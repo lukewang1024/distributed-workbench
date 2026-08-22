@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workbench Fabric"
+  short_description: "Deploy and repair distributed workbench nodes"
+  default_prompt: "Use $workbench-fabric to deploy or diagnose my selected workbench nodes."

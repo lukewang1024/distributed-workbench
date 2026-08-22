@@ -1,0 +1,1 @@
+{"private":true,"scripts":{"build":"sh scripts/build.sh","test":"playwright test"},"dependencies":{"@types/react":"^19.0.0","@types/react-dom":"^19.0.0","esbuild":"^0.25.0","react":"^19.0.0","react-dom":"^19.0.0","typescript":"^5.8.0"},"devDependencies":{"@playwright/test":"^1.62.0"}}

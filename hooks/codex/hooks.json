@@ -1,0 +1,26 @@
+{
+  "description": "Report redacted Workbench Run lifecycle and tool timing metadata.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {"hooks": [{"type": "command", "command": "workbench observe codex-hook", "commandWindows": "workbench.exe observe codex-hook", "timeout": 3}]}
+    ],
+    "PreToolUse": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "workbench observe codex-hook", "commandWindows": "workbench.exe observe codex-hook", "timeout": 3}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "workbench observe codex-hook", "commandWindows": "workbench.exe observe codex-hook", "async": true, "timeout": 3}]}
+    ],
+    "SubagentStart": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "workbench observe codex-hook", "commandWindows": "workbench.exe observe codex-hook", "async": true, "timeout": 3}]}
+    ],
+    "SubagentStop": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "workbench observe codex-hook", "commandWindows": "workbench.exe observe codex-hook", "async": true, "timeout": 3}]}
+    ],
+    "Stop": [
+      {"hooks": [{"type": "command", "command": "workbench observe codex-hook", "commandWindows": "workbench.exe observe codex-hook", "timeout": 3}]}
+    ],
+    "SessionEnd": [
+      {"hooks": [{"type": "command", "command": "workbench observe codex-hook", "commandWindows": "workbench.exe observe codex-hook", "timeout": 3}]}
+    ]
+  }
+}

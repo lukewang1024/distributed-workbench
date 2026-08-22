@@ -1,0 +1,28 @@
+[package]
+name = "workbench-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "workbench"
+path = "src/main.rs"
+
+[[bin]]
+name = "workbench-macos-agent"
+path = "src/bin/workbench-macos-agent.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+uuid.workspace = true
+workbench-core = { path = "../workbench-core" }
+workbench-protocol = { path = "../workbench-protocol" }
+workbench-runtime = { path = "../workbench-runtime" }
+
+[target.'cfg(windows)'.dependencies]
+windows-service.workspace = true
