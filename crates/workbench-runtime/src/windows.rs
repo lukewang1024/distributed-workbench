@@ -1,9 +1,14 @@
 use serde_json::{Value, json};
 use std::{
     fs,
+    io::{Read, Write},
+    net::TcpStream,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    time::Duration,
 };
+use tungstenite::{Message, connect};
+use workbench_core::now_ms;
 use workbench_protocol::RpcError;
 
 pub fn inspect(application: &Path) -> Result<Value, RpcError> {
@@ -41,6 +46,200 @@ pub fn inspect(application: &Path) -> Result<Value, RpcError> {
         "signature": {"valid": native.get("signatureValid").and_then(Value::as_bool).unwrap_or(false)},
         "localWebcontents": find_directory(application, "local_webcontents"),
     }))
+}
+
+pub fn launch(
+    application: &Path,
+    args: &[String],
+    user_data_dir: Option<&Path>,
+    file: Option<&Path>,
+    remote_debugging_port: Option<u16>,
+) -> Result<Value, RpcError> {
+    let executable = find_executable(application).ok_or_else(|| {
+        RpcError::new(
+            "APPLICATION_LAUNCH_FAILED",
+            "application executable is missing",
+        )
+    })?;
+    if let Some(profile) = user_data_dir {
+        fs::create_dir_all(profile)
+            .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
+    }
+    let mut command = Command::new(&executable);
+    command.args(args);
+    if let Some(profile) = user_data_dir {
+        command.arg(format!("--user-data-dir={}", profile.display()));
+    }
+    if let Some(port) = remote_debugging_port {
+        command.arg(format!("--remote-debugging-port={port}"));
+    }
+    if let Some(file) = file {
+        command.arg(file);
+    }
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| RpcError::new("APPLICATION_LAUNCH_FAILED", error.to_string()))?;
+    Ok(json!({
+        "applicationPath": application,
+        "executable": executable,
+        "pid": child.id(),
+        "launcherPid": child.id(),
+        "file": file,
+        "args": args,
+        "cdp": Value::Null,
+        "readyAt": now_ms(),
+    }))
+}
+
+pub fn open_file(
+    application: &Path,
+    file: &Path,
+    handler: Option<&Path>,
+) -> Result<Value, RpcError> {
+    if !file.is_file() {
+        return Err(RpcError::new(
+            "FILE_NOT_FOUND",
+            format!("file not found: {}", file.display()),
+        ));
+    }
+    let executable = handler
+        .map(Path::to_path_buf)
+        .or_else(|| find_executable(application))
+        .ok_or_else(|| RpcError::new("OPEN_FILE_FAILED", "application executable is missing"))?;
+    Command::new(&executable)
+        .arg(file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| RpcError::new("OPEN_FILE_FAILED", error.to_string()))?;
+    Ok(
+        json!({"applicationPath": application, "handlerPath": executable, "file": file, "openedAt": now_ms()}),
+    )
+}
+
+pub fn cdp_evaluate(
+    port: u16,
+    target_url_prefix: Option<&str>,
+    expression: &str,
+) -> Result<Value, RpcError> {
+    let pages = cdp_json(port, "/json")?;
+    let page = pages
+        .as_array()
+        .and_then(|items| {
+            items.iter().find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("page")
+                    && target_url_prefix.is_none_or(|prefix| {
+                        item.get("url")
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| url.starts_with(prefix))
+                    })
+            })
+        })
+        .ok_or_else(|| RpcError::new("CDP_TARGET_NOT_FOUND", "matching page target not found"))?;
+    let websocket_url = page
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new("CDP_TARGET_INVALID", "target has no debugger URL"))?;
+    let (mut socket, _) = connect(websocket_url)
+        .map_err(|error| RpcError::new("CDP_WEBSOCKET_FAILED", error.to_string()))?;
+    socket
+        .send(Message::Text(
+            json!({"id": 1, "method": "Runtime.evaluate", "params": {
+                "expression": expression, "returnByValue": true, "awaitPromise": true
+            }})
+            .to_string()
+            .into(),
+        ))
+        .map_err(|error| RpcError::new("CDP_WEBSOCKET_FAILED", error.to_string()))?;
+    loop {
+        let Message::Text(text) = socket
+            .read()
+            .map_err(|error| RpcError::new("CDP_WEBSOCKET_FAILED", error.to_string()))?
+        else {
+            continue;
+        };
+        let response: Value = serde_json::from_str(&text)
+            .map_err(|error| RpcError::new("CDP_INVALID_RESPONSE", error.to_string()))?;
+        if response.get("id").and_then(Value::as_u64) != Some(1) {
+            continue;
+        }
+        if let Some(error) = response.get("error") {
+            return Err(RpcError::new("CDP_EVALUATION_FAILED", error.to_string()));
+        }
+        if let Some(exception) = response.pointer("/result/exceptionDetails") {
+            return Err(RpcError::new(
+                "CDP_EVALUATION_FAILED",
+                exception.to_string(),
+            ));
+        }
+        return Ok(
+            json!({"target": page, "value": response.pointer("/result/result/value").cloned().unwrap_or(Value::Null), "evaluatedAt": now_ms()}),
+        );
+    }
+}
+
+pub fn native_inspect(application: &Path) -> Result<Value, RpcError> {
+    let executable = find_executable(application).ok_or_else(|| {
+        RpcError::new(
+            "NATIVE_INSPECTION_FAILED",
+            "application executable is missing",
+        )
+    })?;
+    let script = "$target=[IO.Path]::GetFullPath($env:WORKBENCH_APPLICATION_EXE); $items=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) } | ForEach-Object { $p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; @{pid=$_.ProcessId;windows=@($(if($p -and $p.MainWindowHandle -ne 0){@{title=$p.MainWindowTitle;role='Window'}}))} }); @{accessibilityTrusted=$true;processes=$items} | ConvertTo-Json -Depth 6 -Compress";
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .env("WORKBENCH_APPLICATION_EXE", &executable)
+        .output()
+        .map_err(|error| RpcError::new("NATIVE_INSPECTION_FAILED", error.to_string()))?;
+    if !output.status.success() {
+        return Err(RpcError::new(
+            "NATIVE_INSPECTION_FAILED",
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let inspection: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| RpcError::new("NATIVE_INSPECTION_FAILED", error.to_string()))?;
+    let pids = inspection
+        .get("processes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("pid").cloned())
+        .collect::<Vec<_>>();
+    Ok(
+        json!({"applicationPath": application, "executable": executable, "pids": pids, "inspection": inspection, "inspectedAt": now_ms()}),
+    )
+}
+
+fn cdp_json(port: u16, path: &str) -> Result<Value, RpcError> {
+    let mut stream = TcpStream::connect_timeout(
+        &format!("127.0.0.1:{port}").parse().expect("loopback"),
+        Duration::from_millis(500),
+    )
+    .map_err(|error| RpcError::new("CDP_UNAVAILABLE", error.to_string()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|error| RpcError::new("CDP_UNAVAILABLE", error.to_string()))?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+    )
+    .map_err(|error| RpcError::new("CDP_UNAVAILABLE", error.to_string()))?;
+    let mut response = Vec::new();
+    stream
+        .read_to_end(&mut response)
+        .map_err(|error| RpcError::new("CDP_UNAVAILABLE", error.to_string()))?;
+    let body = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| &response[position + 4..])
+        .ok_or_else(|| RpcError::new("CDP_INVALID_RESPONSE", "missing HTTP response body"))?;
+    serde_json::from_slice(body)
+        .map_err(|error| RpcError::new("CDP_INVALID_RESPONSE", error.to_string()))
 }
 
 fn find_executable(root: &Path) -> Option<PathBuf> {

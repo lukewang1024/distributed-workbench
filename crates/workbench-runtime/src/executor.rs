@@ -1153,6 +1153,30 @@ impl ExecutorRuntime {
                     },
                 )
             }
+            #[cfg(windows)]
+            "application.launch" => {
+                let application_path = self.application_path(&params, "applicationPath")?;
+                let user_data_dir = params
+                    .get("userDataDir")
+                    .and_then(Value::as_str)
+                    .map(|_| self.path(&params, "userDataDir", false))
+                    .transpose()?;
+                let file = params
+                    .get("file")
+                    .and_then(Value::as_str)
+                    .map(|_| self.path(&params, "file", true))
+                    .transpose()?;
+                crate::windows::launch(
+                    &application_path,
+                    &string_array(&params, "args")?,
+                    user_data_dir.as_deref(),
+                    file.as_deref(),
+                    params
+                        .get("remoteDebuggingPort")
+                        .and_then(Value::as_u64)
+                        .map(|port| port as u16),
+                )
+            }
             #[cfg(target_os = "macos")]
             "application.open-file" => {
                 let application_path = self.application_path(&params, "applicationPath")?;
@@ -1163,6 +1187,17 @@ impl ExecutorRuntime {
                     .map(|_| self.path(&params, "handlerPath", true))
                     .transpose()?;
                 crate::macos::open_file(&application_path, &file, handler.as_deref())
+            }
+            #[cfg(windows)]
+            "application.open-file" => {
+                let application_path = self.application_path(&params, "applicationPath")?;
+                let file = self.path(&params, "file", true)?;
+                let handler = params
+                    .get("handlerPath")
+                    .and_then(Value::as_str)
+                    .map(|_| self.path(&params, "handlerPath", true))
+                    .transpose()?;
+                crate::windows::open_file(&application_path, &file, handler.as_deref())
             }
             #[cfg(target_os = "macos")]
             "application.stop" => {
@@ -1180,6 +1215,15 @@ impl ExecutorRuntime {
             })),
             #[cfg(target_os = "macos")]
             "ui.evaluate" => crate::macos::cdp_evaluate(
+                params
+                    .get("remoteDebuggingPort")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(9222) as u16,
+                params.get("targetUrlPrefix").and_then(Value::as_str),
+                required_str(&params, "expression")?,
+            ),
+            #[cfg(windows)]
+            "ui.evaluate" => crate::windows::cdp_evaluate(
                 params
                     .get("remoteDebuggingPort")
                     .and_then(Value::as_u64)
@@ -1219,6 +1263,11 @@ impl ExecutorRuntime {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                 )
+            }
+            #[cfg(windows)]
+            "ui.native-inspect" => {
+                let application_path = self.application_path(&params, "applicationPath")?;
+                crate::windows::native_inspect(&application_path)
             }
             _ => Err(RpcError::new(
                 "UNKNOWN_ACTION",
@@ -1387,7 +1436,13 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("ui.native-inspect", Effect::ReadOnly),
     ]);
     #[cfg(windows)]
-    capabilities.push(("application.inspect", Effect::ReadOnly));
+    capabilities.extend([
+        ("application.inspect", Effect::ReadOnly),
+        ("application.launch", Effect::Mutating),
+        ("application.open-file", Effect::Mutating),
+        ("ui.evaluate", Effect::ReadOnly),
+        ("ui.native-inspect", Effect::ReadOnly),
+    ]);
     capabilities
         .into_iter()
         .map(|(name, effect)| contract(name, effect))
