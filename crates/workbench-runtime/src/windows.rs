@@ -4,10 +4,21 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Command,
     time::Duration,
 };
 use tungstenite::{Message, connect};
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, HANDLE},
+    Security::{DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenPrimary},
+    System::{
+        RemoteDesktop::{
+            WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW,
+            WTSFreeMemory, WTSQueryUserToken,
+        },
+        Threading::{CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW},
+    },
+};
 use workbench_core::now_ms;
 use workbench_protocol::RpcError;
 
@@ -65,28 +76,22 @@ pub fn launch(
         fs::create_dir_all(profile)
             .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
     }
-    let mut command = Command::new(&executable);
-    command.args(args);
+    let mut launch_args = args.to_vec();
     if let Some(profile) = user_data_dir {
-        command.arg(format!("--user-data-dir={}", profile.display()));
+        launch_args.push(format!("--user-data-dir={}", profile.display()));
     }
     if let Some(port) = remote_debugging_port {
-        command.arg(format!("--remote-debugging-port={port}"));
+        launch_args.push(format!("--remote-debugging-port={port}"));
     }
     if let Some(file) = file {
-        command.arg(file);
+        launch_args.push(file.to_string_lossy().into_owned());
     }
-    let child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| RpcError::new("APPLICATION_LAUNCH_FAILED", error.to_string()))?;
+    let pid = spawn_in_active_session(&executable, &launch_args, application)?;
     Ok(json!({
         "applicationPath": application,
         "executable": executable,
-        "pid": child.id(),
-        "launcherPid": child.id(),
+        "pid": pid,
+        "launcherPid": pid,
         "file": file,
         "args": args,
         "cdp": Value::Null,
@@ -109,16 +114,115 @@ pub fn open_file(
         .map(Path::to_path_buf)
         .or_else(|| find_executable(application))
         .ok_or_else(|| RpcError::new("OPEN_FILE_FAILED", "application executable is missing"))?;
-    Command::new(&executable)
-        .arg(file)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| RpcError::new("OPEN_FILE_FAILED", error.to_string()))?;
+    spawn_in_active_session(
+        &executable,
+        &[file.to_string_lossy().into_owned()],
+        application,
+    )?;
     Ok(
         json!({"applicationPath": application, "handlerPath": executable, "file": file, "openedAt": now_ms()}),
     )
+}
+
+fn spawn_in_active_session(
+    executable: &Path,
+    args: &[String],
+    cwd: &Path,
+) -> Result<u32, RpcError> {
+    let mut sessions = std::ptr::null_mut::<WTS_SESSION_INFOW>();
+    let mut count = 0_u32;
+    let enumerated = unsafe {
+        WTSEnumerateSessionsW(WTS_CURRENT_SERVER_HANDLE, 0, 1, &mut sessions, &mut count)
+    };
+    if enumerated == 0 {
+        return Err(RpcError::new(
+            "INTERACTIVE_SESSION_UNAVAILABLE",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    let active_session = unsafe { std::slice::from_raw_parts(sessions, count as usize) }
+        .iter()
+        .find(|session| session.State == WTSActive)
+        .map(|session| session.SessionId);
+    unsafe { WTSFreeMemory(sessions.cast()) };
+    let session_id = active_session.ok_or_else(|| {
+        RpcError::new(
+            "INTERACTIVE_SESSION_UNAVAILABLE",
+            "no active Windows desktop session is available",
+        )
+    })?;
+
+    let mut user_token: HANDLE = std::ptr::null_mut();
+    if unsafe { WTSQueryUserToken(session_id, &mut user_token) } == 0 {
+        return Err(RpcError::new(
+            "INTERACTIVE_SESSION_TOKEN_FAILED",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    let mut primary_token: HANDLE = std::ptr::null_mut();
+    let duplicated = unsafe {
+        DuplicateTokenEx(
+            user_token,
+            TOKEN_ALL_ACCESS,
+            std::ptr::null(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary_token,
+        )
+    };
+    unsafe { CloseHandle(user_token) };
+    if duplicated == 0 {
+        return Err(RpcError::new(
+            "INTERACTIVE_SESSION_TOKEN_FAILED",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+
+    let mut command_line = std::iter::once(executable.to_string_lossy().into_owned())
+        .chain(args.iter().cloned())
+        .map(|value| format!("\"{}\"", value.replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut desktop = "winsta0\\default\0".encode_utf16().collect::<Vec<_>>();
+    let cwd = cwd
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    startup.lpDesktop = desktop.as_mut_ptr();
+    let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let created = unsafe {
+        CreateProcessAsUserW(
+            primary_token,
+            std::ptr::null(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            0,
+            std::ptr::null(),
+            cwd.as_ptr(),
+            &startup,
+            &mut process,
+        )
+    };
+    unsafe { CloseHandle(primary_token) };
+    if created == 0 {
+        return Err(RpcError::new(
+            "INTERACTIVE_PROCESS_CREATE_FAILED",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(process.dwProcessId)
 }
 
 pub fn cdp_evaluate(
