@@ -12,11 +12,14 @@ use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE},
     Security::{DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenPrimary},
     System::{
+        Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
         RemoteDesktop::{
             WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW,
             WTSFreeMemory, WTSQueryUserToken,
         },
-        Threading::{CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW},
+        Threading::{
+            CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW,
+        },
     },
 };
 use workbench_core::now_ms;
@@ -196,6 +199,14 @@ fn spawn_in_active_session(
     startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     startup.lpDesktop = desktop.as_mut_ptr();
     let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut environment = std::ptr::null_mut();
+    if unsafe { CreateEnvironmentBlock(&mut environment, primary_token, 0) } == 0 {
+        unsafe { CloseHandle(primary_token) };
+        return Err(RpcError::new(
+            "INTERACTIVE_ENVIRONMENT_FAILED",
+            std::io::Error::last_os_error().to_string(),
+        ));
+    }
     let created = unsafe {
         CreateProcessAsUserW(
             primary_token,
@@ -203,14 +214,15 @@ fn spawn_in_active_session(
             command_line.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
+            CREATE_UNICODE_ENVIRONMENT as i32,
             0,
-            0,
-            std::ptr::null(),
+            environment,
             cwd.as_ptr(),
             &startup,
             &mut process,
         )
     };
+    unsafe { DestroyEnvironmentBlock(environment) };
     unsafe { CloseHandle(primary_token) };
     if created == 0 {
         return Err(RpcError::new(

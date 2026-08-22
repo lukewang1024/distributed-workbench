@@ -24,7 +24,7 @@ workbench-schema = { path = "../workbench-schema" }
 
 [target.'cfg(windows)'.dependencies]
 junction = "1.2"
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_RemoteDesktop", "Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Environment", "Win32_System_RemoteDesktop", "Win32_System_Threading"] }
 widestring = "1.2"
 
 [dev-dependencies]
