@@ -260,7 +260,13 @@ pub fn cdp_evaluate(
         .get("webSocketDebuggerUrl")
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::new("CDP_TARGET_INVALID", "target has no debugger URL"))?;
-    let (mut socket, _) = connect(websocket_url)
+    // The discovery endpoint is deliberately reached over IPv4 loopback. Some
+    // Chromium builds advertise `localhost` even when the debugger only listens
+    // on 127.0.0.1, and Windows may resolve localhost to ::1 first.
+    let websocket_url = websocket_url
+        .replacen("ws://localhost:", "ws://127.0.0.1:", 1)
+        .replacen("ws://[::1]:", "ws://127.0.0.1:", 1);
+    let (mut socket, _) = connect(websocket_url.as_str())
         .map_err(|error| RpcError::new("CDP_WEBSOCKET_FAILED", error.to_string()))?;
     socket
         .send(Message::Text(
