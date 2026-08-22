@@ -2149,12 +2149,16 @@ fn digest_tree(root: &Path) -> Result<(String, u64, u64), RpcError> {
     }
     let mut paths = Vec::new();
     collect(root, root, &mut paths)?;
-    paths.sort();
+    let mut paths = paths
+        .into_iter()
+        .map(|path| Ok((portable_relative_path(&path)?, path)))
+        .collect::<Result<Vec<_>, RpcError>>()?;
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
     let mut digest = Sha256::new();
     let mut size = 0_u64;
-    for relative in &paths {
+    for (portable, relative) in &paths {
         let path = root.join(relative);
-        digest.update(relative.as_os_str().as_encoded_bytes());
+        digest.update(portable.as_bytes());
         digest.update([0]);
         let metadata = fs::symlink_metadata(&path)
             .map_err(|error| io_error("ARTIFACT_READ_FAILED", &path, error))?;
@@ -2175,6 +2179,21 @@ fn digest_tree(root: &Path) -> Result<(String, u64, u64), RpcError> {
         size,
         paths.len() as u64,
     ))
+}
+
+fn portable_relative_path(path: &Path) -> Result<String, RpcError> {
+    path.components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str().ok_or_else(|| {
+                RpcError::new("INVALID_ARTIFACT_PATH", "artifact paths must be UTF-8")
+            }),
+            _ => Err(RpcError::new(
+                "INVALID_ARTIFACT_PATH",
+                format!("artifact path must be relative: {}", path.display()),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|components| components.join("/"))
 }
 
 fn safe_relative(value: &str) -> Result<PathBuf, RpcError> {
@@ -2516,6 +2535,10 @@ mod tests {
         ));
         assert!(created.ok, "{created:?}");
         let archive = created.result.unwrap();
+        assert_eq!(
+            archive["digest"],
+            "sha256:c70ebee67e261fc5491f96c95ab34616c7f596de12ce556513abe9eb82387ac9"
+        );
         let token = archive["token"].as_str().unwrap();
         let staging = directory.path().join("staging");
         let prepared = runtime.handle(Request::new(
