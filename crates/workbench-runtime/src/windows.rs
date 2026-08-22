@@ -5,7 +5,8 @@ use std::{
     net::TcpStream,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 use tungstenite::{Message, connect};
 use windows_sys::Win32::{
@@ -311,19 +312,36 @@ pub fn native_inspect(application: &Path) -> Result<Value, RpcError> {
             "application executable is missing",
         )
     })?;
-    let script = "$target=[IO.Path]::GetFullPath($env:WORKBENCH_APPLICATION_EXE); $items=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) } | ForEach-Object { $p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; @{pid=$_.ProcessId;windows=@($(if($p -and $p.MainWindowHandle -ne 0){@{title=$p.MainWindowTitle;role='Window'}}))} }); @{accessibilityTrusted=$true;processes=$items} | ConvertTo-Json -Depth 6 -Compress";
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
-        .env("WORKBENCH_APPLICATION_EXE", &executable)
-        .output()
-        .map_err(|error| RpcError::new("NATIVE_INSPECTION_FAILED", error.to_string()))?;
-    if !output.status.success() {
-        return Err(RpcError::new(
-            "NATIVE_INSPECTION_FAILED",
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
+    let output_path = application.join(format!(
+        ".workbench-native-inspect-{}-{}.json",
+        std::process::id(),
+        now_ms()
+    ));
+    let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$target=[IO.Path]::GetFullPath('{}'); $items=@(Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) }} | ForEach-Object {{ $p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; @{{pid=$_.ProcessId;windows=@($(if($p -and $p.MainWindowHandle -ne 0){{@{{title=$p.MainWindowTitle;role='Window'}}}}))}} }}); $json=@{{accessibilityTrusted=$true;processes=$items}} | ConvertTo-Json -Depth 6 -Compress; [IO.File]::WriteAllText('{}',$json,(New-Object Text.UTF8Encoding($false)))",
+        quote(&executable),
+        quote(&output_path)
+    );
+    let powershell = Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+    spawn_in_active_session(
+        powershell,
+        &[
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            script,
+        ],
+        application,
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !output_path.is_file() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
     }
-    let inspection: Value = serde_json::from_slice(&output.stdout)
+    let output = fs::read(&output_path)
+        .map_err(|error| RpcError::new("NATIVE_INSPECTION_FAILED", error.to_string()))?;
+    let _ = fs::remove_file(&output_path);
+    let inspection: Value = serde_json::from_slice(&output)
         .map_err(|error| RpcError::new("NATIVE_INSPECTION_FAILED", error.to_string()))?;
     let pids = inspection
         .get("processes")
@@ -352,9 +370,22 @@ fn cdp_json(port: u16, path: &str) -> Result<Value, RpcError> {
     )
     .map_err(|error| RpcError::new("CDP_UNAVAILABLE", error.to_string()))?;
     let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|error| RpcError::new("CDP_UNAVAILABLE", error.to_string()))?;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => response.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && !response.is_empty() =>
+            {
+                break;
+            }
+            Err(error) => return Err(RpcError::new("CDP_UNAVAILABLE", error.to_string())),
+        }
+    }
     let body = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
