@@ -1074,6 +1074,11 @@ impl ExecutorRuntime {
                 let application_path = self.application_path(&params, "applicationPath")?;
                 crate::macos::inspect(&application_path)
             }
+            #[cfg(windows)]
+            "application.inspect" => {
+                let application_path = self.application_path(&params, "applicationPath")?;
+                crate::windows::inspect(&application_path)
+            }
             #[cfg(target_os = "macos")]
             "application.finalize" => {
                 let application_path = self.path(&params, "applicationPath", true)?;
@@ -1381,6 +1386,8 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("ui.capture", Effect::ReadOnly),
         ("ui.native-inspect", Effect::ReadOnly),
     ]);
+    #[cfg(windows)]
+    capabilities.push(("application.inspect", Effect::ReadOnly));
     capabilities
         .into_iter()
         .map(|(name, effect)| contract(name, effect))

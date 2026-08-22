@@ -8,6 +8,8 @@ mod process;
 mod rpc;
 mod telemetry;
 mod transport;
+#[cfg(windows)]
+mod windows;
 
 pub use controller::Controller;
 pub use executor::{ExecutorRuntime, capability_catalog};
