@@ -31,7 +31,21 @@ while [ "$#" -gt 0 ]; do
 done
 
 case $state_root in
-  /*/distributed-workbench) ;;
+  /*) ;;
+  *) printf 'prune-state: refusing unsafe state root: %s\n' "$state_root" >&2; exit 1 ;;
+esac
+case $state_root in
+  */../*|*/..|*/./*) printf 'prune-state: refusing non-normalized state root: %s\n' "$state_root" >&2; exit 1 ;;
+esac
+state_name=${state_root##*/}
+case $state_name in
+  distributed-workbench) ;;
+  distributed-workbench-*)
+    state_namespace=${state_name#distributed-workbench-}
+    case $state_namespace in
+      *[!0-9A-Za-z._-]*|'') printf 'prune-state: refusing unsafe namespace: %s\n' "$state_namespace" >&2; exit 1 ;;
+    esac
+    ;;
   *) printf 'prune-state: refusing unsafe state root: %s\n' "$state_root" >&2; exit 1 ;;
 esac
 case $keep_backups:$keep_deployments in

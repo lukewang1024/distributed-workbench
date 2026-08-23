@@ -1,4 +1,6 @@
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 
@@ -73,6 +75,26 @@ class BootstrapFabricContractTest(unittest.TestCase):
         self.assertIn('[string]$Namespace = "stable"', windows)
         self.assertIn('$controllerService = "DistributedWorkbench" + $serviceNamespace + "Controller"', windows)
         self.assertIn('if ($Namespace -eq "stable") { "" }', windows)
+
+    def test_prune_state_accepts_only_valid_managed_namespaces(self) -> None:
+        script = ROOT / "scripts" / "prune-state.sh"
+        with tempfile.TemporaryDirectory() as temporary:
+            accepted = Path(temporary) / "distributed-workbench-canary"
+            accepted.mkdir()
+            result = subprocess.run(
+                ["/bin/sh", str(script), "--state-root", str(accepted)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            rejected = Path(temporary) / "unmanaged-canary"
+            rejected.mkdir()
+            result = subprocess.run(
+                ["/bin/sh", str(script), "--state-root", str(rejected)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":
