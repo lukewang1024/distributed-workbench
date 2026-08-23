@@ -319,7 +319,7 @@ pub fn native_inspect(application: &Path) -> Result<Value, RpcError> {
     ));
     let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
     let script = format!(
-        "$target=[IO.Path]::GetFullPath('{}'); $items=@(Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) }} | ForEach-Object {{ $p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; @{{pid=$_.ProcessId;windows=@($(if($p -and $p.MainWindowHandle -ne 0){{@{{title=$p.MainWindowTitle;role='Window'}}}}))}} }}); $json=@{{accessibilityTrusted=$true;processes=$items}} | ConvertTo-Json -Depth 6 -Compress; [IO.File]::WriteAllText('{}',$json,(New-Object Text.UTF8Encoding($false)))",
+        "Add-Type -AssemblyName UIAutomationClient; $target=[IO.Path]::GetFullPath('{}'); $items=@(Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) }} | ForEach-Object {{ $p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; $windows=@($(if($p -and $p.MainWindowHandle -ne 0){{ $title=$p.MainWindowTitle; if([string]::IsNullOrWhiteSpace($title)){{ try {{ $title=[Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle).Current.Name }} catch {{}} }}; @{{title=$title;role='Window'}} }})); @{{pid=$_.ProcessId;windows=$windows}} }}); $json=@{{accessibilityTrusted=$true;processes=$items}} | ConvertTo-Json -Depth 6 -Compress; [IO.File]::WriteAllText('{}',$json,(New-Object Text.UTF8Encoding($false)))",
         quote(&executable),
         quote(&output_path)
     );
