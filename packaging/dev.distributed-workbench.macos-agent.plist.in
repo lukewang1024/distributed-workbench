@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>dev.distributed-workbench.macos-agent</string>
+  <string>@LABEL@</string>
   <key>ProgramArguments</key>
   <array>
     <string>@APP_EXECUTABLE@</string>

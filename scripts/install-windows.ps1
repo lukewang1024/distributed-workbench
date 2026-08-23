@@ -1,12 +1,14 @@
 param(
   [Parameter(Mandatory = $true)][string]$Binary,
   [string]$NodeId = $env:COMPUTERNAME,
+  [ValidatePattern('^[0-9A-Za-z._-]+$')][string]$Namespace = "stable",
   [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\distributed-workbench")
 )
 
 $ErrorActionPreference = "Stop"
-$installRoot = Join-Path $env:ProgramFiles "distributed-workbench"
-$stateRoot = Join-Path $env:ProgramData "distributed-workbench"
+$suffix = if ($Namespace -eq "stable") { "" } else { "-" + $Namespace }
+$installRoot = Join-Path $env:ProgramFiles ("distributed-workbench" + $suffix)
+$stateRoot = Join-Path $env:ProgramData ("distributed-workbench" + $suffix)
 $installedBinary = Join-Path $installRoot "workbench.exe"
 $controllerSocket = Join-Path $stateRoot "controller.sock"
 $executorSocket = Join-Path $stateRoot "executor.sock"
@@ -27,7 +29,10 @@ New-Item -ItemType Directory -Force -Path $fabricRoot | Out-Null
 # endpoints in this directory. Controller state remains writable by services.
 & icacls.exe $fabricRoot /grant '*S-1-5-11:(OI)(CI)M' /T /C | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "failed to grant fabric IPC directory access" }
-foreach ($serviceName in @("DistributedWorkbenchController", "DistributedWorkbenchExecutor")) {
+$serviceNamespace = if ($Namespace -eq "stable") { "" } else { (Get-Culture).TextInfo.ToTitleCase($Namespace) }
+$controllerService = "DistributedWorkbench" + $serviceNamespace + "Controller"
+$executorService = "DistributedWorkbench" + $serviceNamespace + "Executor"
+foreach ($serviceName in @($controllerService, $executorService)) {
   if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
   }
@@ -69,7 +74,7 @@ $executorParts = @(
   "executor", "serve", "--id", (Quote-Arg ($NodeId + "-native"))
   "--state", (Quote-Arg $executorState)
 )
-foreach ($root in $AllowRoot) {
+foreach ($root in @($AllowRoot + $stateRoot)) {
   if (-not [System.IO.Path]::IsPathRooted($root)) {
     throw "allow-root must be absolute: $root"
   }
@@ -78,8 +83,8 @@ foreach ($root in $AllowRoot) {
 $executorArgs = $executorParts -join " "
 
 foreach ($service in @(
-  @{ Name = "DistributedWorkbenchController"; Display = "Distributed Workbench Controller"; Command = $controllerArgs },
-  @{ Name = "DistributedWorkbenchExecutor"; Display = "Distributed Workbench Executor"; Command = $executorArgs }
+  @{ Name = $controllerService; Display = "Distributed Workbench $Namespace Controller"; Command = $controllerArgs },
+  @{ Name = $executorService; Display = "Distributed Workbench $Namespace Executor"; Command = $executorArgs }
 )) {
   $existing = Get-Service -Name $service.Name -ErrorAction SilentlyContinue
   $scCommand = $service.Command.Replace('"', '\"')

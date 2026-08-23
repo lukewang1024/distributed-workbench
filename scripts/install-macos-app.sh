@@ -2,25 +2,30 @@
 set -eu
 
 state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
-state_root=$state_home/distributed-workbench
+namespace=${DISTRIBUTED_WORKBENCH_NAMESPACE:-stable}
+case $namespace in *[!0-9A-Za-z._-]*|'') echo "invalid DISTRIBUTED_WORKBENCH_NAMESPACE: $namespace" >&2; exit 2;; esac
+if [ "$namespace" = stable ]; then suffix=; else suffix=-$namespace; fi
+state_root=$state_home/distributed-workbench$suffix
 data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
 bin_home=${XDG_BIN_HOME:-"$HOME/.local/bin"}
 source_binary=${1:-target/release/workbench-macos-agent}
-app_root=$data_home/distributed-workbench/Agent\ Workbench.app
+app_root=$data_home/distributed-workbench$suffix/Agent\ Workbench$suffix.app
 contents=$app_root/Contents
 executable=$contents/MacOS/workbench-macos-agent
-controller_executable=$data_home/distributed-workbench/libexec/workbench-controller
+controller_executable=$data_home/distributed-workbench$suffix/libexec/workbench-controller
 plist=$contents/Info.plist
 launch_agents=$HOME/Library/LaunchAgents
-launch_plist=$launch_agents/dev.distributed-workbench.macos-agent.plist
+agent_label=dev.distributed-workbench$suffix.macos-agent
+controller_label=dev.distributed-workbench$suffix.controller
+launch_plist=$launch_agents/$agent_label.plist
 template=packaging/dev.distributed-workbench.macos-agent.plist.in
-controller_launch_plist=$launch_agents/dev.distributed-workbench.controller.plist
+controller_launch_plist=$launch_agents/$controller_label.plist
 controller_template=packaging/dev.distributed-workbench.controller.plist.in
-socket=$state_home/distributed-workbench/executor.sock
-controller_socket=$state_home/distributed-workbench/controller.sock
-controller_state=$state_home/distributed-workbench/controller.json
-log_path=$state_home/distributed-workbench/macos-agent.log
-controller_log=$state_home/distributed-workbench/controller.log
+socket=$state_root/executor.sock
+controller_socket=$state_root/controller.sock
+controller_state=$state_root/controller.json
+log_path=$state_root/macos-agent.log
+controller_log=$state_root/controller.log
 node_id=${DISTRIBUTED_WORKBENCH_NODE_ID:-$(hostname -s)}
 backup_root=$state_root/backups/$(date -u +%Y%m%dT%H%M%SZ)
 
@@ -34,10 +39,10 @@ if [ ! -f "$template" ] || [ ! -f "$controller_template" ]; then
 fi
 app_version=$($source_binary --version | awk 'NR == 1 { print $2 }')
 
-mkdir -p "$contents/MacOS" "$(dirname "$controller_executable")" "$bin_home" "$launch_agents" "$state_home/distributed-workbench"
-if [ -f "$controller_state" ] || [ -f "$state_home/distributed-workbench/executor-fences.json" ]; then
+mkdir -p "$contents/MacOS" "$(dirname "$controller_executable")" "$bin_home" "$launch_agents" "$state_root"
+if [ -f "$controller_state" ] || [ -f "$state_root/executor-fences.json" ]; then
   mkdir -p "$backup_root"
-  for state_file in "$controller_state" "$state_home/distributed-workbench/executor-fences.json"; do
+  for state_file in "$controller_state" "$state_root/executor-fences.json"; do
     if [ -f "$state_file" ]; then cp -p "$state_file" "$backup_root/"; fi
   done
 fi
@@ -45,7 +50,7 @@ domain=gui/$(id -u)
 # Stop the existing launchd job and any legacy LaunchServices child before
 # replacing a signed bundle. Older releases used `open -W`, which could leave
 # the app process reparented to PID 1 after the launcher exited.
-/bin/launchctl bootout "$domain/dev.distributed-workbench.macos-agent" 2>/dev/null || true
+/bin/launchctl bootout "$domain/$agent_label" 2>/dev/null || true
 if [ -x "$executable" ]; then
   old_pids=$(/bin/ps -axo pid=,command= | awk -v prefix="$executable " 'index($0, prefix) { print $1 }')
   for old_pid in $old_pids; do
@@ -84,7 +89,8 @@ fi
 
 plist_temporary=$plist.$$.tmp
 plutil -create xml1 "$plist_temporary"
-plutil -insert CFBundleIdentifier -string dev.distributed-workbench.macos-agent "$plist_temporary"
+bundle_identifier=dev.distributed-workbench$suffix.macos-agent
+plutil -insert CFBundleIdentifier -string "$bundle_identifier" "$plist_temporary"
 plutil -insert CFBundleName -string 'Agent Workbench' "$plist_temporary"
 plutil -insert CFBundleDisplayName -string 'Agent Workbench' "$plist_temporary"
 plutil -insert CFBundleExecutable -string workbench-macos-agent "$plist_temporary"
@@ -103,19 +109,20 @@ fi
 # repeat installs must preserve the exact identity the user already approved.
 if [ "$app_changed" = true ] || ! /usr/bin/codesign --verify --deep --strict "$app_root" >/dev/null 2>&1; then
   /usr/bin/codesign --force --sign - \
-    --identifier dev.distributed-workbench.macos-agent \
-    --requirements '=designated => identifier "dev.distributed-workbench.macos-agent"' \
+    --identifier "$bundle_identifier" \
+    --requirements "=designated => identifier \"$bundle_identifier\"" \
     "$app_root"
 fi
 /usr/bin/codesign --verify --deep --strict "$app_root"
-ln -sfn "$executable" "$bin_home/workbench"
-ln -sfn "$executable" "$bin_home/workbench-macos-agent"
+ln -sfn "$executable" "$bin_home/workbench$suffix"
+ln -sfn "$executable" "$bin_home/workbench-macos-agent$suffix"
 
 escape_sed() {
   printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
 }
 
 sed \
+  -e "s|@LABEL@|$(escape_sed "$agent_label")|g" \
   -e "s|@APP_ROOT@|$(escape_sed "$app_root")|g" \
   -e "s|@APP_EXECUTABLE@|$(escape_sed "$executable")|g" \
   -e "s|@SOCKET@|$(escape_sed "$socket")|g" \
@@ -129,6 +136,7 @@ plutil -lint "$launch_plist.$$.tmp" >/dev/null
 mv "$launch_plist.$$.tmp" "$launch_plist"
 
 sed \
+  -e "s|@LABEL@|$(escape_sed "$controller_label")|g" \
   -e "s|@EXECUTABLE@|$(escape_sed "$controller_executable")|g" \
   -e "s|@CONTROLLER_SOCKET@|$(escape_sed "$controller_socket")|g" \
   -e "s|@CONTROLLER_STATE@|$(escape_sed "$controller_state")|g" \
@@ -151,11 +159,11 @@ bootstrap_job() {
   done
 }
 
-/bin/launchctl bootout "$domain/dev.distributed-workbench.controller" 2>/dev/null || true
+/bin/launchctl bootout "$domain/$controller_label" 2>/dev/null || true
 bootstrap_job "$launch_plist"
 bootstrap_job "$controller_launch_plist"
-/bin/launchctl kickstart -k "$domain/dev.distributed-workbench.macos-agent"
-/bin/launchctl kickstart -k "$domain/dev.distributed-workbench.controller"
+/bin/launchctl kickstart -k "$domain/$agent_label"
+/bin/launchctl kickstart -k "$domain/$controller_label"
 
 attempt=0
 while [ "$attempt" -lt 100 ]; do

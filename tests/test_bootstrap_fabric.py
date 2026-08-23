@@ -59,6 +59,21 @@ class BootstrapFabricContractTest(unittest.TestCase):
             script,
         )
 
+    def test_os_installers_isolate_canary_namespaces(self) -> None:
+        linux = (ROOT / "scripts/install-linux-user.sh").read_text()
+        macos = (ROOT / "scripts/install-macos-app.sh").read_text()
+        windows = (ROOT / "scripts/install-windows.ps1").read_text()
+
+        self.assertIn("DISTRIBUTED_WORKBENCH_NAMESPACE", linux)
+        self.assertIn('installed_binary=$HOME/.local/bin/workbench$suffix', linux)
+        self.assertIn('controller_service=distributed-workbench$suffix-controller.service', linux)
+        self.assertIn("DISTRIBUTED_WORKBENCH_NAMESPACE", macos)
+        self.assertIn('agent_label=dev.distributed-workbench$suffix.macos-agent', macos)
+        self.assertIn('bundle_identifier=dev.distributed-workbench$suffix.macos-agent', macos)
+        self.assertIn('[string]$Namespace = "stable"', windows)
+        self.assertIn('$controllerService = "DistributedWorkbench" + $serviceNamespace + "Controller"', windows)
+        self.assertIn('if ($Namespace -eq "stable") { "" }', windows)
+
 
 if __name__ == "__main__":
     unittest.main()

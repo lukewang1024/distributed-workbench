@@ -4,13 +4,15 @@ param(
   [Parameter(Mandatory = $true)][string]$HostName,
   [Parameter(Mandatory = $true)][ValidateSet("posix", "windows")][string]$RemotePlatform,
   [Parameter(Mandatory = $true)][string]$RemoteExecutable,
-  [Parameter(Mandatory = $true)][string]$RemoteStateRoot
+  [Parameter(Mandatory = $true)][string]$RemoteStateRoot,
+  [ValidatePattern('^[0-9A-Za-z._-]+$')][string]$Namespace = "stable"
 )
 
 $ErrorActionPreference = "Stop"
 if ($PeerId -notmatch '^[0-9A-Za-z._-]+$') { throw "invalid peer id: $PeerId" }
-$binary = Join-Path $env:ProgramFiles "distributed-workbench\workbench.exe"
-$stateRoot = Join-Path $env:ProgramData "distributed-workbench"
+$suffix = if ($Namespace -eq "stable") { "" } else { "-" + $Namespace }
+$binary = Join-Path $env:ProgramFiles ("distributed-workbench" + $suffix + "\workbench.exe")
+$stateRoot = Join-Path $env:ProgramData ("distributed-workbench" + $suffix)
 $peerRoot = Join-Path $stateRoot ("peers\" + $PeerId)
 New-Item -ItemType Directory -Force -Path $peerRoot | Out-Null
 
@@ -27,7 +29,8 @@ $command = @(
   "--remote-platform", $RemotePlatform,
   "--state", (Q (Join-Path $peerRoot "status.json"))
 ) -join " "
-$name = "DistributedWorkbenchPeer_" + $PeerId
+$serviceNamespace = if ($Namespace -eq "stable") { "" } else { (Get-Culture).TextInfo.ToTitleCase($Namespace) }
+$name = "DistributedWorkbench" + $serviceNamespace + "Peer_" + $PeerId
 $existing = Get-Service -Name $name -ErrorAction SilentlyContinue
 if ($existing) {
   Stop-Service -Name $name -Force -ErrorAction SilentlyContinue

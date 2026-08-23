@@ -4,6 +4,9 @@ set -eu
 binary=${1:-target/release/workbench}
 executor_id=${2:-$(hostname -s)}
 controller_id=${DISTRIBUTED_WORKBENCH_CONTROLLER_ID:-$(hostname -s)}
+namespace=${DISTRIBUTED_WORKBENCH_NAMESPACE:-stable}
+case $namespace in *[!0-9A-Za-z._-]*|'') echo "invalid DISTRIBUTED_WORKBENCH_NAMESPACE: $namespace" >&2; exit 2;; esac
+if [ "$namespace" = stable ]; then suffix=; else suffix=-$namespace; fi
 shift_count=0
 if [ "$#" -ge 1 ]; then shift_count=1; fi
 if [ "$#" -ge 2 ]; then shift_count=2; fi
@@ -21,9 +24,9 @@ fi
 
 state_home=${XDG_STATE_HOME:-"$HOME/.local/state"}
 config_home=${XDG_CONFIG_HOME:-"$HOME/.config"}
-installed_binary=$HOME/.local/bin/workbench
+installed_binary=$HOME/.local/bin/workbench$suffix
 unit_root=$config_home/systemd/user
-state_root=$state_home/distributed-workbench
+state_root=$state_home/distributed-workbench$suffix
 controller_socket=$state_root/controller.sock
 executor_socket=$state_root/executor.sock
 controller_state=$state_root/controller.json
@@ -54,8 +57,10 @@ for root in "$@"; do
   allow_args="$allow_args --allow-root $root"
 done
 
-controller_unit=$unit_root/distributed-workbench-controller.service
-executor_unit=$unit_root/distributed-workbench-executor.service
+controller_service=distributed-workbench$suffix-controller.service
+executor_service=distributed-workbench$suffix-executor.service
+controller_unit=$unit_root/$controller_service
+executor_unit=$unit_root/$executor_service
 
 controller_tmp=$controller_unit.$$.tmp
 sed \
@@ -76,14 +81,14 @@ sed \
 mv "$executor_tmp" "$executor_unit"
 
 systemctl --user daemon-reload
-systemctl --user enable --now distributed-workbench-controller.service
-systemctl --user enable --now distributed-workbench-executor.service
-systemctl --user restart distributed-workbench-controller.service
-systemctl --user restart distributed-workbench-executor.service
-systemctl --user list-unit-files 'distributed-workbench-peer-*.service' --no-legend 2>/dev/null |
+systemctl --user enable --now "$controller_service"
+systemctl --user enable --now "$executor_service"
+systemctl --user restart "$controller_service"
+systemctl --user restart "$executor_service"
+systemctl --user list-unit-files "distributed-workbench$suffix-peer-*.service" --no-legend 2>/dev/null |
   while IFS=' ' read -r peer_unit _; do
     case $peer_unit in
-      distributed-workbench-peer-*.service) systemctl --user restart "$peer_unit" ;;
+      distributed-workbench$suffix-peer-*.service) systemctl --user restart "$peer_unit" ;;
     esac
   done
 
