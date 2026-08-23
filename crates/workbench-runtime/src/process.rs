@@ -29,6 +29,12 @@ pub struct ProcessRecord {
     pub log_start_offset: u64,
     pub state: ProcessState,
     pub readiness: ReadinessStatus,
+    #[serde(default = "starting_phase")]
+    pub phase: String,
+    #[serde(default)]
+    pub last_successful_probe_at: Option<u64>,
+    #[serde(default)]
+    pub last_log_progress: Option<u64>,
     #[serde(default)]
     readiness_spec: Option<Value>,
     #[serde(default)]
@@ -166,6 +172,9 @@ impl ProcessTable {
                 },
                 attempts: 0,
             },
+            phase: "STARTING".to_owned(),
+            last_successful_probe_at: Some(now),
+            last_log_progress: Some(log_start_offset),
             readiness_spec: readiness,
             readiness_deadline_at,
             started_at: now,
@@ -196,6 +205,33 @@ impl ProcessTable {
         }
         let _ = self.persist(&records);
         records.values().cloned().collect()
+    }
+
+    pub fn wait_ready(&self, id: &str, timeout_ms: u64) -> Result<ProcessRecord, RpcError> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms.max(1));
+        loop {
+            let record = self.get(id)?;
+            if record.readiness.state == ReadinessState::Ready {
+                return Ok(record);
+            }
+            if record.state != ProcessState::Running {
+                return Err(process_error("PROCESS_EXITED", &record, false));
+            }
+            if record.readiness.state == ReadinessState::Failed {
+                return Err(process_error("READINESS_MARKER_MISSING", &record, true));
+            }
+            if std::time::Instant::now() >= deadline {
+                let code = if record.last_log_progress.unwrap_or(record.log_start_offset)
+                    <= record.log_start_offset
+                {
+                    "BUILD_STALLED"
+                } else {
+                    "READINESS_MARKER_MISSING"
+                };
+                return Err(process_error(code, &record, true));
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
     }
 
     pub fn stop(&self, id: &str) -> Result<ProcessRecord, RpcError> {
@@ -286,9 +322,17 @@ fn refresh(record: &mut ProcessRecord) {
         return;
     }
     if !process_is_alive(record.pid) {
-        record.state = ProcessState::Stopped;
+        record.state = ProcessState::Failed;
+        record.phase = "FAILED".to_owned();
         record.updated_at = now_ms();
         return;
+    }
+    if let Ok(length) = fs::metadata(&record.log_path).map(|value| value.len()) {
+        if length > record.last_log_progress.unwrap_or(record.log_start_offset) {
+            record.last_log_progress = Some(length);
+            record.phase = "BUILDING".to_owned();
+            record.updated_at = now_ms();
+        }
     }
     if record.readiness.state == ReadinessState::Pending {
         record.readiness.attempts = record.readiness.attempts.saturating_add(1);
@@ -298,7 +342,11 @@ fn refresh(record: &mut ProcessRecord) {
             .map(|spec| readiness_once(spec, &record.log_path, record.log_start_offset))
             .transpose();
         match ready {
-            Ok(Some(true)) => record.readiness.state = ReadinessState::Ready,
+            Ok(Some(true)) => {
+                record.readiness.state = ReadinessState::Ready;
+                record.phase = "READY".to_owned();
+                record.last_successful_probe_at = Some(now_ms());
+            }
             Ok(Some(false))
                 if record
                     .readiness_deadline_at
@@ -311,6 +359,22 @@ fn refresh(record: &mut ProcessRecord) {
         }
         record.updated_at = now_ms();
     }
+}
+
+fn starting_phase() -> String {
+    "STARTING".to_owned()
+}
+
+fn process_error(code: &str, record: &ProcessRecord, retryable: bool) -> RpcError {
+    let mut error = RpcError::new(code, format!("{} for process {}", code, record.id));
+    error.retryable = retryable;
+    error.details = json!({
+        "processId": record.id,
+        "lastSuccessfulProbeAt": record.last_successful_probe_at,
+        "lastLogProgress": record.last_log_progress,
+        "phase": record.phase,
+    });
+    error
 }
 
 #[cfg(unix)]

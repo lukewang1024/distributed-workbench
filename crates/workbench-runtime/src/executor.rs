@@ -996,6 +996,16 @@ impl ExecutorRuntime {
                 self.processes.get(required_str(&params, "processId")?)?,
             )
             .expect("process serializes")),
+            "readiness.wait" => Ok(serde_json::to_value(
+                self.processes.wait_ready(
+                    required_str(&params, "processId")?,
+                    params
+                        .get("timeoutMs")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(600_000),
+                )?,
+            )
+            .expect("process serializes")),
             "process.list" => Ok(json!({"processes": self.processes.list()})),
             "process.stop" | "agent.stop" => Ok(serde_json::to_value(self.processes.stop(
                 if action == "agent.stop" {
@@ -1413,6 +1423,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("process.stop", Effect::Mutating),
         ("process.restart", Effect::Mutating),
         ("process.events", Effect::ReadOnly),
+        ("readiness.wait", Effect::ReadOnly),
         ("logs.read", Effect::ReadOnly),
         ("port.check", Effect::ReadOnly),
         ("agent.start", Effect::Mutating),
@@ -1803,11 +1814,13 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             },
             vec!["process-record", "readiness"],
         ),
-        "process.get" | "process.stop" | "process.restart" | "process.events" | "logs.read" => (
+        "process.get" | "process.stop" | "process.restart" | "process.events"
+        | "readiness.wait" | "logs.read" => (
             vec!["process"],
             json!({
                 "processId": {"type": "string"},
-                "tail": {"type": "integer"}
+                "tail": {"type": "integer"},
+                "timeoutMs": {"type": "integer"}
             }),
             if matches!(name, "process.stop" | "process.restart") {
                 vec!["process:${processId}"]
@@ -1815,7 +1828,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 Vec::new()
             },
             vec!["processId"],
-            30_000,
+            if name == "readiness.wait" {
+                900_000
+            } else {
+                30_000
+            },
             RollbackStrategy::None,
             vec!["process-record"],
         ),

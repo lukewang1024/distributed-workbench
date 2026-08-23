@@ -3587,7 +3587,7 @@ fn render_lock(template: &str, input: &Value) -> Result<String, RpcError> {
 fn wait_for_process_readiness(
     endpoint: &ExecutorEndpoint,
     input: &Value,
-    mut result: Value,
+    result: Value,
 ) -> Result<Value, RpcError> {
     let process_id = required_str(input, "processId")?;
     let timeout_ms = input
@@ -3600,46 +3600,42 @@ fn wait_for_process_readiness(
                 .and_then(Value::as_u64)
         })
         .unwrap_or(180_000);
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-    loop {
-        let readiness = result
-            .get("readiness")
-            .and_then(|value| value.get("state"))
-            .and_then(Value::as_str);
-        let process_state = result.get("state").and_then(Value::as_str);
-        if readiness == Some("ready") {
-            return Ok(result);
-        }
-        if matches!(readiness, Some("failed" | "timeout")) || process_state != Some("running") {
-            return Err(RpcError::new(
-                "PROCESS_NOT_READY",
-                format!(
-                    "process readiness ended in {}",
-                    readiness.or(process_state).unwrap_or("unknown")
-                ),
-            ));
-        }
-        if Instant::now() >= deadline {
-            let mut error = RpcError::new(
-                "READINESS_TIMEOUT",
-                format!("process did not become ready: {process_id}"),
-            );
-            error.retryable = true;
-            return Err(error);
-        }
-        thread::sleep(Duration::from_millis(250));
-        let polled = call_executor(
-            endpoint,
-            &traced_request("process.get", json!({"processId": process_id})),
-        )
-        .map_err(|error| RpcError::new("EXECUTOR_UNAVAILABLE", error.to_string()))?;
-        if !polled.ok {
-            return Err(polled
-                .error
-                .unwrap_or_else(|| RpcError::new("EXECUTOR_FAILED", "process.get failed")));
-        }
-        result = polled.result.unwrap_or(Value::Null);
+    let readiness = result
+        .get("readiness")
+        .and_then(|value| value.get("state"))
+        .and_then(Value::as_str);
+    if readiness == Some("ready") {
+        return Ok(result);
     }
+    // Readiness progression and layered failure detection are owned by the
+    // Executor. The Controller sends one subscription-style wait request; it
+    // never loops process.get across the peer route.
+    let waited = call_executor(
+        endpoint,
+        &traced_request(
+            "readiness.wait",
+            json!({"processId": process_id, "timeoutMs": timeout_ms}),
+        ),
+    )
+    .map_err(|error| {
+        let mut value = RpcError::new("EXECUTOR_DISCONNECTED", error.to_string());
+        value.retryable = true;
+        value
+    })?;
+    if !waited.ok {
+        return Err(waited.error.unwrap_or_else(|| {
+            RpcError::new(
+                "INVALID_EXECUTOR_RESPONSE",
+                "readiness.wait returned no result",
+            )
+        }));
+    }
+    waited.result.ok_or_else(|| {
+        RpcError::new(
+            "INVALID_EXECUTOR_RESPONSE",
+            "readiness.wait returned an empty result",
+        )
+    })
 }
 
 fn command_requires_approval(input: &Value) -> bool {
@@ -3827,20 +3823,26 @@ mod tests {
     }
 
     #[test]
-    fn readiness_wait_polls_until_the_executor_reports_ready() {
+    fn readiness_wait_delegates_one_wait_to_the_executor() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("readiness.sock");
         let calls = Arc::new(AtomicUsize::new(0));
         let server_calls = Arc::clone(&calls);
         let server_socket = socket.clone();
         std::thread::spawn(move || {
-            RpcServer::new(server_socket).serve(move |request| {
-            let call = server_calls.fetch_add(1, Ordering::SeqCst);
-            Response::success(request.request_id, json!({
-                "id": "process-1", "state": "running",
-                "readiness": {"state": if call == 0 { "starting" } else { "ready" }, "attempts": call + 1}
-            }))
-        }).unwrap()
+            RpcServer::new(server_socket)
+                .serve(move |request| {
+                    server_calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(request.action, "readiness.wait");
+                    Response::success(
+                        request.request_id,
+                        json!({
+                            "id": "process-1", "state": "running",
+                            "readiness": {"state": "ready", "attempts": 2}
+                        }),
+                    )
+                })
+                .unwrap()
         });
         for _ in 0..100 {
             if socket.exists() {
@@ -3856,7 +3858,7 @@ mod tests {
             json!({"id": "process-1", "state": "running", "readiness": {"state": "starting", "attempts": 0}}),
         ).unwrap();
         assert_eq!(ready["readiness"]["state"], "ready");
-        assert!(calls.load(Ordering::SeqCst) >= 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
