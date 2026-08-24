@@ -305,7 +305,10 @@ pub fn cdp_evaluate(
     }
 }
 
-pub fn native_inspect(application: &Path) -> Result<Value, RpcError> {
+pub fn native_inspect(
+    application: &Path,
+    expected_window_title: Option<&str>,
+) -> Result<Value, RpcError> {
     let executable = find_executable(application).ok_or_else(|| {
         RpcError::new(
             "NATIVE_INSPECTION_FAILED",
@@ -318,11 +321,53 @@ pub fn native_inspect(application: &Path) -> Result<Value, RpcError> {
         now_ms()
     ));
     let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
-    let script = format!(
-        "Add-Type -AssemblyName UIAutomationClient; $target=[IO.Path]::GetFullPath('{}'); $items=@(Get-CimInstance Win32_Process | Where-Object {{ $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) }} | ForEach-Object {{ $p=Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue; $windows=@($(if($p -and $p.MainWindowHandle -ne 0){{ $title=$p.MainWindowTitle; if([string]::IsNullOrWhiteSpace($title)){{ try {{ $title=[Windows.Automation.AutomationElement]::FromHandle($p.MainWindowHandle).Current.Name }} catch {{}} }}; @{{title=$title;role='Window'}} }})); @{{pid=$_.ProcessId;windows=$windows}} }}); $json=@{{accessibilityTrusted=$true;processes=$items}} | ConvertTo-Json -Depth 6 -Compress; [IO.File]::WriteAllText('{}',$json,(New-Object Text.UTF8Encoding($false)))",
-        quote(&executable),
-        quote(&output_path)
-    );
+    // MainWindowHandle is unreliable for Chromium multi-process applications:
+    // the document HWND can belong to another same-executable process and its
+    // Win32 title may remain empty while UI Automation exposes the document
+    // name on a descendant. Enumerate every desktop top-level UIA element for
+    // the exact executable's PIDs and retain bounded descendant names.
+    let script = r#"
+Add-Type -AssemblyName UIAutomationClient
+$target=[IO.Path]::GetFullPath('@TARGET@')
+$expected='@EXPECTED@'
+$processes=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) })
+$roots=[Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children,[Windows.Automation.Condition]::TrueCondition)
+$items=@()
+foreach($process in $processes) {
+  $windows=@()
+  foreach($root in $roots) {
+    if($root.Current.ProcessId -ne $process.ProcessId) { continue }
+    $names=@()
+    try {
+      $descendants=$root.FindAll([Windows.Automation.TreeScope]::Descendants,[Windows.Automation.Condition]::TrueCondition)
+      $limit=[Math]::Min($descendants.Count,500)
+      for($index=0;$index -lt $limit;$index++) {
+        $name=$descendants.Item($index).Current.Name
+        if(-not [string]::IsNullOrWhiteSpace($name) -and $names.Count -lt 80 -and $names -notcontains $name) { $names += $name }
+      }
+    } catch {}
+    $windows += @{
+      title=$root.Current.Name
+      role=$root.Current.ControlType.ProgrammaticName
+      className=$root.Current.ClassName
+      handle=$root.Current.NativeWindowHandle
+      enabled=$root.Current.IsEnabled
+      offscreen=$root.Current.IsOffscreen
+      accessibleNames=$names
+      expectedTitleObserved=((-not [string]::IsNullOrWhiteSpace($expected)) -and (@($root.Current.Name)+$names | Where-Object { $_ -and $_.IndexOf($expected,[StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count -gt 0)
+    }
+  }
+  $items += @{pid=$process.ProcessId;windows=$windows}
+}
+$json=@{accessibilityTrusted=$true;processes=$items} | ConvertTo-Json -Depth 8 -Compress
+[IO.File]::WriteAllText('@OUTPUT@',$json,(New-Object Text.UTF8Encoding($false)))
+"#
+    .replace("@TARGET@", &quote(&executable))
+    .replace(
+        "@EXPECTED@",
+        &expected_window_title.unwrap_or_default().replace('\'', "''"),
+    )
+    .replace("@OUTPUT@", &quote(&output_path));
     let powershell = Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
     spawn_in_active_session(
         powershell,
