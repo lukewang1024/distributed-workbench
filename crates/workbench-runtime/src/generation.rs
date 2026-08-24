@@ -20,6 +20,8 @@ pub struct MaterializedGeneration {
 pub struct Overlay {
     pub source: PathBuf,
     pub target_relative_path: PathBuf,
+    #[serde(default)]
+    pub replace: bool,
 }
 
 pub fn materialize(
@@ -123,12 +125,15 @@ pub fn apply_overlays(application_path: &Path, overlays: &[Overlay]) -> Result<V
     for overlay in overlays {
         validate_relative(&overlay.target_relative_path)?;
         let target = application_path.join(&overlay.target_relative_path);
-        // Merge-copy is deliberate: adapter artifacts may be partial overlays
-        // and must never delete runtime files supplied by the baseline.
+        if overlay.replace && target.exists() {
+            fs::remove_dir_all(&target)
+                .map_err(|error| io_error("OVERLAY_REPLACE_FAILED", &target, error))?;
+        }
         copy_tree(&overlay.source, &target)?;
         applied.push(serde_json::json!({
             "source": overlay.source,
             "target": target,
+            "replace": overlay.replace,
         }));
     }
     Ok(serde_json::json!({"applied": applied}))
@@ -455,6 +460,7 @@ mod tests {
             &[Overlay {
                 source: overlay.clone(),
                 target_relative_path: PathBuf::from("runtime"),
+                replace: false,
             }],
         )
         .unwrap();
@@ -474,6 +480,33 @@ mod tests {
             read_directory_link(&root.join("previous"))
                 .unwrap()
                 .ends_with(Path::new("generations/one"))
+        );
+    }
+
+    #[test]
+    fn replacing_complete_overlay_removes_baseline_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = directory.path().join("Example.app");
+        fs::create_dir_all(application.join("runtime")).unwrap();
+        fs::write(application.join("runtime/stale"), "baseline").unwrap();
+        let overlay = directory.path().join("overlay");
+        fs::create_dir(&overlay).unwrap();
+        fs::write(overlay.join("current"), "release").unwrap();
+
+        apply_overlays(
+            &application,
+            &[Overlay {
+                source: overlay,
+                target_relative_path: PathBuf::from("runtime"),
+                replace: true,
+            }],
+        )
+        .unwrap();
+
+        assert!(!application.join("runtime/stale").exists());
+        assert_eq!(
+            fs::read_to_string(application.join("runtime/current")).unwrap(),
+            "release"
         );
     }
 
