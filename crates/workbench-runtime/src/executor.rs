@@ -1277,7 +1277,10 @@ impl ExecutorRuntime {
             #[cfg(windows)]
             "ui.native-inspect" => {
                 let application_path = self.application_path(&params, "applicationPath")?;
-                crate::windows::native_inspect(&application_path)
+                crate::windows::native_inspect(
+                    &application_path,
+                    params.get("expectedWindowTitle").and_then(Value::as_str),
+                )
             }
             _ => Err(RpcError::new(
                 "UNKNOWN_ACTION",
