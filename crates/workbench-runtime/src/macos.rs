@@ -628,7 +628,14 @@ pub fn stop(application: &Path) -> Result<Value, RpcError> {
 
 pub fn native_inspect(application: &Path, request_permission: bool) -> Result<Value, RpcError> {
     let executable = application_executable(application)?;
-    let pids = matching_processes(&executable)?;
+    // Chromium owns the visible document window in a Browser helper process,
+    // while the outer application process may expose no AXWindows at all.
+    // Inspect every process rooted in this exact generated application bundle
+    // so another installed Doubao instance cannot satisfy the window check.
+    let pids = processes_for_roots(&[application.to_path_buf()], false)?
+        .iter()
+        .filter_map(|process| process.get("pid").and_then(Value::as_u64))
+        .collect::<Vec<_>>();
     let inspection = accessibility::inspect(&pids, request_permission);
     Ok(json!({
         "applicationPath": application,
