@@ -64,6 +64,34 @@ State follows XDG conventions. The default namespace is
 `distributed-workbench` under `$XDG_CONFIG_HOME`, `$XDG_STATE_HOME`, and
 `$XDG_CACHE_HOME`.
 
+## Observability dashboard
+
+Start the loopback-only, read-only dashboard with:
+
+```sh
+workbench dashboard --open
+```
+
+The dashboard groups execution by workspace session (a domain adapter may label
+one as a Profile), puts blocked and stalled work first, and shows stage progress
+across node and agent-role swimlanes. Its evidence drawer only renders
+allowlisted observation fields. The same projection is available as
+`GET /api/workspaces`; domain adapters can provide stage labels, capability
+groups, restart templates, safe fields, and a default stall threshold through
+the session's optional `observability` metadata.
+
+Agents and operators can report explicit waits without turning raw logs into UI:
+
+```sh
+workbench observe block --kind dependency --reason "waiting for build" \
+  --waiting-on build-task
+workbench observe unblock <blocker-id>
+```
+
+Agent starts receive `WORKBENCH_*` correlation variables so hooks can associate
+run events with the correct session, node, role, and agent. Raw prompts, command
+arguments, environment values, and log bodies are not dashboard fields.
+
 ## Repository boundary
 
 - tmux integration belongs in `tmux-agent-workbench` as a provider.

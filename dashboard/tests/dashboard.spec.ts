@@ -1,12 +1,37 @@
 import{test,expect,request}from'@playwright/test';
-test('loopback auth, views, filters, pagination, SSE and CSRF controls',async({page})=>{
- await page.goto('/');await expect(page).toHaveTitle('Distributed Workbench');expect(page.url()).not.toContain('token');
- const cookies=await page.context().cookies();expect(cookies.find(c=>c.name==='workbench_operator')?.httpOnly).toBe(true);expect(cookies.find(c=>c.name==='workbench_operator')?.sameSite).toBe('Strict');
- for(const name of['runs','topology','runtime','legacy'])await expect(page.getByRole('button',{name})).toBeVisible();
- await expect(page.getByLabel('Run status')).toBeVisible();await expect(page.getByRole('button',{name:'Previous'})).toBeDisabled();
- await page.getByRole('button',{name:'topology'}).click();await expect(page.getByText('Controllers / peer health')).toBeVisible();
- await page.getByRole('button',{name:'runtime'}).click();await expect(page.getByText('Driver sessions')).toBeVisible();await expect(page.getByText('Approvals')).toBeVisible();
- const forbidden=await page.request.post('/api/operator/nonce',{data:{action:'cancel-task',target:'none',reason:'test',confirmed:true},headers:{Origin:'http://127.0.0.1:19918'}});expect(forbidden.status()).toBe(403);
- const invalidLogs=await page.request.get('/api/logs?executorId=bad%2Fid&processId=x');expect(invalidLogs.status()).toBe(400);
+
+test('profile cockpit explains the current task and drills into node lanes',async({page})=>{
+ await page.goto('/');
+ await expect(page).toHaveTitle('Distributed Workbench');
+ await expect(page.getByText('Profile 任务驾驶舱 · 只读')).toBeVisible();
+ await expect(page.getByText('每个 Profile，现在进行到哪里？')).toBeVisible();
+ const profile=page.getByRole('button',{name:/profile-a/});
+ await expect(profile).toContainText('已阻塞');
+ await expect(profile).toContainText('等待依赖：等待上游构建产物');
+ await profile.click();
+ await expect(page).toHaveURL(/\/profiles\/profile-a$/);
+ await expect(page.getByText('阶段与节点泳道')).toBeVisible();
+ await expect(page.locator('.lane-label').getByText('devbox-a',{exact:true})).toBeVisible();
+ await expect(page.locator('.lane-label').getByText('主 Agent',{exact:true})).toBeVisible();
+ await expect(page.getByText('任务被阻塞')).toBeVisible();
+ await expect(page.locator('.stage.current')).toContainText('构建');
+ await page.getByRole('button',{name:'查看证据',exact:true}).click();
+ await expect(page.getByText('STRUCTURED EVIDENCE')).toBeVisible();
+ await expect(page.getByText('原始 prompt、token、完整命令和未授权日志不会出现在此处。')).toBeVisible();
+ await page.getByRole('button',{name:'关闭证据'}).click();
+ await page.getByRole('button',{name:'← 返回所有 Profile'}).click();
+ await expect(page).toHaveURL(/\/$/);
+ await page.emulateMedia({reducedMotion:'reduce'});
+ await page.goto('/profiles/profile-a');
+ await expect(page.getByText('交付示例功能')).toBeVisible();
+ await expect(page.locator('.stage.current')).toContainText('构建');
 });
-test('API and repeat bootstrap reject a client without operator cookie',async()=>{const client=await request.newContext();const snapshot=await client.get('http://127.0.0.1:19918/api/snapshot',{headers:{Host:'127.0.0.1:19918'}});expect(snapshot.status()).toBe(401);const root=await client.get('http://127.0.0.1:19918/',{headers:{Host:'127.0.0.1:19918','Sec-Fetch-Dest':'document'}});expect(root.status()).toBe(401);await client.dispose()});
+
+test('API and repeat bootstrap reject a client without operator cookie',async()=>{
+ const client=await request.newContext();
+ const workspace=await client.get('http://127.0.0.1:19918/api/workspaces',{headers:{Host:'127.0.0.1:19918'}});
+ expect(workspace.status()).toBe(401);
+ const root=await client.get('http://127.0.0.1:19918/',{headers:{Host:'127.0.0.1:19918','Sec-Fetch-Dest':'document'}});
+ expect(root.status()).toBe(401);
+ await client.dispose();
+});

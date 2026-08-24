@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -115,6 +115,23 @@ enum RunCommand {
 #[derive(Debug, Subcommand)]
 enum ObserveCommand {
     CodexHook,
+    Block {
+        #[arg(long, value_parser = ["human", "dependency", "node", "error", "no-progress"])]
+        kind: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        waiting_on: Option<String>,
+        #[arg(long)]
+        blocker_id: Option<String>,
+        #[arg(long)]
+        run_id: Option<String>,
+    },
+    Unblock {
+        blocker_id: String,
+        #[arg(long)]
+        run_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -322,9 +339,37 @@ fn run_cli(cli: Cli) -> Result<()> {
             };
             print_response(call_unix(socket, &request)?)
         }
-        Command::Observe {
-            command: ObserveCommand::CodexHook,
-        } => observe_codex_hook(cli.socket.unwrap_or_else(default_controller_socket)),
+        Command::Observe { command } => {
+            let socket = cli.socket.unwrap_or_else(default_controller_socket);
+            match command {
+                ObserveCommand::CodexHook => observe_codex_hook(socket),
+                ObserveCommand::Block {
+                    kind,
+                    reason,
+                    waiting_on,
+                    blocker_id,
+                    run_id,
+                } => observe_blocker(
+                    socket,
+                    "blocker.open",
+                    blocker_id
+                        .unwrap_or_else(|| format!("blocker_{}", uuid::Uuid::new_v4().simple())),
+                    Some(kind),
+                    Some(reason),
+                    waiting_on,
+                    run_id,
+                ),
+                ObserveCommand::Unblock { blocker_id, run_id } => observe_blocker(
+                    socket,
+                    "blocker.resolve",
+                    blocker_id,
+                    None,
+                    None,
+                    None,
+                    run_id,
+                ),
+            }
+        }
         Command::Logs {
             component,
             correlation_id,
@@ -579,6 +624,48 @@ mod windows_service_entry {
     }
 }
 
+fn observe_blocker(
+    socket: PathBuf,
+    name: &str,
+    blocker_id: String,
+    blocker_kind: Option<String>,
+    reason: Option<String>,
+    waiting_on: Option<String>,
+    run_id: Option<String>,
+) -> Result<()> {
+    let run_id = run_id.or_else(|| env::var("WORKBENCH_RUN_ID").ok());
+    let status = if name == "blocker.open" {
+        "active"
+    } else {
+        "resolved"
+    };
+    let response = call_unix(
+        socket,
+        &Request::new(
+            "observation.append",
+            serde_json::json!({
+                "eventId":0,
+                "runId":run_id,
+                "timestamp":now_millis(),
+                "nodeId":env::var("WORKBENCH_NODE_ID").unwrap_or_else(|_|"local".into()),
+                "role":env::var("WORKBENCH_AGENT_ROLE").unwrap_or_else(|_|"agent".into()),
+                "kind":"blocker",
+                "name":name,
+                "status":status,
+                "attributes":{
+                    "blockerId":blocker_id,
+                    "blockerKind":blocker_kind,
+                    "blockerReason":reason.map(|value|value.chars().take(500).collect::<String>()),
+                    "waitingOn":waiting_on.map(|value|value.chars().take(200).collect::<String>()),
+                    "workspaceSessionId":env::var("WORKBENCH_WORKSPACE_SESSION_ID").ok(),
+                    "agentId":env::var("WORKBENCH_AGENT_ID").ok()
+                }
+            }),
+        ),
+    )?;
+    print_response(response)
+}
+
 fn observe_codex_hook(socket: PathBuf) -> Result<()> {
     let input: Value = serde_json::from_reader(std::io::stdin())?;
     let event = input
@@ -594,6 +681,16 @@ fn observe_codex_hook(socket: PathBuf) -> Result<()> {
         .get("session_id")
         .or_else(|| input.get("agentSessionId"))
         .and_then(Value::as_str);
+    let workspace_session_id = env::var("WORKBENCH_WORKSPACE_SESSION_ID").ok();
+    let node_id = env::var("WORKBENCH_NODE_ID").unwrap_or_else(|_| "local".into());
+    let role = env::var("WORKBENCH_AGENT_ROLE").unwrap_or_else(|_| "agent".into());
+    let agent_id = env::var("WORKBENCH_AGENT_ID").ok();
+    let target_summary = env::var("WORKBENCH_RUN_SUMMARY").unwrap_or_else(|_| {
+        workspace_session_id
+            .as_ref()
+            .map(|workspace| format!("{role} task in {workspace}"))
+            .unwrap_or_else(|| "Codex agent task".into())
+    });
     let state_path = agent_session_id.map(codex_hook_state_path);
     let stored = state_path
         .as_ref()
@@ -608,7 +705,7 @@ fn observe_codex_hook(socket: PathBuf) -> Result<()> {
     let request = match event {
         "UserPromptSubmit" => Request::new(
             "run.start",
-            serde_json::json!({"runId":explicit_run_id,"agentSessionId":agent_session_id,"targetSummary":"Codex agent task","createdBy":"codex-hook"}),
+            serde_json::json!({"runId":explicit_run_id,"workspaceSessionId":workspace_session_id,"agentSessionId":agent_session_id,"targetSummary":target_summary,"createdBy":"codex-hook"}),
         ),
         "Stop" | "SessionEnd" if run_id.is_some() => Request::new(
             "run.finish",
@@ -616,7 +713,7 @@ fn observe_codex_hook(socket: PathBuf) -> Result<()> {
         ),
         _ => Request::new(
             "observation.append",
-            serde_json::json!({"eventId":0,"runId":run_id,"timestamp":now_millis(),"nodeId":env::var("WORKBENCH_NODE_ID").unwrap_or_else(|_|"local".into()),"role":"agent","kind":if event.contains("ToolUse"){"agent-tool"}else{"agent-hook"},"name":event,"status":if event=="PreToolUse"{"running"}else{"completed"},"durationMs":hook_duration_ms(&input,&stored,event),"spanId":input.get("tool_use_id"),"parentSpanId":input.get("turn_id"),"attributes":{"action":input.get("tool_name").and_then(Value::as_str).unwrap_or("lifecycle"),"targetRepo":input.get("cwd").and_then(Value::as_str).and_then(|cwd|Path::new(cwd).file_name()).and_then(|name|name.to_str())}}),
+            serde_json::json!({"eventId":0,"runId":run_id,"timestamp":now_millis(),"nodeId":node_id,"role":role,"kind":if event.contains("ToolUse"){"agent-tool"}else{"agent-hook"},"name":event,"status":if event=="PreToolUse"{"running"}else{"completed"},"durationMs":hook_duration_ms(&input,&stored,event),"spanId":input.get("tool_use_id"),"parentSpanId":input.get("turn_id"),"attributes":{"action":input.get("tool_name").and_then(Value::as_str).unwrap_or("lifecycle"),"targetRepo":input.get("cwd").and_then(Value::as_str).and_then(|cwd|Path::new(cwd).file_name()).and_then(|name|name.to_str()),"workspaceSessionId":workspace_session_id,"agentId":agent_id}}),
         ),
     };
     let response = call_unix(socket, &request)?;
@@ -686,6 +783,357 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn workspace_dashboard_response(socket: &Path) -> (&'static str, &'static str, String) {
+    let fetch = |action: &str, params: Value| {
+        call_unix(socket, &Request::new(action, params)).and_then(|response| {
+            if response.ok {
+                Ok(response.result.unwrap_or(Value::Null))
+            } else {
+                Err(anyhow::anyhow!(
+                    "{}",
+                    response
+                        .error
+                        .map(|error| error.message)
+                        .unwrap_or_else(|| format!("{action} failed"))
+                ))
+            }
+        })
+    };
+    match (
+        fetch("dashboard.snapshot", Value::Null),
+        fetch("run.list", serde_json::json!({"limit":500})),
+        fetch("observability.query", serde_json::json!({"limit":1000})),
+    ) {
+        (Ok(snapshot), Ok(runs), Ok(observations)) => (
+            "200 OK",
+            "application/json",
+            build_workspace_dashboard(snapshot, runs, observations, now_millis()).to_string(),
+        ),
+        (snapshot, runs, observations) => {
+            let message = snapshot
+                .err()
+                .or_else(|| runs.err())
+                .or_else(|| observations.err())
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "dashboard data unavailable".into());
+            (
+                "503 Service Unavailable",
+                "application/json",
+                serde_json::json!({"error":message}).to_string(),
+            )
+        }
+    }
+}
+
+fn build_workspace_dashboard(
+    snapshot: Value,
+    runs_value: Value,
+    observations_value: Value,
+    now: u64,
+) -> Value {
+    let sessions = snapshot
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let runs = runs_value.as_array().cloned().unwrap_or_default();
+    let events = observations_value
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let tasks = snapshot
+        .get("tasks")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let agents = snapshot
+        .get("agents")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut run_workspaces = HashMap::new();
+    for run in &runs {
+        if let (Some(run_id), Some(workspace)) = (
+            run.get("runId").and_then(Value::as_str),
+            run.get("workspaceSessionId").and_then(Value::as_str),
+        ) {
+            run_workspaces.insert(run_id.to_owned(), workspace.to_owned());
+        }
+    }
+    let task_workspaces = tasks
+        .iter()
+        .filter_map(|task| {
+            Some((
+                task.get("id")?.as_str()?.to_owned(),
+                task.get("workspaceSessionId")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut workspaces = sessions
+        .into_iter()
+        .filter_map(|session| {
+            let id = session.get("id")?.as_str()?.to_owned();
+            let workspace_runs = runs
+                .iter()
+                .filter(|run| run.get("workspaceSessionId").and_then(Value::as_str) == Some(&id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let workspace_tasks = tasks
+                .iter()
+                .filter(|task| task.get("workspaceSessionId").and_then(Value::as_str) == Some(&id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let workspace_agents = agents
+                .iter()
+                .filter(|agent| {
+                    agent.get("workspaceSessionId").and_then(Value::as_str) == Some(&id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let mut workspace_events = events
+                .iter()
+                .filter(|event| {
+                    event
+                        .get("runId")
+                        .and_then(Value::as_str)
+                        .and_then(|run_id| run_workspaces.get(run_id))
+                        .is_some_and(|workspace| workspace == &id)
+                        || event
+                            .get("taskId")
+                            .and_then(Value::as_str)
+                            .and_then(|task_id| task_workspaces.get(task_id))
+                            .is_some_and(|workspace| workspace == &id)
+                        || event
+                            .get("attributes")
+                            .and_then(|attributes| attributes.get("workspaceSessionId"))
+                            .and_then(Value::as_str)
+                            == Some(&id)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            workspace_events
+                .sort_by_key(|event| event.get("timestamp").and_then(Value::as_u64).unwrap_or(0));
+            if workspace_events.len() > 300 {
+                workspace_events = workspace_events.split_off(workspace_events.len() - 300);
+            }
+            let observability = session
+                .get("observability")
+                .cloned()
+                .filter(|value| value.is_object())
+                .unwrap_or_else(|| {
+                    serde_json::json!({
+                        "kindLabel":"Workspace",
+                        "stages":[{"id":"activity","label":"Activity"}],
+                        "capabilityGroups":{},
+                        "defaultStallAfterMs":300000
+                    })
+                });
+            let capability_stages = observability
+                .get("capabilityGroups")
+                .and_then(Value::as_object)
+                .map(|groups| {
+                    groups
+                        .iter()
+                        .flat_map(|(stage, capabilities)| {
+                            capabilities
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(Value::as_str)
+                                .map(|capability| (capability.to_owned(), stage.clone()))
+                        })
+                        .collect::<HashMap<_, _>>()
+                })
+                .unwrap_or_default();
+            let current_stage = workspace_events
+                .iter()
+                .rev()
+                .find_map(|event| event.get("attributes")?.get("stage")?.as_str())
+                .map(str::to_owned)
+                .or_else(|| {
+                    workspace_tasks.iter().rev().find_map(|task| {
+                        capability_stages
+                            .get(task.get("capability")?.as_str()?)
+                            .cloned()
+                    })
+                })
+                .or_else(|| {
+                    observability
+                        .get("stages")?
+                        .as_array()?
+                        .first()?
+                        .get("id")?
+                        .as_str()
+                        .map(str::to_owned)
+                });
+            let mut blockers = BTreeMap::new();
+            for event in &workspace_events {
+                if event.get("kind").and_then(Value::as_str) != Some("blocker") {
+                    continue;
+                }
+                let blocker_id = event
+                    .get("attributes")
+                    .and_then(|attributes| attributes.get("blockerId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("blocker")
+                    .to_owned();
+                if event.get("status").and_then(Value::as_str) == Some("resolved") {
+                    blockers.remove(&blocker_id);
+                } else {
+                    blockers.insert(blocker_id, event.clone());
+                }
+            }
+            let failed = workspace_tasks.iter().any(|task| {
+                matches!(
+                    task.get("state").and_then(Value::as_str),
+                    Some("failed" | "failed-to-cancel" | "timed-out" | "outcome-unknown")
+                )
+            });
+            let running = workspace_runs
+                .iter()
+                .any(|run| run.get("status").and_then(Value::as_str) == Some("running"))
+                || workspace_tasks.iter().any(|task| {
+                    matches!(
+                        task.get("state").and_then(Value::as_str),
+                        Some("queued" | "running" | "cancel-requested" | "cancelling")
+                    )
+                });
+            let last_progress_at = workspace_events
+                .iter()
+                .rev()
+                .find(|event| meaningful_progress(event))
+                .and_then(|event| event.get("timestamp").and_then(Value::as_u64))
+                .or_else(|| {
+                    workspace_tasks
+                        .iter()
+                        .filter_map(|task| task.get("updatedAt").and_then(Value::as_u64))
+                        .max()
+                })
+                .or_else(|| {
+                    workspace_runs
+                        .iter()
+                        .filter_map(|run| run.get("startedAt").and_then(Value::as_u64))
+                        .max()
+                })
+                .unwrap_or(0);
+            let overdue = workspace_tasks.iter().any(|task| {
+                matches!(
+                    task.get("state").and_then(Value::as_str),
+                    Some("queued" | "running")
+                ) && task
+                    .get("expectedBy")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|deadline| now > deadline)
+            });
+            let stall_after = observability
+                .get("defaultStallAfterMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(300_000);
+            let stalled = running
+                && (overdue
+                    || (last_progress_at > 0
+                        && now.saturating_sub(last_progress_at) > stall_after));
+            let status = if failed {
+                "failed"
+            } else if !blockers.is_empty() {
+                "blocked"
+            } else if stalled {
+                "stalled"
+            } else if running {
+                "active"
+            } else {
+                "idle"
+            };
+            let current_activity = workspace_events
+                .iter()
+                .rev()
+                .find(|event| event.get("kind").and_then(Value::as_str) != Some("run"))
+                .cloned();
+            let active_nodes = workspace_tasks
+                .iter()
+                .filter(|task| {
+                    matches!(
+                        task.get("state").and_then(Value::as_str),
+                        Some("queued" | "running" | "cancel-requested" | "cancelling")
+                    )
+                })
+                .filter_map(|task| task.get("executorId").and_then(Value::as_str))
+                .chain(
+                    workspace_agents
+                        .iter()
+                        .filter(|agent| {
+                            agent.get("state").and_then(Value::as_str) == Some("running")
+                        })
+                        .filter_map(|agent| agent.get("executorId").and_then(Value::as_str)),
+                )
+                .map(str::to_owned)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let active_roles = workspace_agents
+                .iter()
+                .filter(|agent| agent.get("state").and_then(Value::as_str) == Some("running"))
+                .filter_map(|agent| agent.get("role").and_then(Value::as_str))
+                .map(str::to_owned)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            Some(serde_json::json!({
+                "id":id,
+                "objective":session.get("objective"),
+                "sessionState":session.get("state"),
+                "observability":observability,
+                "status":status,
+                "currentStage":current_stage,
+                "currentActivity":current_activity,
+                "lastProgressAt":last_progress_at,
+                "activeNodes":active_nodes,
+                "activeRoles":active_roles,
+                "blocker":blockers.values().next_back(),
+                "runs":workspace_runs,
+                "tasks":workspace_tasks,
+                "agents":workspace_agents,
+                "events":workspace_events
+            }))
+        })
+        .collect::<Vec<_>>();
+    let rank = |status: Option<&str>| match status {
+        Some("failed") => 0,
+        Some("blocked") => 1,
+        Some("stalled") => 2,
+        Some("active") => 3,
+        _ => 4,
+    };
+    workspaces.sort_by_key(|workspace| rank(workspace.get("status").and_then(Value::as_str)));
+    serde_json::json!({
+        "generatedAt":now,
+        "controller":snapshot.get("controller"),
+        "nodes":snapshot.get("executors").cloned().unwrap_or_else(||serde_json::json!([])),
+        "workspaces":workspaces,
+        "unscopedEvents":events.into_iter().filter(|event| {
+            event.get("runId").and_then(Value::as_str).is_none_or(|run_id|!run_workspaces.contains_key(run_id))
+                && event.get("taskId").and_then(Value::as_str).is_none_or(|task_id|!task_workspaces.contains_key(task_id))
+        }).collect::<Vec<_>>()
+    })
+}
+
+fn meaningful_progress(event: &Value) -> bool {
+    if event.get("kind").and_then(Value::as_str) == Some("blocker") {
+        return event.get("status").and_then(Value::as_str) == Some("resolved");
+    }
+    if event.get("name").and_then(Value::as_str) == Some("PreToolUse") {
+        return false;
+    }
+    matches!(
+        event.get("status").and_then(Value::as_str),
+        Some("completed" | "succeeded" | "ready" | "active")
+    ) || matches!(
+        event.get("kind").and_then(Value::as_str),
+        Some("task-state" | "artifact" | "generation" | "handoff" | "readiness")
+    )
 }
 
 const DASHBOARD_HTML: &str = include_str!("../../../dashboard/dist/index.html");
@@ -856,7 +1304,7 @@ fn handle_dashboard_connection(
             None,
         );
     }
-    if path == "/" && method == "GET" {
+    if (path == "/" || path.starts_with("/profiles/")) && method == "GET" {
         let browser_navigation = header("Sec-Fetch-Dest") == Some("document");
         if !authenticated
             && browser_navigation
@@ -1004,6 +1452,8 @@ fn handle_dashboard_connection(
     }
     let (status, content_type, body) = if path == "/api/snapshot" && method == "GET" {
         rpc_result_json(socket, "dashboard.snapshot", Value::Null)
+    } else if path == "/api/workspaces" && method == "GET" {
+        workspace_dashboard_response(socket)
     } else if path == "/api/runs" && method == "GET" {
         rpc_response_json(
             socket,
@@ -1525,5 +1975,49 @@ topology: {mode: full-mesh}
         assert_eq!(query_u64(&query, "tail", 1), 20);
         let unsafe_query = parse_query("/api/logs?executorId=..%2Fsecret");
         assert!(safe_query_id(&unsafe_query, "executorId").is_err());
+    }
+
+    #[test]
+    fn workspace_dashboard_groups_roles_and_surfaces_blockers() {
+        let snapshot = serde_json::json!({
+            "controller":{"id":"node-a","status":"ready"},
+            "executors":[{"id":"node-a","health":"ready"},{"id":"node-b","health":"ready"}],
+            "sessions":[{"id":"profile-a","objective":"Ship feature","state":"active","observability":{
+                "kindLabel":"Profile","stages":[{"id":"build","label":"Build"},{"id":"acceptance","label":"Acceptance"}],
+                "capabilityGroups":{"build":["artifact.build"],"acceptance":["ui.inspect"]},"defaultStallAfterMs":300000
+            }}],
+            "tasks":[{"id":"task-a","workspaceSessionId":"profile-a","executorId":"node-a","capability":"artifact.build","state":"running","createdAt":100,"updatedAt":200,"expectedBy":10000}],
+            "agents":[
+                {"id":"primary","workspaceSessionId":"profile-a","executorId":"node-a","role":"primary","state":"running"},
+                {"id":"cu","workspaceSessionId":"profile-a","executorId":"node-b","role":"computer-use","state":"running"}
+            ]
+        });
+        let runs = serde_json::json!([{"runId":"run-a","workspaceSessionId":"profile-a","status":"running","startedAt":100}]);
+        let observations = serde_json::json!({"events":[
+            {"eventId":1,"runId":"run-a","timestamp":200,"nodeId":"node-a","role":"primary","kind":"task-state","name":"artifact.build","status":"running","taskId":"task-a","attributes":{"capability":"artifact.build"}},
+            {"eventId":2,"runId":"run-a","timestamp":300,"nodeId":"node-b","role":"computer-use","kind":"blocker","name":"blocker.open","status":"active","attributes":{"blockerId":"blocker-a","blockerKind":"human","blockerReason":"approve fixture"}}
+        ]});
+
+        let result = build_workspace_dashboard(snapshot, runs, observations, 500);
+        let workspace = &result["workspaces"][0];
+        assert_eq!(workspace["id"], "profile-a");
+        assert_eq!(workspace["status"], "blocked");
+        assert_eq!(workspace["currentStage"], "build");
+        assert_eq!(workspace["activeNodes"].as_array().unwrap().len(), 2);
+        assert_eq!(workspace["blocker"]["attributes"]["blockerKind"], "human");
+    }
+
+    #[test]
+    fn workspace_dashboard_marks_overdue_running_task_stalled() {
+        let snapshot = serde_json::json!({
+            "executors":[],
+            "sessions":[{"id":"profile-a","objective":"Ship feature","state":"active","observability":{"defaultStallAfterMs":300000}}],
+            "tasks":[{"id":"task-a","workspaceSessionId":"profile-a","executorId":"node-a","capability":"artifact.build","state":"running","createdAt":100,"updatedAt":200,"expectedBy":400}],
+            "agents":[]
+        });
+        let runs = serde_json::json!([{"runId":"run-a","workspaceSessionId":"profile-a","status":"running","startedAt":100}]);
+        let result =
+            build_workspace_dashboard(snapshot, runs, serde_json::json!({"events":[]}), 500);
+        assert_eq!(result["workspaces"][0]["status"], "stalled");
     }
 }

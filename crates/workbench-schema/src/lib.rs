@@ -24,6 +24,53 @@ pub struct WorkspaceSession {
     pub state: SessionState,
     #[serde(default)]
     pub authority: Option<SessionAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observability: Option<SessionObservability>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionObservability {
+    #[serde(default = "default_workspace_kind_label")]
+    pub kind_label: String,
+    #[serde(default)]
+    pub stages: Vec<ObservabilityStage>,
+    #[serde(default)]
+    pub capability_groups: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub safe_fields: Vec<String>,
+    #[serde(default)]
+    pub process_restart_templates: Vec<Value>,
+    #[serde(default = "default_stall_after_ms")]
+    pub default_stall_after_ms: u64,
+}
+
+impl Default for SessionObservability {
+    fn default() -> Self {
+        Self {
+            kind_label: default_workspace_kind_label(),
+            stages: Vec::new(),
+            capability_groups: BTreeMap::new(),
+            safe_fields: Vec::new(),
+            process_restart_templates: Vec::new(),
+            default_stall_after_ms: default_stall_after_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservabilityStage {
+    pub id: String,
+    pub label: String,
+}
+
+fn default_workspace_kind_label() -> String {
+    "Workspace".to_owned()
+}
+
+fn default_stall_after_ms() -> u64 {
+    300_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

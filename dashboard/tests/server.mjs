@@ -1,1 +1,17 @@
-import{spawn}from'node:child_process';import{mkdirSync,rmSync}from'node:fs';import{resolve}from'node:path';const state='/tmp/workbench-dashboard-e2e';rmSync(state,{recursive:true,force:true});mkdirSync(state,{recursive:true});const binary=resolve('../target/debug/workbench'),socket=`${state}/controller.sock`;const controller=spawn(binary,['--socket',socket,'controller','serve','--state',`${state}/controller.json`,'--id','e2e-controller'],{stdio:'inherit'});await new Promise(r=>setTimeout(r,400));const dashboard=spawn(binary,['--socket',socket,'dashboard','--listen','127.0.0.1:19918'],{stdio:'inherit'});const stop=()=>{dashboard.kill('SIGTERM');controller.kill('SIGTERM')};process.on('SIGTERM',()=>{stop();process.exit(0)});process.on('SIGINT',()=>{stop();process.exit(0)});await new Promise(()=>{});
+import{spawn,spawnSync}from'node:child_process';
+import{existsSync,mkdirSync,rmSync}from'node:fs';
+import{resolve}from'node:path';
+const state='/tmp/workbench-dashboard-e2e';
+rmSync(state,{recursive:true,force:true});mkdirSync(state,{recursive:true});
+const binary=resolve('../target/debug/workbench'),socket=`${state}/controller.sock`;
+const controller=spawn(binary,['--socket',socket,'controller','serve','--state',`${state}/controller.json`,'--id','e2e-controller'],{stdio:'inherit'});
+for(let attempt=0;attempt<50&&!existsSync(socket);attempt++)await new Promise(resolve=>setTimeout(resolve,100));
+if(!existsSync(socket))throw Error('controller socket did not become ready');
+const call=(action,params)=>{const result=spawnSync(binary,['--socket',socket,'call',action,JSON.stringify(params)],{encoding:'utf8'});if(result.status!==0)throw Error(result.stderr||result.stdout)};
+call('session.put',{apiVersion:'workbench.dev/v1',metadata:{id:'profile-a',labels:{},createdAt:100,updatedAt:100},objective:'交付示例功能',state:'active',observability:{kindLabel:'Profile',stages:[{id:'prepare',label:'Prepare'},{id:'build',label:'Build'},{id:'publish',label:'Publish'},{id:'acceptance',label:'Acceptance'}],capabilityGroups:{prepare:['application.validate'],build:['artifact.build'],publish:['application.finalize'],acceptance:['ui.inspect']},defaultStallAfterMs:300000}});
+call('run.start',{runId:'run-e2e',workspaceSessionId:'profile-a',agentSessionId:'agent-e2e',targetSummary:'Build dashboard',createdBy:'e2e'});
+call('observation.append',{eventId:0,runId:'run-e2e',timestamp:Date.now()-15000,nodeId:'devbox-a',role:'primary',kind:'task-state',name:'artifact.build',status:'running',taskId:'task-e2e',attributes:{capability:'artifact.build',stage:'build',workspaceSessionId:'profile-a'}});
+call('observation.append',{eventId:0,runId:'run-e2e',timestamp:Date.now()-5000,nodeId:'devbox-a',role:'primary',kind:'blocker',name:'blocker.open',status:'active',attributes:{blockerId:'blocker-e2e',blockerKind:'dependency',blockerReason:'等待上游构建产物',waitingOn:'upstream-build',workspaceSessionId:'profile-a'}});
+const dashboard=spawn(binary,['--socket',socket,'dashboard','--listen','127.0.0.1:19918'],{stdio:'inherit'});
+const stop=()=>{dashboard.kill('SIGTERM');controller.kill('SIGTERM')};
+process.on('SIGTERM',()=>{stop();process.exit(0)});process.on('SIGINT',()=>{stop();process.exit(0)});await new Promise(()=>{});

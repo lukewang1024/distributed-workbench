@@ -526,16 +526,22 @@ impl Controller {
                     "generatedAt": now_ms(),
                     "controller": {"id": self.id, "status": "ready"},
                     "controllers": state.controllers.iter().map(|item| json!({"id":item.metadata.id,"health":item.health})).collect::<Vec<_>>(),
-                    "sessions": state.sessions.iter().map(|item| json!({"id":item.metadata.id,"state":item.state})).collect::<Vec<_>>(),
+                    "sessions": state.sessions.iter().map(|item| json!({"id":item.metadata.id,"objective":item.objective,"state":item.state,"observability":item.observability})).collect::<Vec<_>>(),
                     "executors": state.executors.iter().map(|item| json!({"id":item.metadata.id,"health":item.health,"capabilityCount":item.capabilities.len()})).collect::<Vec<_>>(),
                     "leases": leases.iter().map(|item|json!({"id":item.id,"kind":item.kind,"resource":item.resource,"owner":item.owner,"fence":item.fence,"expiresAt":item.expires_at,"handoffTo":item.handoff_to})).collect::<Vec<_>>(),
                     "ports": leases.iter().filter(|item|item.resource.starts_with("port:")).map(|item|json!({"id":item.id,"resource":item.resource,"owner":item.owner,"expiresAt":item.expires_at})).collect::<Vec<_>>(),
                     "approvals": state.approvals.iter().map(|item|json!({"id":item.id,"owner":item.owner,"state":item.state,"digest":item.digest,"createdAt":item.created_at,"expiresAt":item.expires_at})).collect::<Vec<_>>(),
                     "processNodes":process_nodes,
-                    "tasks": tasks.iter().map(|item| json!({"id":item.id,"workspaceSessionId":item.workspace_session_id,"executorId":item.executor_id,"capability":item.capability,"state":item.state,"createdAt":item.created_at,"updatedAt":item.updated_at})).collect::<Vec<_>>(),
+                    "tasks": tasks.iter().map(|item| {
+                        let timeout_ms = state.executors.iter()
+                            .find(|executor| executor.metadata.id == item.executor_id)
+                            .and_then(|executor| executor.capabilities.iter().find(|capability| capability.name == item.capability))
+                            .map(|capability| capability.timeout_ms);
+                        json!({"id":item.id,"workspaceSessionId":item.workspace_session_id,"executorId":item.executor_id,"capability":item.capability,"state":item.state,"createdAt":item.created_at,"updatedAt":item.updated_at,"timeoutMs":timeout_ms,"expectedBy":timeout_ms.map(|timeout|item.created_at.saturating_add(timeout))})
+                    }).collect::<Vec<_>>(),
                     "artifacts": state.artifacts.iter().map(|item| json!({"digest":item.digest,"artifactType":item.artifact_type,"size":item.size,"createdAt":item.created_at})).collect::<Vec<_>>(),
                     "generations": state.generations.iter().map(|item| json!({"id":item.id,"state":item.state})).collect::<Vec<_>>(),
-                    "agents": state.agents.iter().map(|item| json!({"id":item.id,"state":item.state,"role":item.role,"executorId":item.executor_id})).collect::<Vec<_>>()
+                    "agents": state.agents.iter().map(|item| json!({"id":item.id,"workspaceSessionId":item.workspace_session_id,"state":item.state,"role":item.role,"executorId":item.executor_id})).collect::<Vec<_>>()
                 }))
             }
             "run.start" => {
@@ -1645,6 +1651,33 @@ impl Controller {
                             format!("executor does not provide {capability_name}"),
                         )
                     })?;
+                if capability_name == "agent.start" {
+                    let role = input
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .unwrap_or("agent")
+                        .to_owned();
+                    let agent_id = input
+                        .get("agentId")
+                        .and_then(Value::as_str)
+                        .unwrap_or(owner)
+                        .to_owned();
+                    if !input.get("env").is_some_and(Value::is_object) {
+                        input["env"] = json!({});
+                    }
+                    let env = input["env"].as_object_mut().expect("agent env is object");
+                    env.insert(
+                        "WORKBENCH_WORKSPACE_SESSION_ID".into(),
+                        json!(workspace_session_id),
+                    );
+                    env.insert("WORKBENCH_NODE_ID".into(), json!(executor_id));
+                    env.insert("WORKBENCH_AGENT_ROLE".into(), json!(role.clone()));
+                    env.insert("WORKBENCH_AGENT_ID".into(), json!(agent_id));
+                    env.insert(
+                        "WORKBENCH_RUN_SUMMARY".into(),
+                        json!(format!("{role} task in {workspace_session_id}")),
+                    );
+                }
                 if !matches!(contract.effect, workbench_schema::Effect::ReadOnly) {
                     self.leases
                         .lock()
@@ -3197,6 +3230,12 @@ fn safe_observation_attributes(attributes: &Value) -> Value {
         "artifactDigest",
         "approvalId",
         "action",
+        "workspaceSessionId",
+        "agentId",
+        "blockerId",
+        "blockerKind",
+        "blockerReason",
+        "waitingOn",
     ];
     let Some(object) = attributes.as_object() else {
         return json!({});
