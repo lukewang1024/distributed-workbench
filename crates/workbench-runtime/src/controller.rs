@@ -3419,6 +3419,45 @@ fn retained_task_output(capability: &str, result: &Value) -> Value {
     if capability != "ui.native-inspect" {
         return result.clone();
     }
+    let processes = result
+        .pointer("/inspection/processes")
+        .and_then(Value::as_array)
+        .map(|processes| {
+            processes
+                .iter()
+                .map(|process| {
+                    let windows = process
+                        .get("windows")
+                        .and_then(Value::as_array)
+                        .map(|windows| {
+                            windows
+                                .iter()
+                                .map(|window| {
+                                    let mut accessible_names = Vec::new();
+                                    collect_native_accessible_names(
+                                        window,
+                                        &mut accessible_names,
+                                        128,
+                                    );
+                                    json!({
+                                        "role": window.get("role").cloned().unwrap_or(Value::Null),
+                                        "title": window.get("title").cloned().unwrap_or(Value::Null),
+                                        "value": window.get("value").cloned().unwrap_or(Value::Null),
+                                        "description": window.get("description").cloned().unwrap_or(Value::Null),
+                                        "accessibleNames": accessible_names,
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    json!({
+                        "pid": process.get("pid").cloned().unwrap_or(Value::Null),
+                        "windows": windows,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     json!({
         "applicationPath": result.get("applicationPath").cloned().unwrap_or(Value::Null),
         "pids": result.get("pids").cloned().unwrap_or_else(|| json!([])),
@@ -3427,9 +3466,43 @@ fn retained_task_output(capability: &str, result: &Value) -> Value {
                 .cloned().unwrap_or(Value::Bool(false)),
             "processCount": result.pointer("/inspection/processes")
                 .and_then(Value::as_array).map_or(0, Vec::len),
+            "processes": processes,
         },
         "inspectedAt": result.get("inspectedAt").cloned().unwrap_or(Value::Null),
     })
+}
+
+fn collect_native_accessible_names(value: &Value, names: &mut Vec<String>, limit: usize) {
+    if names.len() >= limit {
+        return;
+    }
+    if let Some(role) = value.get("role").and_then(Value::as_str)
+        && matches!(
+            role,
+            "AXMenuBar" | "AXMenuBarItem" | "AXMenu" | "AXMenuItem"
+        )
+    {
+        return;
+    }
+    for key in ["title", "value", "description"] {
+        if let Some(text) = value.get(key).and_then(Value::as_str) {
+            let text = text.trim();
+            if !text.is_empty() && !names.iter().any(|existing| existing == text) {
+                names.push(text.to_owned());
+                if names.len() >= limit {
+                    return;
+                }
+            }
+        }
+    }
+    if let Some(children) = value.get("children").and_then(Value::as_array) {
+        for child in children {
+            collect_native_accessible_names(child, names, limit);
+            if names.len() >= limit {
+                return;
+            }
+        }
+    }
 }
 
 fn compact_task_outputs(tasks: &mut [Task]) -> bool {
@@ -4505,14 +4578,25 @@ mod tests {
             "pids": [42],
             "inspection": {
                 "accessibilityTrusted": true,
-                "processes": [{"pid": 42, "windows": [{"children": [null, null]}]}]
+                "processes": [{"pid": 42, "windows": [{
+                    "role": "AXWindow",
+                    "title": "",
+                    "children": [
+                        {"role": "AXStaticText", "title": "document.docx"},
+                        {"role": "AXMenu", "children": [{"title": "Passwords…"}]}
+                    ]
+                }]}]
             },
             "inspectedAt": 123
         });
         let compact = retained_task_output("ui.native-inspect", &output);
         assert_eq!(compact["inspection"]["accessibilityTrusted"], true);
         assert_eq!(compact["inspection"]["processCount"], 1);
-        assert!(compact["inspection"].get("processes").is_none());
+        assert_eq!(compact["inspection"]["processes"][0]["pid"], 42);
+        assert_eq!(
+            compact["inspection"]["processes"][0]["windows"][0]["accessibleNames"],
+            json!(["document.docx"])
+        );
         assert_eq!(retained_task_output("ui.evaluate", &output), output);
     }
 
