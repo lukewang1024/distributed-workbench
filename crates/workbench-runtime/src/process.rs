@@ -327,12 +327,12 @@ fn refresh(record: &mut ProcessRecord) {
         record.updated_at = now_ms();
         return;
     }
-    if let Ok(length) = fs::metadata(&record.log_path).map(|value| value.len()) {
-        if length > record.last_log_progress.unwrap_or(record.log_start_offset) {
-            record.last_log_progress = Some(length);
-            record.phase = "BUILDING".to_owned();
-            record.updated_at = now_ms();
-        }
+    if let Ok(length) = fs::metadata(&record.log_path).map(|value| value.len())
+        && length > record.last_log_progress.unwrap_or(record.log_start_offset)
+    {
+        record.last_log_progress = Some(length);
+        record.phase = "BUILDING".to_owned();
+        record.updated_at = now_ms();
     }
     if record.readiness.state == ReadinessState::Pending {
         record.readiness.attempts = record.readiness.attempts.saturating_add(1);
