@@ -65,14 +65,19 @@ pub fn inspect(application: &Path) -> Result<Value, RpcError> {
     }))
 }
 
+pub struct LaunchOptions<'a> {
+    pub user_data_dir: Option<&'a Path>,
+    pub chromium_local_state_path: Option<&'a Path>,
+    pub chromium_local_state_patch: Option<&'a Value>,
+    pub file: Option<&'a Path>,
+    pub remote_debugging_port: Option<u16>,
+    pub terminate_conflicting_instances: bool,
+}
+
 pub fn launch(
     application: &Path,
     args: &[String],
-    user_data_dir: Option<&Path>,
-    chromium_local_state_patch: Option<&Value>,
-    file: Option<&Path>,
-    remote_debugging_port: Option<u16>,
-    terminate_conflicting_instances: bool,
+    options: LaunchOptions<'_>,
 ) -> Result<Value, RpcError> {
     let executable = find_executable(application).ok_or_else(|| {
         RpcError::new(
@@ -80,36 +85,48 @@ pub fn launch(
             "application executable is missing",
         )
     })?;
-    if let Some(profile) = user_data_dir {
+    if let Some(profile) = options.user_data_dir {
         fs::create_dir_all(profile)
             .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
     }
-    let terminated = if terminate_conflicting_instances {
-        terminate_process_trees(&executable, user_data_dir, remote_debugging_port)?
+    let terminated = if options.terminate_conflicting_instances {
+        terminate_process_trees(
+            &executable,
+            options.user_data_dir,
+            options.remote_debugging_port,
+        )?
     } else {
         0
     };
     // Chromium writes Local State while shutting down. Patch only after every
     // conflicting process has exited, otherwise its final flush can silently
     // replace the development resource flags before the new process starts.
-    let local_state_patch = match (user_data_dir, chromium_local_state_patch) {
-        (Some(profile), Some(patch)) => Some(patch_chromium_local_state(profile, patch)?),
+    let local_state = options
+        .chromium_local_state_path
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            options
+                .user_data_dir
+                .map(|profile| profile.join("Local State"))
+        });
+    let local_state_patch = match (local_state.as_deref(), options.chromium_local_state_patch) {
+        (Some(local_state), Some(patch)) => Some(patch_chromium_local_state(local_state, patch)?),
         (None, Some(_)) => {
             return Err(RpcError::new(
                 "INVALID_PARAMS",
-                "chromiumLocalStatePatch requires userDataDir",
+                "chromiumLocalStatePatch requires chromiumLocalStatePath or userDataDir",
             ));
         }
         _ => None,
     };
     let mut launch_args = args.to_vec();
-    if let Some(profile) = user_data_dir {
+    if let Some(profile) = options.user_data_dir {
         launch_args.push(format!("--user-data-dir={}", profile.display()));
     }
-    if let Some(port) = remote_debugging_port {
+    if let Some(port) = options.remote_debugging_port {
         launch_args.push(format!("--remote-debugging-port={port}"));
     }
-    if let Some(file) = file {
+    if let Some(file) = options.file {
         launch_args.push(file.to_string_lossy().into_owned());
     }
     let pid = spawn_in_active_session(&executable, &launch_args, application)?;
@@ -120,7 +137,7 @@ pub fn launch(
         "launcherPid": pid,
         "terminatedConflictingInstances": terminated,
         "chromiumLocalState": local_state_patch,
-        "file": file,
+        "file": options.file,
         "args": args,
         "cdp": Value::Null,
         "readyAt": now_ms(),
@@ -138,18 +155,23 @@ fn merge_json(target: &mut Value, patch: &Value) {
     }
 }
 
-fn patch_chromium_local_state(profile: &Path, patch: &Value) -> Result<Value, RpcError> {
+fn patch_chromium_local_state(local_state: &Path, patch: &Value) -> Result<Value, RpcError> {
     if !patch.is_object() {
         return Err(RpcError::new(
             "INVALID_PARAMS",
             "chromiumLocalStatePatch must be an object",
         ));
     }
-    fs::create_dir_all(profile)
+    let parent = local_state.parent().ok_or_else(|| {
+        RpcError::new(
+            "INVALID_PARAMS",
+            "chromiumLocalStatePath must have a parent directory",
+        )
+    })?;
+    fs::create_dir_all(parent)
         .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
-    let local_state = profile.join("Local State");
     let mut state = if local_state.exists() {
-        let bytes = fs::read(&local_state)
+        let bytes = fs::read(local_state)
             .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
         serde_json::from_slice(&bytes).map_err(|error| {
             RpcError::new(
@@ -167,7 +189,7 @@ fn patch_chromium_local_state(profile: &Path, patch: &Value) -> Result<Value, Rp
         ));
     }
     merge_json(&mut state, patch);
-    let temporary = profile.join(format!(".Local State.{}.tmp", std::process::id()));
+    let temporary = parent.join(format!(".Local State.{}.tmp", std::process::id()));
     let bytes = serde_json::to_vec(&state)
         .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
     fs::write(&temporary, bytes)
@@ -735,7 +757,7 @@ mod tests {
         .unwrap();
 
         let result = patch_chromium_local_state(
-            directory.path(),
+            &directory.path().join("Local State"),
             &json!({"saman": {"use_file_resource": true, "hotfix": {"is_enabled": false}}}),
         )
         .unwrap();

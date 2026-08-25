@@ -1197,6 +1197,11 @@ impl ExecutorRuntime {
                     .and_then(Value::as_str)
                     .map(|_| self.path(&params, "userDataDir", false))
                     .transpose()?;
+                let chromium_local_state_path = params
+                    .get("chromiumLocalStatePath")
+                    .and_then(Value::as_str)
+                    .map(|_| self.path(&params, "chromiumLocalStatePath", false))
+                    .transpose()?;
                 let file = params
                     .get("file")
                     .and_then(Value::as_str)
@@ -1205,17 +1210,20 @@ impl ExecutorRuntime {
                 crate::windows::launch(
                     &application_path,
                     &string_array(&params, "args")?,
-                    user_data_dir.as_deref(),
-                    params.get("chromiumLocalStatePatch"),
-                    file.as_deref(),
-                    params
-                        .get("remoteDebuggingPort")
-                        .and_then(Value::as_u64)
-                        .map(|port| port as u16),
-                    params
-                        .get("terminateConflictingInstances")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
+                    crate::windows::LaunchOptions {
+                        user_data_dir: user_data_dir.as_deref(),
+                        chromium_local_state_path: chromium_local_state_path.as_deref(),
+                        chromium_local_state_patch: params.get("chromiumLocalStatePatch"),
+                        file: file.as_deref(),
+                        remote_debugging_port: params
+                            .get("remoteDebuggingPort")
+                            .and_then(Value::as_u64)
+                            .map(|port| port as u16),
+                        terminate_conflicting_instances: params
+                            .get("terminateConflictingInstances")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    },
                 )
             }
             #[cfg(target_os = "macos")]
@@ -1868,6 +1876,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "bundleIdentifier": {"type": "string"},
                 "args": {"type": "array", "items": {"type": "string"}},
                 "userDataDir": {"type": "string"},
+                "chromiumLocalStatePath": {"type": "string"},
                 "chromiumLocalStatePatch": {"type": "object"},
                 "file": {"type": "string"},
                 "remoteDebuggingPort": {"type": "integer"},
@@ -2146,7 +2155,10 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                             (name, key.as_str()),
                             (
                                 "application.launch",
-                                "chromiumLocalStatePatch" | "file" | "userDataDir"
+                                "chromiumLocalStatePatch"
+                                    | "chromiumLocalStatePath"
+                                    | "file"
+                                    | "userDataDir"
                             ) | ("application.open-file", "handlerPath")
                         )
                         || (name == "filesystem.write" && key.as_str() == "expectedDigest"))
