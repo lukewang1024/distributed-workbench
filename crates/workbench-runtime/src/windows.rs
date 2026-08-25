@@ -69,6 +69,7 @@ pub struct LaunchOptions<'a> {
     pub user_data_dir: Option<&'a Path>,
     pub chromium_local_state_path: Option<&'a Path>,
     pub chromium_local_state_patch: Option<&'a Value>,
+    pub chromium_local_state_settle_ms: u64,
     pub file: Option<&'a Path>,
     pub remote_debugging_port: Option<u16>,
     pub terminate_conflicting_instances: bool,
@@ -109,16 +110,19 @@ pub fn launch(
                 .user_data_dir
                 .map(|profile| profile.join("Local State"))
         });
-    let local_state_patch = match (local_state.as_deref(), options.chromium_local_state_patch) {
-        (Some(local_state), Some(patch)) => Some(patch_chromium_local_state(local_state, patch)?),
-        (None, Some(_)) => {
-            return Err(RpcError::new(
-                "INVALID_PARAMS",
-                "chromiumLocalStatePatch requires chromiumLocalStatePath or userDataDir",
-            ));
-        }
-        _ => None,
-    };
+    let prelaunch_local_state_patch =
+        match (local_state.as_deref(), options.chromium_local_state_patch) {
+            (Some(local_state), Some(patch)) => {
+                Some(patch_chromium_local_state(local_state, patch)?)
+            }
+            (None, Some(_)) => {
+                return Err(RpcError::new(
+                    "INVALID_PARAMS",
+                    "chromiumLocalStatePatch requires chromiumLocalStatePath or userDataDir",
+                ));
+            }
+            _ => None,
+        };
     let mut launch_args = args.to_vec();
     if let Some(profile) = options.user_data_dir {
         launch_args.push(format!("--user-data-dir={}", profile.display()));
@@ -130,13 +134,33 @@ pub fn launch(
         launch_args.push(file.to_string_lossy().into_owned());
     }
     let pid = spawn_in_active_session(&executable, &launch_args, application)?;
+    if options.chromium_local_state_patch.is_some() && options.chromium_local_state_settle_ms > 0 {
+        thread::sleep(Duration::from_millis(
+            options.chromium_local_state_settle_ms,
+        ));
+    }
+    // The native CCM bootstrap can flush its startup snapshot after process
+    // creation, replacing values written before launch. Re-apply the exact
+    // patch after that startup settle window and fail launch if the atomic
+    // write/read path cannot be completed.
+    let postlaunch_local_state_patch =
+        match (local_state.as_deref(), options.chromium_local_state_patch) {
+            (Some(local_state), Some(patch)) => {
+                Some(patch_chromium_local_state(local_state, patch)?)
+            }
+            _ => None,
+        };
     Ok(json!({
         "applicationPath": application,
         "executable": executable,
         "pid": pid,
         "launcherPid": pid,
         "terminatedConflictingInstances": terminated,
-        "chromiumLocalState": local_state_patch,
+        "chromiumLocalState": {
+            "prelaunch": prelaunch_local_state_patch,
+            "postlaunch": postlaunch_local_state_patch,
+            "settleMs": options.chromium_local_state_settle_ms,
+        },
         "file": options.file,
         "args": args,
         "cdp": Value::Null,

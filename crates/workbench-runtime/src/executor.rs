@@ -1282,6 +1282,10 @@ impl ExecutorRuntime {
                         user_data_dir: user_data_dir.as_deref(),
                         chromium_local_state_path: chromium_local_state_path.as_deref(),
                         chromium_local_state_patch: params.get("chromiumLocalStatePatch"),
+                        chromium_local_state_settle_ms: params
+                            .get("chromiumLocalStateSettleMs")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
                         file: file.as_deref(),
                         remote_debugging_port: params
                             .get("remoteDebuggingPort")
@@ -1994,6 +1998,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "userDataDir": {"type": "string"},
                 "chromiumLocalStatePath": {"type": "string"},
                 "chromiumLocalStatePatch": {"type": "object"},
+                "chromiumLocalStateSettleMs": {"type": "integer", "minimum": 0, "maximum": 30000},
                 "file": {"type": "string"},
                 "remoteDebuggingPort": {"type": "integer"},
                 "terminateConflictingInstances": {"type": "boolean"}
@@ -2276,6 +2281,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                                 "application.launch",
                                 "chromiumLocalStatePatch"
                                     | "chromiumLocalStatePath"
+                                    | "chromiumLocalStateSettleMs"
                                     | "file"
                                     | "userDataDir"
                             ) | ("application.open-file", "handlerPath")
