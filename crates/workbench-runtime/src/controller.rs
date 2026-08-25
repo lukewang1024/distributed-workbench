@@ -1693,6 +1693,10 @@ impl Controller {
                             format!("executor does not provide {capability_name}"),
                         )
                     })?;
+                let invocation_is_readonly =
+                    matches!(contract.effect, workbench_schema::Effect::ReadOnly)
+                        || (capability_name == "command.run"
+                            && input.get("mode").and_then(Value::as_str) == Some("readonly"));
                 if capability_name == "agent.start" {
                     let role = input
                         .get("role")
@@ -1720,7 +1724,7 @@ impl Controller {
                         json!(format!("{role} task in {workspace_session_id}")),
                     );
                 }
-                if !matches!(contract.effect, workbench_schema::Effect::ReadOnly) {
+                if !invocation_is_readonly {
                     self.leases
                         .lock()
                         .expect("lease lock")
@@ -1818,9 +1822,10 @@ impl Controller {
                     .iter()
                     .map(|lock| render_lock(&lock.key, &input))
                     .collect::<Result<_, _>>()?;
-                if !matches!(contract.effect, workbench_schema::Effect::ReadOnly)
-                    && resources.is_empty()
-                {
+                if capability_name == "command.run" && !invocation_is_readonly {
+                    resources.extend(command_resources(&input)?);
+                }
+                if !invocation_is_readonly && resources.is_empty() {
                     resources.push(format!("workspace:{workspace_session_id}"));
                 }
                 let mut acquired = Vec::new();
@@ -1854,7 +1859,7 @@ impl Controller {
                         }
                     }
                 }
-                if !matches!(contract.effect, workbench_schema::Effect::ReadOnly) {
+                if !invocation_is_readonly {
                     input["_workspaceSessionId"] = Value::String(workspace_session_id.to_owned());
                     input["_authority"] = Value::Array(
                         acquired
@@ -3758,6 +3763,37 @@ fn render_lock(template: &str, input: &Value) -> Result<String, RpcError> {
         rendered.replace_range(start..=end, &value);
     }
     Ok(rendered)
+}
+
+fn command_resources(input: &Value) -> Result<Vec<String>, RpcError> {
+    let Some(values) = input.get("resources") else {
+        return Ok(Vec::new());
+    };
+    let values = values
+        .as_array()
+        .ok_or_else(|| RpcError::new("INVALID_PARAMS", "command resources must be an array"))?;
+    if values.len() > 32 {
+        return Err(RpcError::new(
+            "INVALID_PARAMS",
+            "command resources may contain at most 32 entries",
+        ));
+    }
+    values
+        .iter()
+        .map(|value| {
+            let resource = value.as_str().ok_or_else(|| {
+                RpcError::new("INVALID_PARAMS", "command resources must be strings")
+            })?;
+            if resource.is_empty() || resource.len() > 512 || resource.chars().any(char::is_control)
+            {
+                return Err(RpcError::new(
+                    "INVALID_PARAMS",
+                    "command resource is empty, too long, or contains control characters",
+                ));
+            }
+            Ok(format!("command:{resource}"))
+        })
+        .collect()
 }
 
 fn wait_for_process_readiness(
