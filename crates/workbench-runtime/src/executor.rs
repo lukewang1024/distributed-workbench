@@ -37,6 +37,7 @@ pub struct ExecutorRuntime {
 struct ExecutionCapacity {
     mutating: CapacityPool,
     readonly: CapacityPool,
+    probes: CapacityPool,
 }
 
 #[derive(Debug)]
@@ -60,6 +61,7 @@ impl ExecutionCapacity {
         Self {
             mutating: CapacityPool::new(mutating),
             readonly: CapacityPool::new(readonly),
+            probes: CapacityPool::new(4),
         }
     }
 
@@ -81,12 +83,20 @@ impl ExecutionCapacity {
         Self {
             mutating: CapacityPool::new(mutating),
             readonly: CapacityPool::new(readonly),
+            probes: CapacityPool::new(
+                std::env::var("WORKBENCH_EXECUTOR_PROBE_CONCURRENCY")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .filter(|value: &usize| *value > 0)
+                    .unwrap_or(4),
+            ),
         }
     }
 
     fn try_acquire(&self, class: ExecutionClass) -> Result<Option<ExecutionPermit<'_>>, RpcError> {
         match class {
             ExecutionClass::Control => Ok(None),
+            ExecutionClass::Probe => self.probes.try_acquire().map(Some),
             ExecutionClass::ReadOnly => self.readonly.try_acquire().map(Some),
             ExecutionClass::Mutating => self.mutating.try_acquire().map(Some),
         }
@@ -119,6 +129,7 @@ impl CapacityPool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExecutionClass {
     Control,
+    Probe,
     ReadOnly,
     Mutating,
 }
@@ -146,7 +157,7 @@ fn execution_class(action: &str, params: &Value) -> ExecutionClass {
         | "ui.evaluate"
         | "ui.native-inspect" => ExecutionClass::ReadOnly,
         "command.run" if params.get("mode").and_then(Value::as_str) == Some("readonly") => {
-            ExecutionClass::ReadOnly
+            ExecutionClass::Probe
         }
         _ => ExecutionClass::Mutating,
     }
@@ -1479,7 +1490,7 @@ impl ExecutorRuntime {
         let readiness = (direction == "local-forward").then(|| {
             json!({
                 "type": "tcp", "host": bind_host, "port": bind_port,
-                "timeoutMs": 30_000, "intervalMs": 500
+                "timeoutMs": 8_000, "intervalMs": 250
             })
         });
         let record = self.processes.start(
@@ -2339,6 +2350,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
 fn capability_priority(name: &str) -> u8 {
     match execution_class(name, &Value::Null) {
         ExecutionClass::Control => 0,
+        ExecutionClass::Probe => 2,
         ExecutionClass::ReadOnly => 2,
         ExecutionClass::Mutating
             if matches!(name, "tunnel.ensure" | "process.start" | "process.stop") =>
@@ -2350,19 +2362,26 @@ fn capability_priority(name: &str) -> u8 {
 }
 
 fn capability_concurrency(name: &str) -> Option<u32> {
+    if name == "command.run" {
+        return Some(4);
+    }
     match execution_class(name, &Value::Null) {
         ExecutionClass::Control => None,
+        ExecutionClass::Probe => Some(4),
         ExecutionClass::ReadOnly => Some(8),
         ExecutionClass::Mutating => Some(1),
     }
 }
 
 fn capability_cancel_policy(name: &str) -> CancelPolicy {
-    if matches!(name, "command.run" | "readiness.wait" | "logs.read") {
-        CancelPolicy::CancelOnDisconnect
-    } else {
-        CancelPolicy::Continue
-    }
+    // The synchronous IPC transport cannot yet prove a disconnect early
+    // enough to stop in-flight Executor work.  Continue is intentional: the
+    // Controller persists the task before dispatch, so abandoned client waits
+    // remain visible through task.list/task.get and can be cancelled by an
+    // operator.  Do not advertise cancel-on-disconnect until that transport
+    // hook exists end to end.
+    let _ = name;
+    CancelPolicy::Continue
 }
 
 fn output_schema(name: &str) -> Value {
@@ -3157,7 +3176,7 @@ mod tests {
             .find(|capability| capability.name == "command.run")
             .unwrap();
         assert_eq!(command.priority, 4);
-        assert_eq!(command.cancel_policy, CancelPolicy::CancelOnDisconnect);
+        assert_eq!(command.cancel_policy, CancelPolicy::Continue);
         assert_eq!(
             command.input_schema["properties"]["mode"]["enum"],
             json!(["readonly", "mutating"])
