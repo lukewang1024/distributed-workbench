@@ -1206,6 +1206,7 @@ impl ExecutorRuntime {
                     &application_path,
                     &string_array(&params, "args")?,
                     user_data_dir.as_deref(),
+                    params.get("chromiumLocalStatePatch"),
                     file.as_deref(),
                     params
                         .get("remoteDebuggingPort")
