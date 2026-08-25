@@ -395,7 +395,7 @@ fn process_error(code: &str, record: &ProcessRecord, retryable: bool) -> RpcErro
 }
 
 #[cfg(unix)]
-fn stop_process(pid: u32) -> Result<(), RpcError> {
+pub(crate) fn stop_process(pid: u32) -> Result<(), RpcError> {
     // Processes started by this table lead their own process group. Signal the
     // group so package managers and shells cannot leave product servers or
     // download helpers behind after a restart.
@@ -412,7 +412,7 @@ fn stop_process(pid: u32) -> Result<(), RpcError> {
 }
 
 #[cfg(windows)]
-fn stop_process(pid: u32) -> Result<(), RpcError> {
+pub(crate) fn stop_process(pid: u32) -> Result<(), RpcError> {
     let status = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .status()

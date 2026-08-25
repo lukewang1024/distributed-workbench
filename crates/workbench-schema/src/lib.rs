@@ -169,6 +169,30 @@ pub struct CapabilityDescriptor {
     pub emitted_evidence: Vec<String>,
     #[serde(default)]
     pub effect: Effect,
+    /// Scheduler priority. Lower values are served first; zero is reserved for
+    /// control-plane operations that must remain responsive under load.
+    #[serde(default = "default_capability_priority")]
+    pub priority: u8,
+    /// Optional per-executor concurrency budget for this class of capability.
+    /// The runtime may apply a stricter operator-configured limit.
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
+    /// What the controller should do with child work when the requesting
+    /// client disconnects before receiving the response.
+    #[serde(default)]
+    pub cancel_policy: CancelPolicy,
+}
+
+fn default_capability_priority() -> u8 {
+    3
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CancelPolicy {
+    CancelOnDisconnect,
+    #[default]
+    Continue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

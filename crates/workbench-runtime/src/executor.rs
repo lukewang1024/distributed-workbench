@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -13,8 +15,8 @@ use std::time::Duration;
 use workbench_core::{ObservabilityStore, atomic_replace, now_ms, sha256_bytes};
 use workbench_protocol::{Request, Response, RpcError};
 use workbench_schema::{
-    CapabilityDescriptor, Effect, HealthCheck, IdempotencyContract, Observation, RetryPolicy,
-    RollbackStrategy,
+    CancelPolicy, CapabilityDescriptor, Effect, HealthCheck, IdempotencyContract, Observation,
+    RetryPolicy, RollbackStrategy,
 };
 
 use crate::generation::{Overlay, activate, apply_overlays, materialize, record_state};
@@ -33,11 +35,17 @@ pub struct ExecutorRuntime {
 
 #[derive(Debug)]
 struct ExecutionCapacity {
+    mutating: CapacityPool,
+    readonly: CapacityPool,
+}
+
+#[derive(Debug)]
+struct CapacityPool {
     maximum: usize,
     active: Mutex<usize>,
 }
 
-struct ExecutionPermit<'a>(&'a ExecutionCapacity);
+struct ExecutionPermit<'a>(&'a CapacityPool);
 
 impl Drop for ExecutionPermit<'_> {
     fn drop(&mut self) {
@@ -48,10 +56,10 @@ impl Drop for ExecutionPermit<'_> {
 
 impl ExecutionCapacity {
     #[cfg(test)]
-    fn new(maximum: usize) -> Self {
+    fn new(mutating: usize, readonly: usize) -> Self {
         Self {
-            maximum,
-            active: Mutex::new(0),
+            mutating: CapacityPool::new(mutating),
+            readonly: CapacityPool::new(readonly),
         }
     }
 
@@ -60,11 +68,33 @@ impl ExecutionCapacity {
             .map(usize::from)
             .unwrap_or(4)
             .clamp(2, 32);
-        let maximum = std::env::var("WORKBENCH_EXECUTOR_MAX_CONCURRENCY")
+        let mutating = std::env::var("WORKBENCH_EXECUTOR_MAX_CONCURRENCY")
             .ok()
             .and_then(|value| value.parse().ok())
             .filter(|value: &usize| *value > 0)
             .unwrap_or(fallback);
+        let readonly = std::env::var("WORKBENCH_EXECUTOR_READONLY_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value: &usize| *value > 0)
+            .unwrap_or(8);
+        Self {
+            mutating: CapacityPool::new(mutating),
+            readonly: CapacityPool::new(readonly),
+        }
+    }
+
+    fn try_acquire(&self, class: ExecutionClass) -> Result<Option<ExecutionPermit<'_>>, RpcError> {
+        match class {
+            ExecutionClass::Control => Ok(None),
+            ExecutionClass::ReadOnly => self.readonly.try_acquire().map(Some),
+            ExecutionClass::Mutating => self.mutating.try_acquire().map(Some),
+        }
+    }
+}
+
+impl CapacityPool {
+    fn new(maximum: usize) -> Self {
         Self {
             maximum,
             active: Mutex::new(0),
@@ -83,6 +113,42 @@ impl ExecutionCapacity {
         }
         *active += 1;
         Ok(ExecutionPermit(self))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionClass {
+    Control,
+    ReadOnly,
+    Mutating,
+}
+
+fn execution_class(action: &str, params: &Value) -> ExecutionClass {
+    match action {
+        // These operations only inspect small in-memory tables. They form the
+        // executor fast lane and must not queue behind commands or probes.
+        "ping" | "status" | "capability.list" | "process.get" | "process.list"
+        | "process.events" | "tunnel.get" | "tunnel.list" => ExecutionClass::Control,
+        "filesystem.resolve"
+        | "filesystem.stat"
+        | "filesystem.read"
+        | "filesystem.list"
+        | "filesystem.search"
+        | "artifact.describe"
+        | "artifact.relay.archive.read"
+        | "artifact.relay.manifest"
+        | "artifact.relay.read"
+        | "readiness.wait"
+        | "logs.read"
+        | "port.check"
+        | "application.inspect"
+        | "ui.inspect"
+        | "ui.evaluate"
+        | "ui.native-inspect" => ExecutionClass::ReadOnly,
+        "command.run" if params.get("mode").and_then(Value::as_str) == Some("readonly") => {
+            ExecutionClass::ReadOnly
+        }
+        _ => ExecutionClass::Mutating,
     }
 }
 
@@ -185,14 +251,9 @@ impl ExecutorRuntime {
             .get("processId")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let permit = if matches!(
-            request.action.as_str(),
-            "ping" | "status" | "capability.list"
-        ) {
-            Ok(None)
-        } else {
-            self.execution.try_acquire().map(Some)
-        };
+        let permit = self
+            .execution
+            .try_acquire(execution_class(&request.action, &request.params));
         let result = match permit {
             Ok(_permit) => self
                 .enforce_authority(&request.action, &request.params)
@@ -377,8 +438,15 @@ impl ExecutorRuntime {
                 "allowedRoots": self.allowed_roots,
                 "capabilities": capability_catalog(),
                 "execution": {
-                    "active": *self.execution.active.lock().expect("execution capacity lock"),
-                    "maximum": self.execution.maximum,
+                    "mutating": {
+                        "active": *self.execution.mutating.active.lock().expect("execution capacity lock"),
+                        "maximum": self.execution.mutating.maximum,
+                    },
+                    "readonly": {
+                        "active": *self.execution.readonly.active.lock().expect("execution capacity lock"),
+                        "maximum": self.execution.readonly.maximum,
+                    },
+                    "control": {"bounded": false},
                 },
             })),
             "capability.list" => Ok(serde_json::to_value(capability_catalog()).unwrap()),
@@ -1545,23 +1613,68 @@ impl ExecutorRuntime {
             .transpose()
             .map_err(|error| RpcError::new("INVALID_PARAMS", error.to_string()))?
             .unwrap_or_default();
-        let output = Command::new(&argv[0])
+        let timeout_ms = params
+            .get("timeoutMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(3_600_000)
+            .clamp(1, 3_600_000);
+        let mut command = Command::new(&argv[0]);
+        command
             .args(&argv[1..])
             .current_dir(&cwd)
             .envs(env)
             .stdin(Stdio::null())
-            .output()
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command
+            .spawn()
             .map_err(|error| RpcError::new("COMMAND_FAILED", error.to_string()))?;
-        let stdout = bounded_output(&output.stdout);
-        let stderr = bounded_output(&output.stderr);
-        if !output.status.success() {
+        let stdout_pipe = child.stdout.take().expect("piped stdout");
+        let stderr_pipe = child.stderr.take().expect("piped stderr");
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::BufReader::new(stdout_pipe).read_to_end(&mut bytes);
+            bytes
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::BufReader::new(stderr_pipe).read_to_end(&mut bytes);
+            bytes
+        });
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| RpcError::new("COMMAND_FAILED", error.to_string()))?
+            {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                crate::process::stop_process(child.id())?;
+                let _ = child.wait();
+                let mut error = RpcError::new(
+                    "COMMAND_TIMED_OUT",
+                    format!("command exceeded its {timeout_ms}ms deadline"),
+                );
+                error.retryable = true;
+                return Err(error);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let stdout_bytes = stdout_reader.join().unwrap_or_default();
+        let stderr_bytes = stderr_reader.join().unwrap_or_default();
+        let stdout = bounded_output(&stdout_bytes);
+        let stderr = bounded_output(&stderr_bytes);
+        if !status.success() {
             return Err(RpcError::new(
                 "COMMAND_FAILED",
-                format!("command exited with {}: {stderr}", output.status),
+                format!("command exited with {status}: {stderr}"),
             ));
         }
         Ok(json!({
-            "cwd": cwd, "argv": argv, "exitCode": output.status.code(),
+            "cwd": cwd, "argv": argv, "exitCode": status.code(),
             "stdout": stdout, "stderr": stderr
         }))
     }
@@ -1733,10 +1846,13 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "cwd": {"type": "string"},
                 "argv": {"type": "array", "items": {"type": "string"}},
                 "env": {"type": "object", "additionalProperties": {"type": "string"}},
+                "mode": {"type": "string", "enum": ["readonly", "mutating"]},
+                "resources": {"type": "array", "items": {"type": "string"}},
+                "timeoutMs": {"type": "integer", "minimum": 1, "maximum": 3600000},
                 "approvalDigest": {"type": "string"}
             }),
-            vec!["command:${cwd}"],
-            vec!["cwd", "argv", "env"],
+            Vec::new(),
+            vec!["cwd", "argv", "env", "mode", "resources"],
             3_600_000,
             RollbackStrategy::None,
             vec!["command-result"],
@@ -2051,7 +2167,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "logPath": {"type": "string"},
                 "knownHostsFile": {"type": "string"}
             }),
-            vec!["tunnel:${tunnelId}"],
+            vec!["tunnel:${tunnelId}", "bind:${bindHost}:${bindPort}"],
             vec![
                 "tunnelId",
                 "sshHost",
@@ -2143,6 +2259,9 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
         "approvalDigest",
         "workspaceSessionId",
         "knownHostsFile",
+        "mode",
+        "resources",
+        "timeoutMs",
     ];
     let schema_required: Vec<String> = properties
         .as_object()
@@ -2205,6 +2324,38 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
         health_check: HealthCheck::Process,
         emitted_evidence: evidence.into_iter().map(str::to_owned).collect(),
         effect,
+        priority: capability_priority(name),
+        max_concurrency: capability_concurrency(name),
+        cancel_policy: capability_cancel_policy(name),
+    }
+}
+
+fn capability_priority(name: &str) -> u8 {
+    match execution_class(name, &Value::Null) {
+        ExecutionClass::Control => 0,
+        ExecutionClass::ReadOnly => 2,
+        ExecutionClass::Mutating
+            if matches!(name, "tunnel.ensure" | "process.start" | "process.stop") =>
+        {
+            3
+        }
+        ExecutionClass::Mutating => 4,
+    }
+}
+
+fn capability_concurrency(name: &str) -> Option<u32> {
+    match execution_class(name, &Value::Null) {
+        ExecutionClass::Control => None,
+        ExecutionClass::ReadOnly => Some(8),
+        ExecutionClass::Mutating => Some(1),
+    }
+}
+
+fn capability_cancel_policy(name: &str) -> CancelPolicy {
+    if matches!(name, "command.run" | "readiness.wait" | "logs.read") {
+        CancelPolicy::CancelOnDisconnect
+    } else {
+        CancelPolicy::Continue
     }
 }
 
@@ -2959,14 +3110,62 @@ mod tests {
     }
 
     #[test]
-    fn execution_capacity_rejects_excess_work_and_recovers() {
-        let capacity = ExecutionCapacity::new(1);
-        let permit = capacity.try_acquire().expect("first permit");
-        let error = capacity.try_acquire().err().expect("capacity rejection");
+    fn execution_capacity_isolates_work_classes_and_recovers() {
+        let capacity = ExecutionCapacity::new(1, 1);
+        let permit = capacity
+            .try_acquire(ExecutionClass::Mutating)
+            .expect("first permit");
+        let error = capacity
+            .try_acquire(ExecutionClass::Mutating)
+            .err()
+            .expect("capacity rejection");
         assert_eq!(error.code, "EXECUTOR_BUSY");
         assert!(error.retryable);
+        assert!(capacity.try_acquire(ExecutionClass::ReadOnly).is_ok());
+        assert!(capacity.try_acquire(ExecutionClass::Control).is_ok());
         drop(permit);
-        assert!(capacity.try_acquire().is_ok());
+        assert!(capacity.try_acquire(ExecutionClass::Mutating).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_deadline_terminates_a_slow_process_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
+        let error = runtime
+            .run_command(&json!({
+                "cwd": directory.path(),
+                "argv": ["sh", "-c", "sleep 5"],
+                "timeoutMs": 25
+            }))
+            .expect_err("slow command must time out");
+        assert_eq!(error.code, "COMMAND_TIMED_OUT");
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn command_and_tunnel_contracts_declare_scheduler_resources() {
+        let catalog = capability_catalog();
+        let command = catalog
+            .iter()
+            .find(|capability| capability.name == "command.run")
+            .unwrap();
+        assert_eq!(command.priority, 4);
+        assert_eq!(command.cancel_policy, CancelPolicy::CancelOnDisconnect);
+        assert_eq!(
+            command.input_schema["properties"]["mode"]["enum"],
+            json!(["readonly", "mutating"])
+        );
+        let tunnel = catalog
+            .iter()
+            .find(|capability| capability.name == "tunnel.ensure")
+            .unwrap();
+        assert!(
+            tunnel
+                .locks
+                .iter()
+                .any(|lock| lock.key == "bind:${bindHost}:${bindPort}")
+        );
     }
     use workbench_protocol::Request;
 
