@@ -358,7 +358,10 @@ impl ExecutorRuntime {
         let Some(contract) = contract else {
             return Ok(());
         };
-        if matches!(contract.effect, Effect::ReadOnly) {
+        if matches!(contract.effect, Effect::ReadOnly)
+            || (canonical == "command.run"
+                && params.get("mode").and_then(Value::as_str) == Some("readonly"))
+        {
             return Ok(());
         }
         let authorities = params
@@ -3150,6 +3153,29 @@ mod tests {
         assert!(capacity.try_acquire(ExecutionClass::Control).is_ok());
         drop(permit);
         assert!(capacity.try_acquire(ExecutionClass::Mutating).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_command_does_not_require_mutating_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::open(
+            "local",
+            vec![directory.path().to_path_buf()],
+            directory.path().join("executor.json"),
+        )
+        .unwrap();
+        let response = runtime.handle(Request::new(
+            "command.run",
+            json!({
+                "cwd": directory.path(),
+                "argv": ["sh", "-c", "printf readonly"],
+                "mode": "readonly",
+                "timeoutMs": 1_000
+            }),
+        ));
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(response.result.unwrap()["stdout"], "readonly");
     }
 
     #[cfg(unix)]
