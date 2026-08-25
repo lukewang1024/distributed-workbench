@@ -1899,6 +1899,28 @@ impl Controller {
                                 }
                             }
                         }
+                        if capability_name == "tunnel.ensure"
+                            && input.get("waitReady").and_then(Value::as_bool) == Some(true)
+                        {
+                            match wait_for_tunnel_readiness(&executor.endpoint, &input, result) {
+                                Ok(ready) => result = ready,
+                                Err(error) => {
+                                    let _ = self.tasks.lock().expect("task lock").transition(
+                                        &task.id,
+                                        TaskState::Failed,
+                                        None,
+                                        Some(workbench_schema::TaskError {
+                                            code: error.code.clone(),
+                                            message: error.message.clone(),
+                                            retryable: error.retryable,
+                                            details: error.details.clone(),
+                                        }),
+                                    );
+                                    self.persist()?;
+                                    return Err(error);
+                                }
+                            }
+                        }
                         if let Err(error) =
                             validate_schema(&contract.output_schema, &result, "output")
                         {
@@ -3790,6 +3812,55 @@ fn wait_for_process_readiness(
             "readiness.wait returned an empty result",
         )
     })
+}
+
+fn wait_for_tunnel_readiness(
+    endpoint: &ExecutorEndpoint,
+    input: &Value,
+    result: Value,
+) -> Result<Value, RpcError> {
+    if result.get("observedState").and_then(Value::as_str) == Some("ready") {
+        return Ok(result);
+    }
+    let tunnel_id = required_str(input, "tunnelId")?;
+    let process_id = format!("tunnel-{tunnel_id}");
+    let timeout_ms = input
+        .get("readinessTimeoutMs")
+        .and_then(Value::as_u64)
+        .unwrap_or(60_000);
+    let waited = call_executor(
+        endpoint,
+        &traced_request(
+            "readiness.wait",
+            json!({"processId": process_id, "timeoutMs": timeout_ms}),
+        ),
+    );
+    let current = call_executor(
+        endpoint,
+        &traced_request("tunnel.get", json!({"tunnelId": tunnel_id})),
+    )
+    .map_err(|error| RpcError::new("EXECUTOR_DISCONNECTED", error.to_string()))?;
+    if current.ok {
+        if let Some(value) = current.result
+            && value.get("observedState").and_then(Value::as_str) == Some("ready")
+        {
+            return Ok(value);
+        }
+    }
+    match waited {
+        Ok(response) if !response.ok => Err(response
+            .error
+            .unwrap_or_else(|| RpcError::new("TUNNEL_NOT_READY", "tunnel readiness failed"))),
+        Ok(_) => Err(RpcError::new(
+            "TUNNEL_NOT_READY",
+            "tunnel did not become ready",
+        )),
+        Err(error) => {
+            let mut value = RpcError::new("EXECUTOR_DISCONNECTED", error.to_string());
+            value.retryable = true;
+            Err(value)
+        }
+    }
 }
 
 fn command_requires_approval(input: &Value) -> bool {
