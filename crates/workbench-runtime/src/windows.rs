@@ -84,6 +84,14 @@ pub fn launch(
         fs::create_dir_all(profile)
             .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
     }
+    let terminated = if terminate_conflicting_instances {
+        terminate_process_trees(&executable)?
+    } else {
+        0
+    };
+    // Chromium writes Local State while shutting down. Patch only after every
+    // conflicting process has exited, otherwise its final flush can silently
+    // replace the development resource flags before the new process starts.
     let local_state_patch = match (user_data_dir, chromium_local_state_patch) {
         (Some(profile), Some(patch)) => Some(patch_chromium_local_state(profile, patch)?),
         (None, Some(_)) => {
@@ -93,11 +101,6 @@ pub fn launch(
             ));
         }
         _ => None,
-    };
-    let terminated = if terminate_conflicting_instances {
-        terminate_process_trees(&executable)?
-    } else {
-        0
     };
     let mut launch_args = args.to_vec();
     if let Some(profile) = user_data_dir {
