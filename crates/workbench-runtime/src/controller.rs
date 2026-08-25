@@ -3863,7 +3863,8 @@ fn wait_for_tunnel_readiness(
     let timeout_ms = input
         .get("readinessTimeoutMs")
         .and_then(Value::as_u64)
-        .unwrap_or(60_000);
+        .unwrap_or(8_000)
+        .min(8_000);
     let waited = call_executor(
         endpoint,
         &traced_request(
@@ -3877,10 +3878,21 @@ fn wait_for_tunnel_readiness(
     )
     .map_err(|error| RpcError::new("EXECUTOR_DISCONNECTED", error.to_string()))?;
     if current.ok
-        && let Some(value) = current.result
-        && value.get("observedState").and_then(Value::as_str) == Some("ready")
+        && let Some(mut value) = current.result
     {
-        return Ok(value);
+        if value.get("observedState").and_then(Value::as_str) == Some("ready") {
+            return Ok(value);
+        }
+        if let Ok(response) = &waited
+            && !response.ok
+            && let Some(error) = &response.error
+            && error.retryable
+        {
+            value["observedState"] = json!("pending");
+            value["pendingReason"] = json!(error.message);
+            value["retryable"] = json!(true);
+            return Ok(value);
+        }
     }
     match waited {
         Ok(response) if !response.ok => Err(response
@@ -4119,6 +4131,46 @@ mod tests {
         ).unwrap();
         assert_eq!(ready["readiness"]["state"], "ready");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tunnel_wait_returns_visible_pending_state_after_short_retryable_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("tunnel-readiness.sock");
+        let server_socket = socket.clone();
+        std::thread::spawn(move || {
+            RpcServer::new(server_socket)
+                .serve(move |request| match request.action.as_str() {
+                    "readiness.wait" => {
+                        let mut error = RpcError::new("BUILD_STALLED", "tunnel probe timed out");
+                        error.retryable = true;
+                        Response::failure(request.request_id, error)
+                    }
+                    "tunnel.get" => Response::success(
+                        request.request_id,
+                        json!({"tunnelId": "signal", "observedState": "starting"}),
+                    ),
+                    other => panic!("unexpected action: {other}"),
+                })
+                .unwrap()
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let endpoint: ExecutorEndpoint =
+            serde_json::from_value(json!({"transport": "local", "socket": socket})).unwrap();
+        let pending = wait_for_tunnel_readiness(
+            &endpoint,
+            &json!({"tunnelId": "signal", "readinessTimeoutMs": 25}),
+            json!({"tunnelId": "signal", "observedState": "starting"}),
+        )
+        .unwrap();
+        assert_eq!(pending["observedState"], "pending");
+        assert_eq!(pending["pendingReason"], "tunnel probe timed out");
+        assert_eq!(pending["retryable"], true);
     }
 
     #[test]
