@@ -3840,12 +3840,11 @@ fn wait_for_tunnel_readiness(
         &traced_request("tunnel.get", json!({"tunnelId": tunnel_id})),
     )
     .map_err(|error| RpcError::new("EXECUTOR_DISCONNECTED", error.to_string()))?;
-    if current.ok {
-        if let Some(value) = current.result
-            && value.get("observedState").and_then(Value::as_str) == Some("ready")
-        {
-            return Ok(value);
-        }
+    if current.ok
+        && let Some(value) = current.result
+        && value.get("observedState").and_then(Value::as_str) == Some("ready")
+    {
+        return Ok(value);
     }
     match waited {
         Ok(response) if !response.ok => Err(response
