@@ -5,9 +5,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::time::Duration;
 use workbench_core::{ObservabilityStore, atomic_replace, now_ms, sha256_bytes};
 use workbench_protocol::{Request, Response, RpcError};
 use workbench_schema::{
@@ -1364,6 +1366,8 @@ impl ExecutorRuntime {
             "ssh".to_owned(),
             "-N".to_owned(),
             "-C".to_owned(),
+            "-o".to_owned(),
+            "ClearAllForwardings=yes".to_owned(),
             if direction == "local-forward" {
                 "-L"
             } else {
@@ -2423,19 +2427,33 @@ fn tunnel_definition_matches(left: &Value, right: &Value) -> bool {
 }
 
 fn tunnel_view(record: &crate::process::ProcessRecord, reused: bool) -> Value {
-    let observed_state = match (record.state.clone(), record.readiness.state.clone()) {
-        (crate::process::ProcessState::Running, crate::process::ReadinessState::Ready) => "ready",
-        (crate::process::ProcessState::Running, crate::process::ReadinessState::Pending) => {
+    let probe_recovered = record.state == crate::process::ProcessState::Running
+        && record.readiness.state == crate::process::ReadinessState::Failed
+        && tunnel_source_is_reachable(&record.metadata);
+    let observed_state = match (
+        record.state.clone(),
+        record.readiness.state.clone(),
+        probe_recovered,
+    ) {
+        (crate::process::ProcessState::Running, crate::process::ReadinessState::Ready, _) => {
+            "ready"
+        }
+        (crate::process::ProcessState::Running, crate::process::ReadinessState::Pending, _) => {
             "starting"
         }
-        (crate::process::ProcessState::Running, crate::process::ReadinessState::Failed) => {
+        (crate::process::ProcessState::Running, crate::process::ReadinessState::Failed, true) => {
+            "ready"
+        }
+        (crate::process::ProcessState::Running, crate::process::ReadinessState::Failed, false) => {
             "degraded"
         }
-        (crate::process::ProcessState::Running, crate::process::ReadinessState::NotConfigured) => {
-            "running"
-        }
-        (crate::process::ProcessState::Failed, _) => "failed",
-        (crate::process::ProcessState::Stopped, _) => "stopped",
+        (
+            crate::process::ProcessState::Running,
+            crate::process::ReadinessState::NotConfigured,
+            _,
+        ) => "running",
+        (crate::process::ProcessState::Failed, _, _) => "failed",
+        (crate::process::ProcessState::Stopped, _, _) => "stopped",
     };
     json!({
         "id": record.metadata.get("tunnelId"),
@@ -2452,8 +2470,37 @@ fn tunnel_view(record: &crate::process::ProcessRecord, reused: bool) -> Value {
         "startedAt": record.started_at,
         "updatedAt": record.updated_at,
         "lastProbeAt": record.last_successful_probe_at,
+        "warning": probe_recovered.then_some("readiness probe previously failed; source port is currently reachable"),
         "reused": reused
     })
+}
+
+fn tunnel_source_is_reachable(metadata: &Value) -> bool {
+    if metadata.get("direction").and_then(Value::as_str) != Some("local-forward") {
+        return false;
+    }
+    let source = match metadata.get("source") {
+        Some(source) => source,
+        None => return false,
+    };
+    let host = match source.get("host").and_then(Value::as_str) {
+        Some(host) => host,
+        None => return false,
+    };
+    let port = match source
+        .get("port")
+        .and_then(Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok())
+    {
+        Some(port) => port,
+        None => return false,
+    };
+    (host, port)
+        .to_socket_addrs()
+        .ok()
+        .into_iter()
+        .flatten()
+        .any(|address| TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_ok())
 }
 
 fn string_array(params: &Value, key: &str) -> Result<Vec<String>, RpcError> {
@@ -2782,6 +2829,7 @@ fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     #[test]
     fn tunnel_capabilities_are_typed_and_do_not_expose_command_arguments() {
@@ -2798,6 +2846,21 @@ mod tests {
             "string"
         );
         assert!(ensure.input_schema["properties"].get("argv").is_none());
+    }
+
+    #[test]
+    fn tunnel_source_probe_treats_a_reachable_local_forward_as_usable() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind probe listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let metadata = json!({
+            "direction": "local-forward",
+            "source": {"host": "127.0.0.1", "port": port}
+        });
+        assert!(tunnel_source_is_reachable(&metadata));
+        assert!(!tunnel_source_is_reachable(&json!({
+            "direction": "remote-forward",
+            "source": {"host": "127.0.0.1", "port": port}
+        })));
     }
 
     #[test]
