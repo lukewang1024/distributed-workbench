@@ -85,7 +85,7 @@ pub fn launch(
             .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
     }
     let terminated = if terminate_conflicting_instances {
-        terminate_process_trees(&executable)?
+        terminate_process_trees(&executable, user_data_dir, remote_debugging_port)?
     } else {
         0
     };
@@ -196,7 +196,11 @@ fn patch_chromium_local_state(profile: &Path, patch: &Value) -> Result<Value, Rp
     }))
 }
 
-fn terminate_process_trees(executable: &Path) -> Result<usize, RpcError> {
+fn terminate_process_trees(
+    executable: &Path,
+    user_data_dir: Option<&Path>,
+    remote_debugging_port: Option<u16>,
+) -> Result<usize, RpcError> {
     let name = executable
         .file_name()
         .and_then(|value| value.to_str())
@@ -207,8 +211,31 @@ fn terminate_process_trees(executable: &Path) -> Result<usize, RpcError> {
             )
         })?;
     let escaped = name.replace('\'', "''");
+    let (selector_prelude, selector) = if user_data_dir.is_some() || remote_debugging_port.is_some()
+    {
+        let profile = user_data_dir
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .replace('\'', "''")
+            })
+            .unwrap_or_default();
+        let port = remote_debugging_port
+            .map(|value| format!("--remote-debugging-port={value}"))
+            .unwrap_or_default();
+        (
+            format!("$profile='{profile}'; $portNeedle='{port}'; "),
+            "@($all | Where-Object { $command=[string]$_.CommandLine; if($command) { $command=$command.Replace('\\','/'); (($profile.Length -gt 0) -and ($command.IndexOf($profile,[System.StringComparison]::OrdinalIgnoreCase) -ge 0)) -or (($portNeedle.Length -gt 0) -and ($command.IndexOf($portNeedle,[System.StringComparison]::OrdinalIgnoreCase) -ge 0)) } else { $false } })".to_owned(),
+        )
+    } else {
+        (
+            String::new(),
+            format!("@($all | Where-Object {{ $_.Name -ieq '{escaped}' }})"),
+        )
+    };
     let script = format!(
-        "$name='{escaped}'; $items=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq $name }}); foreach($item in $items) {{ & taskkill.exe /PID $item.ProcessId /T /F | Out-Null }}; $deadline=(Get-Date).AddSeconds(15); do {{ $remaining=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq $name }}); if($remaining.Count -eq 0) {{ break }}; Start-Sleep -Milliseconds 200 }} while((Get-Date) -lt $deadline); if($remaining.Count -ne 0) {{ throw \"conflicting $name process tree did not exit\" }}; $items.Count"
+        "{selector_prelude}$all=@(Get-CimInstance Win32_Process); $items={selector}; foreach($item in $items) {{ & taskkill.exe /PID $item.ProcessId /T /F | Out-Null }}; $deadline=(Get-Date).AddSeconds(15); do {{ $all=@(Get-CimInstance Win32_Process); $remaining={selector}; if($remaining.Count -eq 0) {{ break }}; Start-Sleep -Milliseconds 200 }} while((Get-Date) -lt $deadline); if($remaining.Count -ne 0) {{ throw \"conflicting processes for {escaped} did not exit\" }}; $items.Count"
     );
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
