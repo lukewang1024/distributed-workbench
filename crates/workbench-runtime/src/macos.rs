@@ -833,25 +833,6 @@ fn application_executable(application: &Path) -> Result<PathBuf, RpcError> {
     Ok(executable)
 }
 
-fn matching_processes(executable: &Path) -> Result<Vec<u64>, RpcError> {
-    let output = Command::new("/bin/ps")
-        .args(["-axo", "pid=,comm="])
-        .output()
-        .map_err(|error| command_error("PROCESS_DISCOVERY_FAILED", "ps", error))?;
-    if !output.status.success() {
-        return Err(failed_output("PROCESS_DISCOVERY_FAILED", &output));
-    }
-    let expected = executable.to_string_lossy();
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.trim().splitn(2, char::is_whitespace);
-            let pid = parts.next()?.parse::<u64>().ok()?;
-            (parts.next()?.trim() == expected.as_ref()).then_some(pid)
-        })
-        .collect())
-}
-
 fn select_application_pid(processes: &[Value], executable: &Path) -> Option<u64> {
     let expected = executable.to_string_lossy();
     processes.iter().find_map(|process| {
