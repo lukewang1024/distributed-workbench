@@ -92,6 +92,19 @@ Agent starts receive `WORKBENCH_*` correlation variables so hooks can associate
 run events with the correct session, node, role, and agent. Raw prompts, command
 arguments, environment values, and log bodies are not dashboard fields.
 
+### Managed tunnels
+
+Cross-node SSH forwards are typed Executor resources rather than opaque command
+processes. `tunnel.ensure` declares the runner, SSH destination, direction,
+bind endpoint, target endpoint, and optional workspace scope. The Executor
+persists desired state, probes local forwards, reuses matching definitions, and
+reconciles an unexpectedly exited tunnel on subsequent control-plane activity.
+Use `tunnel.get`, `tunnel.list`, and `tunnel.stop` for lifecycle operations.
+
+`dashboard.snapshot` aggregates safe tunnel records from every capable Executor;
+the dashboard renders their node, route, workspace, desired state, observed
+state, and last probe without exposing generated SSH arguments or logs.
+
 ## Repository boundary
 
 - tmux integration belongs in `tmux-agent-workbench` as a provider.

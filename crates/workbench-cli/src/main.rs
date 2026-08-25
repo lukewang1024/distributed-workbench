@@ -1112,6 +1112,7 @@ fn build_workspace_dashboard(
         "generatedAt":now,
         "controller":snapshot.get("controller"),
         "nodes":snapshot.get("executors").cloned().unwrap_or_else(||serde_json::json!([])),
+        "tunnels":snapshot.get("tunnels").cloned().unwrap_or_else(||serde_json::json!([])),
         "workspaces":workspaces,
         "unscopedEvents":events.into_iter().filter(|event| {
             event.get("runId").and_then(Value::as_str).is_none_or(|run_id|!run_workspaces.contains_key(run_id))
@@ -1990,7 +1991,8 @@ topology: {mode: full-mesh}
             "agents":[
                 {"id":"primary","workspaceSessionId":"profile-a","executorId":"node-a","role":"primary","state":"running"},
                 {"id":"cu","workspaceSessionId":"profile-a","executorId":"node-b","role":"computer-use","state":"running"}
-            ]
+            ],
+            "tunnels":[{"id":"dev-4105","executorId":"node-b","workspaceSessionId":"profile-a","observedState":"ready","source":{"host":"127.0.0.1","port":4105},"destination":{"host":"127.0.0.1","port":4105}}]
         });
         let runs = serde_json::json!([{"runId":"run-a","workspaceSessionId":"profile-a","status":"running","startedAt":100}]);
         let observations = serde_json::json!({"events":[
@@ -2005,6 +2007,7 @@ topology: {mode: full-mesh}
         assert_eq!(workspace["currentStage"], "build");
         assert_eq!(workspace["activeNodes"].as_array().unwrap().len(), 2);
         assert_eq!(workspace["blocker"]["attributes"]["blockerKind"], "human");
+        assert_eq!(result["tunnels"][0]["id"], "dev-4105");
     }
 
     #[test]

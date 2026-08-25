@@ -522,6 +522,47 @@ impl Controller {
                 let process_nodes = thread::scope(|scope| {
                     state.executors.iter().map(|executor|scope.spawn(move||{let result=call_executor(&executor.endpoint,&Request::new("process.list",Value::Null));(executor.metadata.id.clone(),result)})).collect::<Vec<_>>().into_iter().map(|handle|handle.join().expect("process list worker")).map(|(executor_id,result)|match result{Ok(response)if response.ok=>json!({"executorId":executor_id,"stale":false,"processes":response.result.and_then(|value|value.get("processes").and_then(Value::as_array).cloned()).unwrap_or_default().iter().map(|item|json!({"id":item.get("id"),"state":item.get("state"),"pid":item.get("pid"),"restartable":item.get("restartable"),"readiness":item.get("readiness"),"startedAt":item.get("startedAt"),"updatedAt":item.get("updatedAt")})).collect::<Vec<_>>() }),_=>json!({"executorId":executor_id,"stale":true,"processes":[]})}).collect::<Vec<_>>()
                 });
+                let tunnels = thread::scope(|scope| {
+                    state
+                        .executors
+                        .iter()
+                        .filter(|executor| {
+                            executor
+                                .capabilities
+                                .iter()
+                                .any(|capability| capability.name == "tunnel.list")
+                        })
+                        .map(|executor| {
+                            scope.spawn(move || {
+                                let result = call_executor(
+                                    &executor.endpoint,
+                                    &Request::new("tunnel.list", Value::Null),
+                                );
+                                (executor.metadata.id.clone(), result)
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .flat_map(|handle| {
+                            let (executor_id, result) = handle.join().expect("tunnel list worker");
+                            match result {
+                                Ok(response) if response.ok => response
+                                    .result
+                                    .and_then(|value| {
+                                        value.get("tunnels").and_then(Value::as_array).cloned()
+                                    })
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|mut tunnel| {
+                                        tunnel["executorId"] = Value::String(executor_id.clone());
+                                        tunnel
+                                    })
+                                    .collect::<Vec<_>>(),
+                                _ => Vec::new(),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                });
                 Ok(json!({
                     "generatedAt": now_ms(),
                     "controller": {"id": self.id, "status": "ready"},
@@ -532,6 +573,7 @@ impl Controller {
                     "ports": leases.iter().filter(|item|item.resource.starts_with("port:")).map(|item|json!({"id":item.id,"resource":item.resource,"owner":item.owner,"expiresAt":item.expires_at})).collect::<Vec<_>>(),
                     "approvals": state.approvals.iter().map(|item|json!({"id":item.id,"owner":item.owner,"state":item.state,"digest":item.digest,"createdAt":item.created_at,"expiresAt":item.expires_at})).collect::<Vec<_>>(),
                     "processNodes":process_nodes,
+                    "tunnels": tunnels,
                     "tasks": tasks.iter().map(|item| {
                         let timeout_ms = state.executors.iter()
                             .find(|executor| executor.metadata.id == item.executor_id)

@@ -24,6 +24,8 @@ pub struct ProcessRecord {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub restartable: bool,
+    #[serde(default)]
+    pub metadata: Value,
     pub log_path: PathBuf,
     #[serde(default)]
     pub log_start_offset: u64,
@@ -102,6 +104,7 @@ impl ProcessTable {
         log_path: PathBuf,
         readiness: Option<Value>,
         restartable: bool,
+        metadata: Value,
     ) -> Result<ProcessRecord, RpcError> {
         if argv.is_empty() {
             return Err(RpcError::new("INVALID_PARAMS", "argv must not be empty"));
@@ -161,6 +164,7 @@ impl ProcessTable {
             argv,
             env,
             restartable,
+            metadata,
             log_path,
             log_start_offset,
             state: ProcessState::Running,
@@ -249,6 +253,18 @@ impl ProcessTable {
         Ok(result)
     }
 
+    pub fn update_metadata(&self, id: &str, metadata: Value) -> Result<ProcessRecord, RpcError> {
+        let mut records = self.records.lock().expect("process lock");
+        let record = records
+            .get_mut(id)
+            .ok_or_else(|| RpcError::new("PROCESS_NOT_FOUND", format!("unknown process: {id}")))?;
+        record.metadata = metadata;
+        record.updated_at = now_ms();
+        let result = record.clone();
+        self.persist(&records)?;
+        Ok(result)
+    }
+
     pub fn restart(&self, id: &str) -> Result<ProcessRecord, RpcError> {
         let record = self.get(id)?;
         if !record.restartable {
@@ -266,6 +282,7 @@ impl ProcessTable {
             record.log_path,
             record.readiness_spec,
             true,
+            record.metadata,
         )
     }
 
@@ -555,6 +572,7 @@ mod tests {
                 log_path,
                 Some(json!({"type": "log", "pattern": "^ready$", "timeoutMs": 2_000})),
                 false,
+                serde_json::Value::Null,
             )
             .expect("start process");
         assert!(started.elapsed() < Duration::from_millis(150));
@@ -597,6 +615,7 @@ mod tests {
                 log_path,
                 Some(json!({"type": "log", "pattern": "^compiler done$", "timeoutMs": 1_000})),
                 false,
+                serde_json::Value::Null,
             )
             .expect("start process");
         std::thread::sleep(Duration::from_millis(50));
@@ -626,12 +645,27 @@ mod tests {
                 root.join("process.log"),
                 None,
                 false,
+                json!({"kind": "tunnel", "desiredState": "running"}),
             )
             .expect("start process");
         drop(table);
         let restored = ProcessTable::open(state_path).expect("restore table");
         let record = restored.get("persistent-process").expect("restored record");
         assert_eq!(record.state, super::ProcessState::Running);
+        assert_eq!(record.metadata["kind"], "tunnel");
+        restored
+            .update_metadata(
+                "persistent-process",
+                json!({"kind": "tunnel", "desiredState": "stopped"}),
+            )
+            .expect("update metadata");
+        assert_eq!(
+            restored
+                .get("persistent-process")
+                .expect("updated record")
+                .metadata["desiredState"],
+            "stopped"
+        );
         restored.stop("persistent-process").expect("stop process");
         let _ = fs::remove_dir_all(root);
     }
@@ -660,6 +694,7 @@ mod tests {
                 root.join("process.log"),
                 None,
                 false,
+                serde_json::Value::Null,
             )
             .expect("start process");
         let deadline = std::time::Instant::now() + Duration::from_secs(1);

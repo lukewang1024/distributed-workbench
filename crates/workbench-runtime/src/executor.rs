@@ -162,6 +162,9 @@ impl ExecutorRuntime {
     }
 
     pub fn handle(&self, request: Request) -> Response {
+        if !matches!(request.action.as_str(), "tunnel.ensure" | "tunnel.stop") {
+            self.reconcile_tunnels();
+        }
         let started = std::time::Instant::now();
         request_event(
             "info",
@@ -950,6 +953,26 @@ impl ExecutorRuntime {
                     json!({"destination": destination, "digest": digest, "size": size, "files": files}),
                 )
             }
+            "tunnel.ensure" => self.tunnel_ensure(&params),
+            "tunnel.get" => self.tunnel_get(&params),
+            "tunnel.list" => Ok(json!({
+                "tunnels": self.processes.list().iter()
+                    .filter(|record| record.metadata.get("kind").and_then(Value::as_str) == Some("tunnel"))
+                    .map(|record| tunnel_view(record, false))
+                    .collect::<Vec<_>>()
+            })),
+            "tunnel.stop" => {
+                let tunnel_id = required_str(&params, "tunnelId")?;
+                validate_resource_id(tunnel_id)?;
+                let process_id = format!("tunnel-{tunnel_id}");
+                let existing = self.processes.get(&process_id)?;
+                require_tunnel_record(&existing)?;
+                let mut metadata = existing.metadata;
+                metadata["desiredState"] = Value::String("stopped".to_owned());
+                self.processes.update_metadata(&process_id, metadata)?;
+                let record = self.processes.stop(&process_id)?;
+                Ok(tunnel_view(&record, false))
+            }
             "process.start" | "agent.start" => {
                 let cwd_input = required_str(&params, "cwd")?;
                 let cwd = self.path(&params, "cwd", true)?;
@@ -988,6 +1011,7 @@ impl ExecutorRuntime {
                             .get("restartable")
                             .and_then(Value::as_bool)
                             .unwrap_or(false),
+                        Value::Null,
                     )?,
                 )
                 .expect("process serializes"))
@@ -1293,6 +1317,139 @@ impl ExecutorRuntime {
         }
     }
 
+    fn tunnel_ensure(&self, params: &Value) -> Result<Value, RpcError> {
+        let tunnel_id = required_str(params, "tunnelId")?;
+        validate_resource_id(tunnel_id)?;
+        let process_id = format!("tunnel-{tunnel_id}");
+        let direction = required_str(params, "direction")?;
+        if !matches!(direction, "local-forward" | "remote-forward") {
+            return Err(RpcError::new(
+                "INVALID_PARAMS",
+                "unsupported tunnel direction",
+            ));
+        }
+        let bind_host = required_str(params, "bindHost")?;
+        let bind_port = required_port(params, "bindPort")?;
+        let target_host = required_str(params, "targetHost")?;
+        let target_port = required_port(params, "targetPort")?;
+        let ssh_host = required_str(params, "sshHost")?;
+        let metadata = json!({
+            "kind": "tunnel", "tunnelId": tunnel_id,
+            "workspaceSessionId": params.get("workspaceSessionId"),
+            "sshHost": ssh_host, "direction": direction,
+            "source": {"host": bind_host, "port": bind_port},
+            "destination": {"host": target_host, "port": target_port},
+            "desiredState": "running"
+        });
+        if let Ok(existing) = self.processes.get(&process_id)
+            && existing.state == crate::process::ProcessState::Running
+        {
+            if !tunnel_definition_matches(&existing.metadata, &metadata) {
+                return Err(RpcError::new(
+                    "TUNNEL_CONFLICT",
+                    format!("tunnel {tunnel_id} is running with a different definition"),
+                ));
+            }
+            return Ok(tunnel_view(&existing, true));
+        }
+        let cwd = self.path(params, "cwd", true)?;
+        let log_path = if params.get("logPath").and_then(Value::as_str).is_some() {
+            self.path(params, "logPath", false)?
+        } else {
+            cwd.join(format!(".workbench-{process_id}.log"))
+        };
+        let forward = format!("{bind_host}:{bind_port}:{target_host}:{target_port}");
+        let mut argv = vec![
+            "ssh".to_owned(),
+            "-N".to_owned(),
+            "-C".to_owned(),
+            if direction == "local-forward" {
+                "-L"
+            } else {
+                "-R"
+            }
+            .to_owned(),
+            forward,
+            "-o".to_owned(),
+            "ExitOnForwardFailure=yes".to_owned(),
+            "-o".to_owned(),
+            "ServerAliveInterval=10".to_owned(),
+            "-o".to_owned(),
+            "ServerAliveCountMax=3".to_owned(),
+            "-o".to_owned(),
+            "StrictHostKeyChecking=accept-new".to_owned(),
+        ];
+        if params
+            .get("knownHostsFile")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            let known_hosts = self.path(params, "knownHostsFile", false)?;
+            argv.extend([
+                "-o".to_owned(),
+                format!("UserKnownHostsFile={}", known_hosts.display()),
+            ]);
+        }
+        argv.push(ssh_host.to_owned());
+        let readiness = (direction == "local-forward").then(|| {
+            json!({
+                "type": "tcp", "host": bind_host, "port": bind_port,
+                "timeoutMs": 30_000, "intervalMs": 500
+            })
+        });
+        let record = self.processes.start(
+            process_id,
+            cwd,
+            argv,
+            BTreeMap::new(),
+            log_path,
+            readiness,
+            true,
+            metadata,
+        )?;
+        Ok(tunnel_view(&record, false))
+    }
+
+    fn tunnel_get(&self, params: &Value) -> Result<Value, RpcError> {
+        let tunnel_id = required_str(params, "tunnelId")?;
+        validate_resource_id(tunnel_id)?;
+        let record = self.processes.get(&format!("tunnel-{tunnel_id}"))?;
+        require_tunnel_record(&record)?;
+        Ok(tunnel_view(&record, false))
+    }
+
+    fn reconcile_tunnels(&self) {
+        let now = now_ms();
+        let candidates = self
+            .processes
+            .list()
+            .into_iter()
+            .filter(|record| {
+                record.metadata.get("kind").and_then(Value::as_str) == Some("tunnel")
+                    && record.metadata.get("desiredState").and_then(Value::as_str)
+                        == Some("running")
+                    && matches!(
+                        record.state,
+                        crate::process::ProcessState::Failed
+                            | crate::process::ProcessState::Stopped
+                    )
+                    && now.saturating_sub(
+                        record
+                            .metadata
+                            .get("lastReconcileAttemptAt")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0),
+                    ) >= 5_000
+            })
+            .collect::<Vec<_>>();
+        for record in candidates {
+            let mut metadata = record.metadata.clone();
+            metadata["lastReconcileAttemptAt"] = Value::from(now);
+            let _ = self.processes.update_metadata(&record.id, metadata);
+            let _ = self.processes.restart(&record.id);
+        }
+    }
+
     fn path(&self, params: &Value, key: &str, must_exist: bool) -> Result<PathBuf, RpcError> {
         let raw = params
             .get(key)
@@ -1433,6 +1590,10 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("readiness.wait", Effect::ReadOnly),
         ("logs.read", Effect::ReadOnly),
         ("port.check", Effect::ReadOnly),
+        ("tunnel.ensure", Effect::Mutating),
+        ("tunnel.get", Effect::ReadOnly),
+        ("tunnel.list", Effect::ReadOnly),
+        ("tunnel.stop", Effect::Mutating),
         ("agent.start", Effect::Mutating),
         ("agent.stop", Effect::Mutating),
         ("application.materialize", Effect::Mutating),
@@ -1861,6 +2022,59 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             RollbackStrategy::None,
             vec!["port-status"],
         ),
+        "tunnel.ensure" => (
+            vec!["process", "network"],
+            json!({
+                "tunnelId": {"type": "string"},
+                "workspaceSessionId": {"type": "string"},
+                "sshHost": {"type": "string"},
+                "direction": {"type": "string", "enum": ["local-forward", "remote-forward"]},
+                "bindHost": {"type": "string"},
+                "bindPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "targetHost": {"type": "string"},
+                "targetPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+                "cwd": {"type": "string"},
+                "logPath": {"type": "string"},
+                "knownHostsFile": {"type": "string"}
+            }),
+            vec!["tunnel:${tunnelId}"],
+            vec![
+                "tunnelId",
+                "sshHost",
+                "direction",
+                "bindHost",
+                "bindPort",
+                "targetHost",
+                "targetPort",
+            ],
+            30_000,
+            RollbackStrategy::Compensate {
+                capability: "tunnel.stop".to_owned(),
+            },
+            vec!["tunnel-record", "readiness"],
+        ),
+        "tunnel.get" | "tunnel.stop" => (
+            vec!["process", "network"],
+            json!({"tunnelId": {"type": "string"}}),
+            if name == "tunnel.stop" {
+                vec!["tunnel:${tunnelId}"]
+            } else {
+                Vec::new()
+            },
+            vec!["tunnelId"],
+            30_000,
+            RollbackStrategy::None,
+            vec!["tunnel-record"],
+        ),
+        "tunnel.list" => (
+            vec!["process", "network"],
+            json!({}),
+            Vec::new(),
+            Vec::new(),
+            30_000,
+            RollbackStrategy::None,
+            vec!["tunnel-list"],
+        ),
         "agent.start" => (
             vec!["process", "agent-runtime"],
             json!({
@@ -1913,6 +2127,8 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
         "tail",
         "fence",
         "approvalDigest",
+        "workspaceSessionId",
+        "knownHostsFile",
     ];
     let schema_required: Vec<String> = properties
         .as_object()
@@ -2025,6 +2241,12 @@ fn output_schema(name: &str) -> Value {
             "id": {"type": "string"}, "state": {"type": "string"},
             "pid": {"type": ["integer", "null"]}
         }),
+        "tunnel.ensure" | "tunnel.get" | "tunnel.stop" => json!({
+            "id": {"type": "string"}, "state": {"type": "string"},
+            "observedState": {"type": "string"}, "source": {"type": "object"},
+            "destination": {"type": "object"}
+        }),
+        "tunnel.list" => json!({"tunnels": {"type": "array"}}),
         "application.materialize" => json!({
             "generationId": {"type": "string"}, "root": {"type": "string"},
             "applicationPath": {"type": "string"}, "markerPath": {"type": "string"},
@@ -2149,6 +2371,88 @@ fn required_str<'a>(params: &'a Value, key: &str) -> Result<&'a str, RpcError> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| RpcError::new("INVALID_PARAMS", format!("{key} is required")))
+}
+
+fn required_port(params: &Value, key: &str) -> Result<u16, RpcError> {
+    let value = params
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=u16::MAX as u64).contains(value))
+        .ok_or_else(|| RpcError::new("INVALID_PARAMS", format!("{key} must be a valid port")))?;
+    Ok(value as u16)
+}
+
+fn validate_resource_id(value: &str) -> Result<(), RpcError> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(RpcError::new(
+            "INVALID_PARAMS",
+            "resource id must contain only letters, digits, dot, dash, or underscore",
+        ));
+    }
+    Ok(())
+}
+
+fn require_tunnel_record(record: &crate::process::ProcessRecord) -> Result<(), RpcError> {
+    if record.metadata.get("kind").and_then(Value::as_str) != Some("tunnel") {
+        return Err(RpcError::new(
+            "TUNNEL_NOT_FOUND",
+            "process is not a managed tunnel",
+        ));
+    }
+    Ok(())
+}
+
+fn tunnel_definition_matches(left: &Value, right: &Value) -> bool {
+    [
+        "kind",
+        "tunnelId",
+        "workspaceSessionId",
+        "sshHost",
+        "direction",
+        "source",
+        "destination",
+    ]
+    .iter()
+    .all(|key| left.get(key) == right.get(key))
+}
+
+fn tunnel_view(record: &crate::process::ProcessRecord, reused: bool) -> Value {
+    let observed_state = match (record.state.clone(), record.readiness.state.clone()) {
+        (crate::process::ProcessState::Running, crate::process::ReadinessState::Ready) => "ready",
+        (crate::process::ProcessState::Running, crate::process::ReadinessState::Pending) => {
+            "starting"
+        }
+        (crate::process::ProcessState::Running, crate::process::ReadinessState::Failed) => {
+            "degraded"
+        }
+        (crate::process::ProcessState::Running, crate::process::ReadinessState::NotConfigured) => {
+            "running"
+        }
+        (crate::process::ProcessState::Failed, _) => "failed",
+        (crate::process::ProcessState::Stopped, _) => "stopped",
+    };
+    json!({
+        "id": record.metadata.get("tunnelId"),
+        "workspaceSessionId": record.metadata.get("workspaceSessionId"),
+        "sshHost": record.metadata.get("sshHost"),
+        "direction": record.metadata.get("direction"),
+        "source": record.metadata.get("source"),
+        "destination": record.metadata.get("destination"),
+        "desiredState": record.metadata.get("desiredState"),
+        "observedState": observed_state,
+        "state": record.state,
+        "readiness": record.readiness,
+        "processId": record.id,
+        "startedAt": record.started_at,
+        "updatedAt": record.updated_at,
+        "lastProbeAt": record.last_successful_probe_at,
+        "reused": reused
+    })
 }
 
 fn string_array(params: &Value, key: &str) -> Result<Vec<String>, RpcError> {
@@ -2477,6 +2781,23 @@ fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tunnel_capabilities_are_typed_and_do_not_expose_command_arguments() {
+        let catalog = capability_catalog();
+        for name in ["tunnel.ensure", "tunnel.get", "tunnel.list", "tunnel.stop"] {
+            assert!(catalog.iter().any(|capability| capability.name == name));
+        }
+        let ensure = catalog
+            .iter()
+            .find(|capability| capability.name == "tunnel.ensure")
+            .expect("tunnel ensure contract");
+        assert_eq!(
+            ensure.input_schema["properties"]["direction"]["type"],
+            "string"
+        );
+        assert!(ensure.input_schema["properties"].get("argv").is_none());
+    }
 
     #[test]
     fn application_paths_allow_managed_bundles() {
