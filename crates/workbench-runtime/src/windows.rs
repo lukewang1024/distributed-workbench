@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::TcpStream,
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -12,6 +13,7 @@ use tungstenite::{Message, connect};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE},
     Security::{DuplicateTokenEx, SecurityImpersonation, TOKEN_ALL_ACCESS, TokenPrimary},
+    Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
     System::{
         Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
         RemoteDesktop::{
@@ -67,6 +69,7 @@ pub fn launch(
     application: &Path,
     args: &[String],
     user_data_dir: Option<&Path>,
+    chromium_local_state_patch: Option<&Value>,
     file: Option<&Path>,
     remote_debugging_port: Option<u16>,
     terminate_conflicting_instances: bool,
@@ -81,6 +84,16 @@ pub fn launch(
         fs::create_dir_all(profile)
             .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
     }
+    let local_state_patch = match (user_data_dir, chromium_local_state_patch) {
+        (Some(profile), Some(patch)) => Some(patch_chromium_local_state(profile, patch)?),
+        (None, Some(_)) => {
+            return Err(RpcError::new(
+                "INVALID_PARAMS",
+                "chromiumLocalStatePatch requires userDataDir",
+            ));
+        }
+        _ => None,
+    };
     let terminated = if terminate_conflicting_instances {
         terminate_process_trees(&executable)?
     } else {
@@ -103,10 +116,80 @@ pub fn launch(
         "pid": pid,
         "launcherPid": pid,
         "terminatedConflictingInstances": terminated,
+        "chromiumLocalState": local_state_patch,
         "file": file,
         "args": args,
         "cdp": Value::Null,
         "readyAt": now_ms(),
+    }))
+}
+
+fn merge_json(target: &mut Value, patch: &Value) {
+    match (target, patch) {
+        (Value::Object(target), Value::Object(patch)) => {
+            for (key, value) in patch {
+                merge_json(target.entry(key.clone()).or_insert(Value::Null), value);
+            }
+        }
+        (target, patch) => *target = patch.clone(),
+    }
+}
+
+fn patch_chromium_local_state(profile: &Path, patch: &Value) -> Result<Value, RpcError> {
+    if !patch.is_object() {
+        return Err(RpcError::new(
+            "INVALID_PARAMS",
+            "chromiumLocalStatePatch must be an object",
+        ));
+    }
+    fs::create_dir_all(profile)
+        .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
+    let local_state = profile.join("Local State");
+    let mut state = if local_state.exists() {
+        let bytes = fs::read(&local_state)
+            .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            RpcError::new(
+                "PROFILE_INVALID",
+                format!("cannot parse {}: {error}", local_state.display()),
+            )
+        })?
+    } else {
+        json!({})
+    };
+    if !state.is_object() {
+        return Err(RpcError::new(
+            "PROFILE_INVALID",
+            format!("{} must contain a JSON object", local_state.display()),
+        ));
+    }
+    merge_json(&mut state, patch);
+    let temporary = profile.join(format!(".Local State.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec(&state)
+        .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
+    fs::write(&temporary, bytes)
+        .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
+    let temporary_wide: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let local_state_wide: Vec<u16> = local_state
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let replaced = unsafe {
+        MoveFileExW(
+            temporary_wide.as_ptr(),
+            local_state_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = fs::remove_file(&temporary);
+        return Err(RpcError::new("PROFILE_WRITE_FAILED", error.to_string()));
+    }
+    Ok(json!({
+        "path": local_state,
+        "applied": true,
     }))
 }
 
@@ -610,5 +693,30 @@ mod tests {
                 "LSItemContentTypes": []
             })]
         );
+    }
+
+    #[test]
+    fn chromium_local_state_patch_preserves_existing_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("Local State"),
+            serde_json::to_vec(&json!({"existing": true, "saman": {"other": 1}})).unwrap(),
+        )
+        .unwrap();
+
+        let result = patch_chromium_local_state(
+            directory.path(),
+            &json!({"saman": {"use_file_resource": true, "hotfix": {"is_enabled": false}}}),
+        )
+        .unwrap();
+
+        assert_eq!(result["applied"], true);
+        let state: Value =
+            serde_json::from_slice(&fs::read(directory.path().join("Local State")).unwrap())
+                .unwrap();
+        assert_eq!(state["existing"], true);
+        assert_eq!(state["saman"]["other"], 1);
+        assert_eq!(state["saman"]["use_file_resource"], true);
+        assert_eq!(state["saman"]["hotfix"]["is_enabled"], false);
     }
 }
