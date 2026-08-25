@@ -122,13 +122,7 @@ fn terminate_process_trees(executable: &Path) -> Result<usize, RpcError> {
         })?;
     let escaped = name.replace('\'', "''");
     let script = format!(
-        "$name='{escaped}'; ".to_owned()
-            + "$items=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq $name }}); "
-            + "foreach($item in $items) {{ & taskkill.exe /PID $item.ProcessId /T /F | Out-Null }}; "
-            + "$deadline=(Get-Date).AddSeconds(15); "
-            + "do {{ $remaining=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq $name }}); if($remaining.Count -eq 0) {{ break }}; Start-Sleep -Milliseconds 200 }} while((Get-Date) -lt $deadline); "
-            + "if($remaining.Count -ne 0) {{ throw \"conflicting $name process tree did not exit\" }}; "
-            + "$items.Count"
+        "$name='{escaped}'; $items=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq $name }}); foreach($item in $items) {{ & taskkill.exe /PID $item.ProcessId /T /F | Out-Null }}; $deadline=(Get-Date).AddSeconds(15); do {{ $remaining=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq $name }}); if($remaining.Count -eq 0) {{ break }}; Start-Sleep -Milliseconds 200 }} while((Get-Date) -lt $deadline); if($remaining.Count -ne 0) {{ throw \"conflicting $name process tree did not exit\" }}; $items.Count"
     );
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
