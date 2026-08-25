@@ -1185,6 +1185,10 @@ impl ExecutorRuntime {
                         .get("remoteDebuggingPort")
                         .and_then(Value::as_u64)
                         .map(|port| port as u16),
+                    params
+                        .get("terminateConflictingInstances")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 )
             }
             #[cfg(target_os = "macos")]

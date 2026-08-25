@@ -69,6 +69,7 @@ pub fn launch(
     user_data_dir: Option<&Path>,
     file: Option<&Path>,
     remote_debugging_port: Option<u16>,
+    terminate_conflicting_instances: bool,
 ) -> Result<Value, RpcError> {
     let executable = find_executable(application).ok_or_else(|| {
         RpcError::new(
@@ -80,6 +81,11 @@ pub fn launch(
         fs::create_dir_all(profile)
             .map_err(|error| RpcError::new("PROFILE_WRITE_FAILED", error.to_string()))?;
     }
+    let terminated = if terminate_conflicting_instances {
+        terminate_process_trees(&executable)?
+    } else {
+        0
+    };
     let mut launch_args = args.to_vec();
     if let Some(profile) = user_data_dir {
         launch_args.push(format!("--user-data-dir={}", profile.display()));
@@ -96,11 +102,48 @@ pub fn launch(
         "executable": executable,
         "pid": pid,
         "launcherPid": pid,
+        "terminatedConflictingInstances": terminated,
         "file": file,
         "args": args,
         "cdp": Value::Null,
         "readyAt": now_ms(),
     }))
+}
+
+fn terminate_process_trees(executable: &Path) -> Result<usize, RpcError> {
+    let name = executable
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            RpcError::new(
+                "APPLICATION_TERMINATE_FAILED",
+                "executable has no UTF-8 file name",
+            )
+        })?;
+    let escaped = name.replace('\'', "''");
+    let script = format!(
+        "$name='{escaped}'; ".to_owned()
+            + "$items=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq $name }}); "
+            + "foreach($item in $items) {{ & taskkill.exe /PID $item.ProcessId /T /F | Out-Null }}; "
+            + "$deadline=(Get-Date).AddSeconds(15); "
+            + "do {{ $remaining=@(Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq $name }}); if($remaining.Count -eq 0) {{ break }}; Start-Sleep -Milliseconds 200 }} while((Get-Date) -lt $deadline); "
+            + "if($remaining.Count -ne 0) {{ throw \"conflicting $name process tree did not exit\" }}; "
+            + "$items.Count"
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .map_err(|error| RpcError::new("APPLICATION_TERMINATE_FAILED", error.to_string()))?;
+    if !output.status.success() {
+        return Err(RpcError::new(
+            "APPLICATION_TERMINATE_FAILED",
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| RpcError::new("APPLICATION_TERMINATE_FAILED", error.to_string()))
 }
 
 pub fn open_file(
