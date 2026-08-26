@@ -15,8 +15,8 @@ use std::time::Duration;
 use workbench_core::{ObservabilityStore, atomic_replace, now_ms, sha256_bytes};
 use workbench_protocol::{Request, Response, RpcError};
 use workbench_schema::{
-    CancelPolicy, CapabilityDescriptor, Effect, HealthCheck, IdempotencyContract, Observation,
-    RetryPolicy, RollbackStrategy,
+    CancelPolicy, CapabilityDescriptor, Effect, ExecutionKind, HealthCheck, IdempotencyContract,
+    Observation, RetryPolicy, RollbackStrategy,
 };
 
 use crate::generation::{Overlay, activate, apply_overlays, materialize, record_state};
@@ -2331,6 +2331,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             retention_ms: 86_400_000,
         },
         timeout_ms,
+        execution_kind: capability_execution_kind(name, timeout_ms),
         retry: RetryPolicy {
             max_attempts: if matches!(effect, Effect::ReadOnly) || retryable_idempotent {
                 3
@@ -2347,6 +2348,24 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
         priority: capability_priority(name),
         max_concurrency: capability_concurrency(name),
         cancel_policy: capability_cancel_policy(name),
+    }
+}
+
+fn capability_execution_kind(name: &str, timeout_ms: u64) -> ExecutionKind {
+    if timeout_ms > 30_000
+        || matches!(
+            name,
+            "artifact.build"
+                | "artifact.relay"
+                | "generation.materialize"
+                | "application.launch"
+                | "process.start"
+                | "command.run"
+        )
+    {
+        ExecutionKind::Background
+    } else {
+        ExecutionKind::Inline
     }
 }
 

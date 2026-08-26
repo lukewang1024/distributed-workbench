@@ -289,13 +289,27 @@ fn main() -> Result<()> {
 
 fn run_cli(cli: Cli) -> Result<()> {
     match &cli.command {
-        Command::Controller { .. } => {
-            init_logging("controller", default_log_dir().join("controller.jsonl"))
+        Command::Controller {
+            command: ControllerCommand::Serve { state, .. },
+        } => init_logging(
+            "controller",
+            role_log_path(state.as_deref(), "controller.jsonl"),
+        ),
+        Command::Executor {
+            command: ExecutorCommand::Serve { state, .. },
+        } => init_logging(
+            "executor",
+            role_log_path(state.as_deref(), "executor.jsonl"),
+        ),
+        Command::Peer { command } => {
+            let state = match command.as_ref() {
+                PeerCommand::Connect { state, .. } | PeerCommand::Status { state } => {
+                    Some(state.as_path())
+                }
+                PeerCommand::Accept { .. } => None,
+            };
+            init_logging("peer", role_log_path(state, "peer.jsonl"))
         }
-        Command::Executor { .. } => {
-            init_logging("executor", default_log_dir().join("executor.jsonl"))
-        }
-        Command::Peer { .. } => init_logging("peer", default_log_dir().join("peer.jsonl")),
         _ => {}
     }
     match cli.command {
@@ -1800,6 +1814,13 @@ fn default_log_dir() -> PathBuf {
     state_home().join("logs")
 }
 
+fn role_log_path(state: Option<&Path>, name: &str) -> PathBuf {
+    match state.and_then(Path::parent) {
+        Some(parent) => parent.join("logs").join(name),
+        None => default_log_dir().join(name),
+    }
+}
+
 fn print_logs(
     component: Option<&str>,
     correlation_id: Option<&str>,
@@ -1948,6 +1969,19 @@ domains: []
         for root in ["/srv/workspace", "${user.home}/Code", "D:\\Workspace"] {
             validate_allow_root(root).unwrap();
         }
+    }
+
+    #[test]
+    fn role_logs_follow_the_explicit_instance_state_root() {
+        assert_eq!(
+            role_log_path(
+                Some(Path::new(
+                    "/tmp/distributed-workbench-canary/controller.json"
+                )),
+                "controller.jsonl",
+            ),
+            PathBuf::from("/tmp/distributed-workbench-canary/logs/controller.jsonl")
+        );
     }
 
     #[test]

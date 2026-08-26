@@ -47,6 +47,7 @@
       }
     },
     "timeoutMs": {"type": "integer", "minimum": 1},
+    "executionKind": {"enum": ["inline", "background"], "default": "inline"},
     "retry": {
       "type": "object",
       "additionalProperties": false,
@@ -67,6 +68,9 @@
     },
     "healthCheck": {"type": "object", "required": ["type"]},
     "emittedEvidence": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-    "effect": {"enum": ["read-only", "mutating"]}
+    "effect": {"enum": ["read-only", "mutating"]},
+    "priority": {"type": "integer", "minimum": 0, "maximum": 255},
+    "maxConcurrency": {"type": ["integer", "null"], "minimum": 1},
+    "cancelPolicy": {"enum": ["cancel-on-disconnect", "continue"]}
   }
 }

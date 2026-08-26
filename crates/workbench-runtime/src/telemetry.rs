@@ -52,3 +52,32 @@ pub fn event_fields(level: &str, event: &str, fields: Value) {
         let _ = file.write_all(b"\n");
     }
 }
+
+pub fn task_event(task_id: &str, level: &str, event: &str, fields: Value) {
+    let Some(sink) = LOG.get() else { return };
+    if !task_id.starts_with("task_")
+        || task_id.len() > 64
+        || !task_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return;
+    }
+    let root = sink
+        .path
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new("."));
+    let path = root.join("tasks").join(task_id).join("events.jsonl");
+    let record = json!({"timestamp": now_ms(), "level": level, "component": sink.component, "event": event, "data": fields});
+    let Ok(_guard) = sink.lock.lock() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path)
+        && let Ok(encoded) = serde_json::to_vec(&record)
+    {
+        let _ = file.write_all(&encoded);
+        let _ = file.write_all(b"\n");
+    }
+}
