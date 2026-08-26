@@ -1999,10 +1999,23 @@ impl Controller {
                 }
                 if !invocation_is_readonly {
                     input["_workspaceSessionId"] = Value::String(workspace_session_id.to_owned());
-                    input["_authority"] = Value::Array(
-                        driver_authority
+                    // The executor validates authority against the capability contract's
+                    // declared locks. The workspace Driver lease authorizes lock-free
+                    // mutations, while declared capability locks use their matching
+                    // Resource leases. Controller-only command resources may still be
+                    // acquired above, but are intentionally not forwarded as executor
+                    // authority because they are not part of the executor contract.
+                    let executor_authority = if contract.locks.is_empty() {
+                        driver_authority.iter().collect::<Vec<_>>()
+                    } else {
+                        acquired
                             .iter()
-                            .chain(acquired.iter())
+                            .take(contract.locks.len())
+                            .collect::<Vec<_>>()
+                    };
+                    input["_authority"] = Value::Array(
+                        executor_authority
+                            .into_iter()
                             .map(|lease| {
                                 json!({
                                     "controllerId": self.id,
@@ -5332,15 +5345,17 @@ mod tests {
         let token = lease["token"].as_str().unwrap().to_owned();
         let target = directory.path().to_path_buf();
         let (sender, receiver) = mpsc::channel();
+        let controller_for_command = Arc::clone(&controller);
+        let command_token = token.clone();
         std::thread::spawn(move || {
-            let response = controller.handle(Request::new(
+            let response = controller_for_command.handle(Request::new(
                 "capability.invoke",
                 json!({
                     "executorId":"executor",
                 "capability":"command.run",
                     "workspaceSessionId":"workspace",
                     "owner":"agent",
-                    "driverToken":token,
+                    "driverToken":command_token,
                     "idempotencyKey":"mutating-capability",
                     "executionMode":"sync",
                 "input":{"cwd":target,"argv":["pwd"]}
@@ -5352,6 +5367,23 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("mutating capability deadlocked before executor dispatch");
         assert!(response.ok, "{:?}", response.error);
+
+        let written = directory.path().join("authority-contract.txt");
+        let response = controller.handle(Request::new(
+            "capability.invoke",
+            json!({
+                "executorId":"executor",
+                "capability":"filesystem.write",
+                "workspaceSessionId":"workspace",
+                "owner":"agent",
+                "driverToken":token,
+                "idempotencyKey":"mutating-capability-with-lock",
+                "executionMode":"sync",
+                "input":{"path":written,"content":"ok"}
+            }),
+        ));
+        assert!(response.ok, "{:?}", response.error);
+        assert_eq!(std::fs::read_to_string(written).unwrap(), "ok");
     }
 
     #[test]
