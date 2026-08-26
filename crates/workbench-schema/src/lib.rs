@@ -161,6 +161,10 @@ pub struct CapabilityDescriptor {
     pub locks: Vec<LockTemplate>,
     pub idempotency: IdempotencyContract,
     pub timeout_ms: u64,
+    /// Default invocation behavior. Clients may explicitly request sync or
+    /// async execution, while auto follows this contract value.
+    #[serde(default)]
+    pub execution_kind: ExecutionKind,
     #[serde(default)]
     pub retry: RetryPolicy,
     pub rollback: RollbackStrategy,
@@ -181,6 +185,14 @@ pub struct CapabilityDescriptor {
     /// client disconnects before receiving the response.
     #[serde(default)]
     pub cancel_policy: CancelPolicy,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecutionKind {
+    #[default]
+    Inline,
+    Background,
 }
 
 fn default_capability_priority() -> u8 {

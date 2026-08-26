@@ -1,6 +1,9 @@
 use anyhow::{Context, Result, anyhow};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use workbench_protocol::{Request, Response};
 use workbench_schema::ExecutorEndpoint;
 
@@ -73,6 +76,25 @@ pub fn call_executor(endpoint: &ExecutorEndpoint, request: &Request) -> Result<R
     }
 }
 
+pub fn call_executor_with_timeout(
+    endpoint: &ExecutorEndpoint,
+    request: &Request,
+    timeout: Duration,
+) -> Result<Response> {
+    let endpoint = endpoint.clone();
+    let request = request.clone();
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(call_executor(&endpoint, &request));
+    });
+    receiver.recv_timeout(timeout).map_err(|_| {
+        anyhow!(
+            "executor response exceeded {}ms deadline",
+            timeout.as_millis()
+        )
+    })?
+}
+
 pub fn deploy_binary_over_ssh(host: &str, bytes: &[u8], target: &str) -> Result<()> {
     let temporary = format!("{target}.workbench.tmp");
     let mut child = Command::new("ssh")
@@ -134,5 +156,24 @@ mod tests {
     #[test]
     fn ssh_arguments_are_safe_inside_single_quotes() {
         assert_eq!(shell_single_quote("a'b"), "a'\\''b");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_provider_call_obeys_controller_deadline() {
+        let endpoint = ExecutorEndpoint::Command {
+            executable: "/bin/sh".to_owned(),
+            args: vec!["-c".to_owned(), "sleep 1".to_owned()],
+            cwd: None,
+        };
+        let started = std::time::Instant::now();
+        let error = call_executor_with_timeout(
+            &endpoint,
+            &Request::new("status", json!({})),
+            Duration::from_millis(25),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("deadline"));
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

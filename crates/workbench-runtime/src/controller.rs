@@ -1,6 +1,7 @@
 use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,14 +13,14 @@ use workbench_core::{
 use workbench_protocol::{Request, Response, RpcError};
 use workbench_schema::{
     ActivationTransaction, AgentInstance, AgentState, Approval, ApprovalState, Artifact,
-    ArtifactLocation, CapabilityDescriptor, ControllerPeer, Executor, ExecutorEndpoint, Generation,
-    GenerationState, Handoff, HealthStatus, LeaseKind, Metadata, Observation, Provenance, Run,
-    RunHealth, RunStatus, SessionAuthority, SessionState, Task, TaskState, TransactionJournalEntry,
-    TransactionState, TransactionStepState, WorkspaceSession,
+    ArtifactLocation, CapabilityDescriptor, ControllerPeer, ExecutionKind, Executor,
+    ExecutorEndpoint, Generation, GenerationState, Handoff, HealthStatus, LeaseKind, Metadata,
+    Observation, Provenance, Run, RunHealth, RunStatus, SessionAuthority, SessionState, Task,
+    TaskState, TransactionJournalEntry, TransactionState, TransactionStepState, WorkspaceSession,
 };
 
-use crate::telemetry::{event_fields, request_event};
-use crate::transport::call_executor;
+use crate::telemetry::{event_fields, request_event, task_event};
+use crate::transport::{call_executor, call_executor_with_timeout};
 
 #[derive(Clone, Default)]
 struct TraceContext {
@@ -118,16 +119,20 @@ fn transfer_error(mut error: RpcError, stage: &str, offset: u64, chunks: u64) ->
     error
 }
 
+#[derive(Clone)]
 pub struct Controller {
     id: String,
     store: JsonStore,
-    state: Mutex<WorkbenchState>,
-    leases: Mutex<LeaseTable>,
-    tasks: Mutex<TaskTable>,
-    session_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    observations: ObservabilityStore,
-    operator_grants: Mutex<HashMap<String, OperatorGrant>>,
-    operator_nonces: Mutex<HashMap<String, OperatorNonce>>,
+    state: Arc<Mutex<WorkbenchState>>,
+    leases: Arc<Mutex<LeaseTable>>,
+    tasks: Arc<Mutex<TaskTable>>,
+    session_gates: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    observations: Arc<ObservabilityStore>,
+    operator_grants: Arc<Mutex<HashMap<String, OperatorGrant>>>,
+    operator_nonces: Arc<Mutex<HashMap<String, OperatorNonce>>>,
+    async_active: Arc<AtomicUsize>,
+    async_maximum: usize,
+    async_resume_tokens: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Controller {
@@ -181,14 +186,21 @@ impl Controller {
         }
         Ok(Self {
             id,
-            leases: Mutex::new(leases),
-            tasks: Mutex::new(tasks),
-            session_gates: Mutex::new(HashMap::new()),
-            state: Mutex::new(state),
+            leases: Arc::new(Mutex::new(leases)),
+            tasks: Arc::new(Mutex::new(tasks)),
+            session_gates: Arc::new(Mutex::new(HashMap::new())),
+            state: Arc::new(Mutex::new(state)),
             store,
-            observations,
-            operator_grants: Mutex::new(HashMap::new()),
-            operator_nonces: Mutex::new(HashMap::new()),
+            observations: Arc::new(observations),
+            operator_grants: Arc::new(Mutex::new(HashMap::new())),
+            operator_nonces: Arc::new(Mutex::new(HashMap::new())),
+            async_active: Arc::new(AtomicUsize::new(0)),
+            async_maximum: std::env::var("WORKBENCH_CONTROLLER_ASYNC_CONCURRENCY")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value: &usize| *value > 0)
+                .unwrap_or(32),
+            async_resume_tokens: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -207,7 +219,12 @@ impl Controller {
             }))
         });
         let started = Instant::now();
-        request_event("info", "request.started", &request, json!({}));
+        request_event(
+            "info",
+            "request.started",
+            &request,
+            safe_request_fields(&request.action, &request.params),
+        );
         let finish_fields = json!({
             "requestId": request.request_id.clone(),
             "correlationId": request.correlation_id.as_deref().unwrap_or(&request.request_id),
@@ -1736,6 +1753,107 @@ impl Controller {
                         .map_err(map_lease_error)?;
                 }
                 validate_schema(&contract.input_schema, &input, "input")?;
+                let execution_mode = params
+                    .get("executionMode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("auto");
+                if !matches!(execution_mode, "auto" | "sync" | "async") {
+                    return Err(RpcError::new(
+                        "INVALID_PARAMS",
+                        "executionMode must be auto, sync, or async",
+                    ));
+                }
+                let resume_task_id = params.get("_resumeTaskId").and_then(Value::as_str);
+                let resume_authorized = resume_task_id.is_some_and(|task_id| {
+                    let supplied = params.get("_resumeToken").and_then(Value::as_str);
+                    let mut tokens = self
+                        .async_resume_tokens
+                        .lock()
+                        .expect("async resume tokens lock");
+                    let matches =
+                        supplied.is_some() && supplied == tokens.get(task_id).map(String::as_str);
+                    if matches {
+                        tokens.remove(task_id);
+                    }
+                    matches
+                });
+                let default_async = contract.execution_kind == ExecutionKind::Background;
+                if resume_task_id.is_none()
+                    && (execution_mode == "async" || (execution_mode == "auto" && default_async))
+                {
+                    if self
+                        .async_active
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                            (active < self.async_maximum).then_some(active + 1)
+                        })
+                        .is_err()
+                    {
+                        let mut error = RpcError::new(
+                            "TASK_QUEUE_FULL",
+                            format!("controller async task limit {} reached", self.async_maximum),
+                        );
+                        error.retryable = true;
+                        return Err(error);
+                    }
+                    let (correlation_id, request_id) = current_trace();
+                    let (task, reused) = self.tasks.lock().expect("task lock").submit_traced(
+                        workspace_session_id,
+                        executor_id,
+                        capability_name,
+                        input.clone(),
+                        idempotency_key,
+                        correlation_id.clone(),
+                        request_id.clone(),
+                    );
+                    if reused {
+                        self.async_active.fetch_sub(1, Ordering::AcqRel);
+                        return Ok(
+                            json!({"task": task, "reused": true, "accepted": !task.state.terminal()}),
+                        );
+                    }
+                    if let Err(error) = self.persist() {
+                        self.async_active.fetch_sub(1, Ordering::AcqRel);
+                        return Err(error);
+                    }
+                    self.observe_task_state(&task);
+                    let mut worker_params = params.clone();
+                    worker_params["executionMode"] = json!("sync");
+                    worker_params["_resumeTaskId"] = json!(task.id.clone());
+                    let resume_token = format!("resume_{}", Uuid::new_v4().simple());
+                    self.async_resume_tokens
+                        .lock()
+                        .expect("async resume tokens lock")
+                        .insert(task.id.clone(), resume_token.clone());
+                    worker_params["_resumeToken"] = json!(resume_token);
+                    let controller = self.clone();
+                    let async_active = Arc::clone(&self.async_active);
+                    let worker_task_id = task.id.clone();
+                    thread::spawn(move || {
+                        task_event(&worker_task_id, "info", "task.worker.started", json!({}));
+                        event_fields(
+                            "info",
+                            "task.worker.started",
+                            json!({"taskId": worker_task_id}),
+                        );
+                        let mut request = Request::new("capability.invoke", worker_params);
+                        request.correlation_id = correlation_id;
+                        request.parent_request_id = request_id;
+                        let response = controller.handle(request);
+                        task_event(
+                            &worker_task_id,
+                            if response.ok { "info" } else { "error" },
+                            "task.worker.finished",
+                            json!({"ok": response.ok, "errorCode": response.error.as_ref().map(|error| error.code.as_str())}),
+                        );
+                        event_fields(
+                            if response.ok { "info" } else { "error" },
+                            "task.worker.finished",
+                            json!({"taskId": worker_task_id, "ok": response.ok, "errorCode": response.error.as_ref().map(|error| error.code.as_str())}),
+                        );
+                        async_active.fetch_sub(1, Ordering::AcqRel);
+                    });
+                    return Ok(json!({"task": task, "reused": false, "accepted": true}));
+                }
                 if matches!(
                     capability_name,
                     "process.start" | "command.run" | "artifact.build" | "agent.start"
@@ -1794,6 +1912,11 @@ impl Controller {
                                 .map_err(|error| {
                                     RpcError::new("INVALID_TASK_STATE", error.to_string())
                                 })?
+                        }
+                        TaskState::Queued
+                            if resume_task_id == Some(task.id.as_str()) && resume_authorized =>
+                        {
+                            task
                         }
                         TaskState::Queued | TaskState::Running => {
                             return Err(RpcError::new(
@@ -1874,11 +1997,32 @@ impl Controller {
                             .collect(),
                     );
                 }
-                let response = call_executor(
+                event_fields(
+                    "info",
+                    "executor.dispatch.started",
+                    json!({"taskId": task.id, "executorId": executor_id, "capability": capability_name, "timeoutMs": contract.timeout_ms}),
+                );
+                let dispatch_started = Instant::now();
+                let response = call_executor_with_timeout(
                     &executor.endpoint,
                     &traced_request(capability_name, input.clone()),
+                    Duration::from_millis(contract.timeout_ms.max(1)),
                 );
-                release_acquired(&mut self.leases.lock().expect("lease lock"), &acquired);
+                let transport_timed_out = response
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.to_string().contains("deadline"));
+                // A timed-out transport may still have live work on the executor.
+                // Retain its fenced leases until TTL expiry instead of permitting
+                // a second writer while the first outcome is unknown.
+                if !transport_timed_out {
+                    release_acquired(&mut self.leases.lock().expect("lease lock"), &acquired);
+                }
+                event_fields(
+                    if response.is_ok() { "info" } else { "error" },
+                    "executor.dispatch.finished",
+                    json!({"taskId": task.id, "executorId": executor_id, "capability": capability_name, "timeoutMs": contract.timeout_ms, "durationMs": dispatch_started.elapsed().as_millis(), "transportOk": response.is_ok()}),
+                );
                 match response {
                     Ok(response) if response.ok => {
                         let mut result = response.result.unwrap_or(Value::Null);
@@ -2023,10 +2167,23 @@ impl Controller {
                         Err(error)
                     }
                     Err(error) => {
-                        let rpc = RpcError::new("EXECUTOR_UNAVAILABLE", error.to_string());
+                        let timed_out = error.to_string().contains("deadline");
+                        let mut rpc = RpcError::new(
+                            if timed_out {
+                                "EXECUTOR_TIMEOUT"
+                            } else {
+                                "EXECUTOR_UNAVAILABLE"
+                            },
+                            error.to_string(),
+                        );
+                        rpc.retryable = true;
                         let _ = self.tasks.lock().expect("task lock").transition(
                             &task.id,
-                            TaskState::Failed,
+                            if timed_out {
+                                TaskState::OutcomeUnknown
+                            } else {
+                                TaskState::Failed
+                            },
                             None,
                             Some(workbench_schema::TaskError {
                                 code: rpc.code.clone(),
@@ -3400,6 +3557,36 @@ fn safe_lifecycle_attributes(params: &Value) -> Value {
     Value::Object(result)
 }
 
+fn safe_request_fields(action: &str, params: &Value) -> Value {
+    let mut fields = serde_json::Map::new();
+    for key in [
+        "executorId",
+        "capability",
+        "workspaceSessionId",
+        "sessionId",
+        "taskId",
+        "processId",
+        "executionMode",
+    ] {
+        if let Some(value) = params.get(key)
+            && (value.is_string() || value.is_number() || value.is_boolean())
+        {
+            fields.insert(key.into(), value.clone());
+        }
+    }
+    if action == "capability.invoke" {
+        let input = params.get("input").unwrap_or(&Value::Null);
+        fields.insert(
+            "inputSummary".into(),
+            json!({
+                "keys": input.as_object().map(|object| object.keys().take(32).cloned().collect::<Vec<_>>()).unwrap_or_default(),
+                "encodedBytes": serde_json::to_vec(input).map(|bytes| bytes.len()).unwrap_or(0),
+            }),
+        );
+    }
+    Value::Object(fields)
+}
+
 fn optional_array<T: serde::de::DeserializeOwned>(
     params: &Value,
     key: &str,
@@ -3991,6 +4178,24 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, mpsc};
     use workbench_protocol::Request;
+
+    #[test]
+    fn capability_start_log_fields_are_useful_without_recording_input_values() {
+        let fields = safe_request_fields(
+            "capability.invoke",
+            &json!({
+                "executorId":"node-a",
+                "capability":"artifact.relay",
+                "workspaceSessionId":"session-a",
+                "input":{"source":"/secret/path","token":"do-not-log"}
+            }),
+        );
+        assert_eq!(fields["executorId"], "node-a");
+        assert_eq!(fields["capability"], "artifact.relay");
+        assert_eq!(fields["inputSummary"]["keys"].as_array().unwrap().len(), 2);
+        assert!(!fields.to_string().contains("do-not-log"));
+        assert!(!fields.to_string().contains("/secret/path"));
+    }
 
     #[test]
     fn unregister_removes_persisted_peer_registrations_idempotently() {
