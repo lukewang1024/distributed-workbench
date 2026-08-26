@@ -1742,15 +1742,21 @@ impl Controller {
                     );
                 }
                 if !invocation_is_readonly {
-                    self.leases
-                        .lock()
-                        .expect("lease lock")
-                        .validate(
-                            &format!("workspace:{workspace_session_id}"),
-                            owner,
-                            required_str(&params, "driverToken")?,
-                        )
-                        .map_err(map_lease_error)?;
+                    // `LeaseTable::validate` returns a reference into the table. Keep the
+                    // mutex guard in an explicit scope so it is released before task
+                    // persistence reacquires the lease lock. A chained temporary here can
+                    // otherwise live through the rest of this match arm and deadlock every
+                    // mutating capability before `executor.dispatch`.
+                    {
+                        let leases = self.leases.lock().expect("lease lock");
+                        leases
+                            .validate(
+                                &format!("workspace:{workspace_session_id}"),
+                                owner,
+                                required_str(&params, "driverToken")?,
+                            )
+                            .map_err(map_lease_error)?;
+                    }
                 }
                 validate_schema(&contract.input_schema, &input, "input")?;
                 let execution_mode = params
