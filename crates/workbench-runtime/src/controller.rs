@@ -1741,7 +1741,7 @@ impl Controller {
                         json!(format!("{role} task in {workspace_session_id}")),
                     );
                 }
-                if !invocation_is_readonly {
+                let driver_authority = if !invocation_is_readonly {
                     // `LeaseTable::validate` returns a reference into the table. Keep the
                     // mutex guard in an explicit scope so it is released before task
                     // persistence reacquires the lease lock. A chained temporary here can
@@ -1749,15 +1749,20 @@ impl Controller {
                     // mutating capability before `executor.dispatch`.
                     {
                         let leases = self.leases.lock().expect("lease lock");
-                        leases
-                            .validate(
-                                &format!("workspace:{workspace_session_id}"),
-                                owner,
-                                required_str(&params, "driverToken")?,
-                            )
-                            .map_err(map_lease_error)?;
+                        Some(
+                            leases
+                                .validate(
+                                    &format!("workspace:{workspace_session_id}"),
+                                    owner,
+                                    required_str(&params, "driverToken")?,
+                                )
+                                .map_err(map_lease_error)?
+                                .clone(),
+                        )
                     }
-                }
+                } else {
+                    None
+                };
                 validate_schema(&contract.input_schema, &input, "input")?;
                 let execution_mode = params
                     .get("executionMode")
@@ -1954,17 +1959,21 @@ impl Controller {
                 if capability_name == "command.run" && !invocation_is_readonly {
                     resources.extend(command_resources(&input)?);
                 }
-                if !invocation_is_readonly && resources.is_empty() {
-                    resources.push(format!("workspace:{workspace_session_id}"));
-                }
                 let mut acquired = Vec::new();
                 for resource in &resources {
-                    match self.leases.lock().expect("lease lock").acquire(
-                        LeaseKind::Resource,
-                        resource,
-                        owner,
-                        contract.timeout_ms.saturating_add(30_000),
-                    ) {
+                    // Drop the acquisition guard before handling a conflict. The error
+                    // branch releases resources already acquired for this invocation and
+                    // therefore must be able to lock the same lease table again.
+                    let acquisition = {
+                        let mut leases = self.leases.lock().expect("lease lock");
+                        leases.acquire(
+                            LeaseKind::Resource,
+                            resource,
+                            owner,
+                            contract.timeout_ms.saturating_add(30_000),
+                        )
+                    };
+                    match acquisition {
                         Ok(lease) => acquired.push(lease),
                         Err(error) => {
                             release_acquired(
@@ -1991,8 +2000,9 @@ impl Controller {
                 if !invocation_is_readonly {
                     input["_workspaceSessionId"] = Value::String(workspace_session_id.to_owned());
                     input["_authority"] = Value::Array(
-                        acquired
+                        driver_authority
                             .iter()
+                            .chain(acquired.iter())
                             .map(|lease| {
                                 json!({
                                     "controllerId": self.id,
@@ -5263,6 +5273,85 @@ mod tests {
                 .iter()
                 .any(|event| event["eventType"] == "task.cancelling")
         );
+    }
+
+    #[test]
+    fn mutating_capability_releases_driver_lock_before_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("executor-mutation.sock");
+        let runtime = Arc::new(
+            crate::ExecutorRuntime::new("executor", vec![directory.path().to_path_buf()]).unwrap(),
+        );
+        let server_runtime = Arc::clone(&runtime);
+        let server_socket = socket.clone();
+        std::thread::spawn(move || {
+            RpcServer::new(server_socket)
+                .serve(move |request| server_runtime.handle(request))
+                .unwrap()
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let controller = Arc::new(
+            Controller::open_with_id(
+                JsonStore::new(directory.path().join("controller-mutation.json")),
+                Some("controller".to_owned()),
+            )
+            .unwrap(),
+        );
+        assert!(
+            controller
+                .handle(Request::new(
+                    "executor.register",
+                    json!({
+                        "executorId":"executor",
+                        "endpoint":{"transport":"local","socket":socket}
+                    })
+                ))
+                .ok
+        );
+        assert!(controller.handle(Request::new("session.put", json!({
+            "apiVersion":"workbench.dev/v1",
+            "metadata":{"id":"workspace","labels":{},"createdAt":now_ms(),"updatedAt":now_ms()},
+            "objective":"test mutating capability",
+            "state":"active"
+        }))).ok);
+        let lease = controller
+            .handle(Request::new(
+                "driver.acquire",
+                json!({
+                    "resource":"workspace:workspace","owner":"agent","ttlMs":60000
+                }),
+            ))
+            .result
+            .unwrap();
+        let token = lease["token"].as_str().unwrap().to_owned();
+        let target = directory.path().to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let response = controller.handle(Request::new(
+                "capability.invoke",
+                json!({
+                    "executorId":"executor",
+                "capability":"command.run",
+                    "workspaceSessionId":"workspace",
+                    "owner":"agent",
+                    "driverToken":token,
+                    "idempotencyKey":"mutating-capability",
+                    "executionMode":"sync",
+                "input":{"cwd":target,"argv":["pwd"]}
+                }),
+            ));
+            sender.send(response).unwrap();
+        });
+        let response = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("mutating capability deadlocked before executor dispatch");
+        assert!(response.ok, "{:?}", response.error);
     }
 
     #[test]
