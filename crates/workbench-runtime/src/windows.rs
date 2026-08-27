@@ -281,7 +281,7 @@ fn terminate_process_trees(
         )
     };
     let script = format!(
-        "{selector_prelude}$all=@(Get-CimInstance Win32_Process); $items={selector}; foreach($item in $items) {{ & taskkill.exe /PID $item.ProcessId /T /F 2>$null | Out-Null }}; $deadline=(Get-Date).AddSeconds(15); do {{ $all=@(Get-CimInstance Win32_Process); $remaining={selector}; if($remaining.Count -eq 0) {{ break }}; Start-Sleep -Milliseconds 200 }} while((Get-Date) -lt $deadline); if($remaining.Count -ne 0) {{ throw \"conflicting processes for {escaped} did not exit\" }}; Write-Output $items.Count; exit 0"
+        "{selector_prelude}$all=@(Get-CimInstance Win32_Process); $items={selector}; foreach($item in $items) {{ Start-Process -FilePath taskkill.exe -ArgumentList @('/PID',[string]$item.ProcessId,'/T','/F') -Wait -WindowStyle Hidden | Out-Null }}; $deadline=(Get-Date).AddSeconds(15); do {{ $all=@(Get-CimInstance Win32_Process); $remaining={selector}; if($remaining.Count -eq 0) {{ break }}; Start-Sleep -Milliseconds 200 }} while((Get-Date) -lt $deadline); if($remaining.Count -ne 0) {{ throw \"conflicting processes for {escaped} did not exit\" }}; Write-Output $items.Count; exit 0"
     );
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
