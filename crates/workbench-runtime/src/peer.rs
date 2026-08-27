@@ -6,8 +6,12 @@ use std::fs;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::process::{Child, Command, Stdio};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -18,7 +22,7 @@ use workbench_schema::Observation;
 use crate::{RpcServer, call_unix, log_event};
 
 const PEER_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
-const PEER_BACKOFF_MAX: Duration = Duration::from_secs(5);
+const PEER_BACKOFF_MAX: Duration = Duration::from_secs(60);
 const PEER_STABLE_CONNECTION: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
@@ -186,6 +190,47 @@ impl Drop for PeerSocketLease {
 struct PeerBridge {
     writer: SharedWriter,
     pending: Pending,
+}
+
+struct BridgeRuntime {
+    reader: thread::JoinHandle<Result<()>>,
+    listeners: Vec<thread::JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl BridgeRuntime {
+    fn wait(self) -> Result<()> {
+        let result = self
+            .reader
+            .join()
+            .map_err(|_| anyhow!("peer reader thread panicked"));
+        self.shutdown.store(true, Ordering::Release);
+        for listener in self.listeners {
+            listener
+                .join()
+                .map_err(|_| anyhow!("peer listener thread panicked"))?;
+        }
+        result?
+    }
+}
+
+struct ReapingChild(Child);
+
+impl ReapingChild {
+    fn new(child: Child) -> Self {
+        Self(child)
+    }
+
+    fn terminate(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for ReapingChild {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
 
 impl PeerBridge {
@@ -373,7 +418,7 @@ pub fn accept_peer(config: PeerAcceptConfig) -> Result<()> {
     accept_handshake(&mut input, &mut output, &config.peer_id, actual_local_id)?;
     let expose_controller_socket = config.expose_controller_socket.clone();
     let expose_executor_socket = config.expose_executor_socket.clone();
-    let (bridge, reader) = start_bridge(
+    let (bridge, runtime) = start_bridge(
         Box::new(input),
         Box::new(output),
         config.local_controller_socket,
@@ -386,9 +431,7 @@ pub fn accept_peer(config: PeerAcceptConfig) -> Result<()> {
         let _ = remove_socket(&expose_executor_socket);
         return Err(error);
     }
-    reader
-        .join()
-        .map_err(|_| anyhow!("peer reader thread panicked"))?
+    runtime.wait()
 }
 
 pub fn read_peer_status(path: impl AsRef<Path>) -> Result<PeerStatus> {
@@ -433,7 +476,7 @@ fn connect_once(config: &PeerConnectConfig, connection_id: &str, generation: u64
             shell_single_quote(&remote_executor),
         )
     };
-    let mut child = Command::new("ssh")
+    let child = Command::new("ssh")
         .args([
             "-T",
             "-o",
@@ -457,20 +500,20 @@ fn connect_once(config: &PeerConnectConfig, connection_id: &str, generation: u64
         .stdout(Stdio::piped())
         .spawn()
         .with_context(|| format!("start SSH peer transport to {}", config.host))?;
-    let stdout = child.stdout.take().expect("SSH stdout is piped");
+    let mut child = ReapingChild::new(child);
+    let stdout = child.0.stdout.take().expect("SSH stdout is piped");
     let mut stdout = BufReader::new(stdout);
     if let Err(error) = initiate_handshake(
         &mut stdout,
-        &mut child.stdin.as_mut().expect("SSH stdin is piped"),
+        &mut child.0.stdin.as_mut().expect("SSH stdin is piped"),
         &config.local_id,
         &config.peer_id,
     ) {
-        let _ = child.kill();
-        let _ = child.wait();
+        child.terminate();
         return Err(error);
     }
-    let stdin = child.stdin.take().expect("SSH stdin is piped");
-    let (bridge, reader) = start_bridge(
+    let stdin = child.0.stdin.take().expect("SSH stdin is piped");
+    let (bridge, runtime) = start_bridge(
         Box::new(stdout),
         Box::new(stdin),
         config.local_controller_socket.clone(),
@@ -479,8 +522,8 @@ fn connect_once(config: &PeerConnectConfig, connection_id: &str, generation: u64
         config.expose_executor_socket.clone(),
     )?;
     if let Err(error) = probe_peer_roles(&bridge, "remote peer") {
-        let _ = child.kill();
-        let _ = reader.join();
+        child.terminate();
+        let _ = runtime.wait();
         return Err(error);
     }
     write_status(
@@ -493,11 +536,8 @@ fn connect_once(config: &PeerConnectConfig, connection_id: &str, generation: u64
         None,
     )?;
     observe_peer(config, "ready", connection_id, generation, None);
-    let reader_result = reader
-        .join()
-        .map_err(|_| anyhow!("peer reader thread panicked"))?;
-    let _ = child.kill();
-    let _ = child.wait();
+    let reader_result = runtime.wait();
+    child.terminate();
     reader_result
 }
 
@@ -550,13 +590,15 @@ fn start_bridge(
     local_executor_socket: PathBuf,
     expose_controller_socket: PathBuf,
     expose_executor_socket: PathBuf,
-) -> Result<(PeerBridge, thread::JoinHandle<Result<()>>)> {
+) -> Result<(PeerBridge, BridgeRuntime)> {
     remove_socket(&expose_controller_socket)?;
     remove_socket(&expose_executor_socket)?;
     let bridge = PeerBridge {
         writer: Arc::new(Mutex::new(writer)),
         pending: Arc::new(Mutex::new(HashMap::new())),
     };
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut listeners = Vec::new();
     let cleanup_controller_socket = expose_controller_socket.clone();
     let cleanup_executor_socket = expose_executor_socket.clone();
     for (socket, role) in [
@@ -564,13 +606,15 @@ fn start_bridge(
         (expose_executor_socket, TargetRole::Executor),
     ] {
         let handler_bridge = bridge.clone();
-        thread::spawn(move || {
-            if let Err(error) =
-                RpcServer::new(socket).serve(move |request| handler_bridge.call(role, request))
-            {
+        let listener_shutdown = Arc::clone(&shutdown);
+        listeners.push(thread::spawn(move || {
+            if let Err(error) = RpcServer::new(socket).serve_until(
+                move |request| handler_bridge.call(role, request),
+                listener_shutdown,
+            ) {
                 eprintln!("peer role listener failed: {error:#}");
             }
-        });
+        }));
     }
     let reader_bridge = bridge.clone();
     let handle = thread::spawn(move || {
@@ -583,7 +627,14 @@ fn start_bridge(
             cleanup_executor_socket,
         )
     });
-    Ok((bridge, handle))
+    Ok((
+        bridge,
+        BridgeRuntime {
+            reader: handle,
+            listeners,
+            shutdown,
+        },
+    ))
 }
 
 fn read_frames(
@@ -913,10 +964,14 @@ mod tests {
         );
         assert_eq!(
             next_peer_backoff(Duration::from_secs(4), Duration::from_secs(1)),
-            Duration::from_secs(5)
+            Duration::from_secs(8)
         );
         assert_eq!(
-            next_peer_backoff(Duration::from_secs(5), Duration::from_secs(30)),
+            next_peer_backoff(Duration::from_secs(60), Duration::from_secs(1)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            next_peer_backoff(Duration::from_secs(60), Duration::from_secs(30)),
             Duration::from_secs(1)
         );
     }
@@ -941,7 +996,7 @@ mod tests {
         let exposed_executor = directory.path().join("peer-executor.sock");
         let (local, remote) = UnixStream::pair().unwrap();
         let reader = local.try_clone().unwrap();
-        let (_bridge, reader_thread) = start_bridge(
+        let (_bridge, runtime) = start_bridge(
             Box::new(reader),
             Box::new(local),
             controller,
@@ -959,8 +1014,40 @@ mod tests {
         assert!(exposed_controller.exists());
         assert!(exposed_executor.exists());
         drop(remote);
-        assert!(reader_thread.join().unwrap().is_err());
+        assert!(runtime.wait().is_err());
         assert!(!exposed_controller.exists());
         assert!(!exposed_executor.exists());
+    }
+
+    #[test]
+    fn repeated_disconnects_join_every_bridge_thread() {
+        let directory = tempfile::tempdir().unwrap();
+        for generation in 0..25 {
+            let controller = directory
+                .path()
+                .join(format!("controller-{generation}.sock"));
+            let executor = directory.path().join(format!("executor-{generation}.sock"));
+            let exposed_controller = directory
+                .path()
+                .join(format!("peer-controller-{generation}.sock"));
+            let exposed_executor = directory
+                .path()
+                .join(format!("peer-executor-{generation}.sock"));
+            let (local, remote) = UnixStream::pair().unwrap();
+            let reader = local.try_clone().unwrap();
+            let (_bridge, runtime) = start_bridge(
+                Box::new(reader),
+                Box::new(local),
+                controller,
+                executor,
+                exposed_controller.clone(),
+                exposed_executor.clone(),
+            )
+            .unwrap();
+            drop(remote);
+            assert!(runtime.wait().is_err());
+            assert!(!exposed_controller.exists());
+            assert!(!exposed_executor.exists());
+        }
     }
 }

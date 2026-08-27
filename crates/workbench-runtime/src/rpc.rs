@@ -1,10 +1,16 @@
 use anyhow::{Context, Result, anyhow};
-use interprocess::local_socket::{GenericFilePath, ListenerOptions, Stream, prelude::*};
+use interprocess::local_socket::{
+    GenericFilePath, ListenerNonblockingMode, ListenerOptions, Stream, prelude::*,
+};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
+use std::time::Duration;
 use workbench_protocol::{Request, Response, RpcError};
 
 pub struct RpcServer {
@@ -22,6 +28,13 @@ impl RpcServer {
     where
         F: Fn(Request) -> Response + Send + Sync + 'static,
     {
+        self.serve_until(handler, Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn serve_until<F>(&self, handler: F, shutdown: Arc<AtomicBool>) -> Result<()>
+    where
+        F: Fn(Request) -> Response + Send + Sync + 'static,
+    {
         if let Some(parent) = self.socket.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -36,17 +49,25 @@ impl RpcServer {
         let listener = options
             .create_sync()
             .with_context(|| format!("bind local IPC {}", self.socket.display()))?;
+        listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
         set_owner_only_permissions(&self.socket)?;
         let handler = Arc::new(handler);
-        for stream in listener.incoming() {
-            let handler = Arc::clone(&handler);
-            match stream {
+        while !shutdown.load(Ordering::Acquire) {
+            match listener.accept() {
                 Ok(stream) => {
+                    // Some BSD-family kernels inherit O_NONBLOCK from the
+                    // listener even when only accept polling was requested.
+                    // RPC streams themselves use blocking line-oriented I/O.
+                    stream.set_nonblocking(false)?;
+                    let handler = Arc::clone(&handler);
                     thread::spawn(move || {
                         if let Err(error) = handle_stream(stream, handler) {
                             eprintln!("workbench RPC connection failed: {error:#}");
                         }
                     });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(20));
                 }
                 Err(error) => eprintln!("workbench RPC accept failed: {error}"),
             }
