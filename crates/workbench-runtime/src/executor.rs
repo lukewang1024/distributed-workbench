@@ -2517,6 +2517,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                                     | "file"
                                     | "userDataDir"
                             ) | ("application.open-file", "handlerPath")
+                                | ("filesystem.read", "offset" | "limit")
                         )
                         || (name == "filesystem.write" && key.as_str() == "expectedDigest"))
                 })
@@ -3828,6 +3829,11 @@ mod tests {
                 .unwrap()
                 .contains(&json!("expectedDigest"))
         );
+        let read = capability_catalog()
+            .into_iter()
+            .find(|item| item.name == "filesystem.read")
+            .unwrap();
+        assert_eq!(read.input_schema["required"], json!(["path"]));
     }
 
     #[test]
