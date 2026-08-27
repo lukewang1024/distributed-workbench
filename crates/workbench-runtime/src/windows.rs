@@ -272,7 +272,7 @@ fn terminate_process_trees(
             .unwrap_or_default();
         (
             format!("$profile='{profile}'; $portNeedle='{port}'; "),
-            "@($all | Where-Object { $command=[string]$_.CommandLine; if($command) { $command=$command.Replace('\\','/'); (($profile.Length -gt 0) -and ($command.IndexOf($profile,[System.StringComparison]::OrdinalIgnoreCase) -ge 0)) -or (($portNeedle.Length -gt 0) -and ($command.IndexOf($portNeedle,[System.StringComparison]::OrdinalIgnoreCase) -ge 0)) } else { $false } })".to_owned(),
+            "@($all | Where-Object { if($_.ProcessId -eq $PID) { $false } else { $command=[string]$_.CommandLine; if($command) { $command=$command.Replace('\\','/'); (($profile.Length -gt 0) -and ($command.IndexOf($profile,[System.StringComparison]::OrdinalIgnoreCase) -ge 0)) -or (($portNeedle.Length -gt 0) -and ($command.IndexOf($portNeedle,[System.StringComparison]::OrdinalIgnoreCase) -ge 0)) } else { $false } } })".to_owned(),
         )
     } else {
         (
