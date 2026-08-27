@@ -616,13 +616,33 @@ impl ExecutorRuntime {
             }
             "fs.read" | "filesystem.read" => {
                 let path = self.read_path(&params, "path", true, "filesystem.read")?;
-                let bytes =
-                    fs::read(&path).map_err(|error| io_error("FS_READ_FAILED", &path, error))?;
+                let offset = params.get("offset").and_then(Value::as_u64).unwrap_or(0);
+                let requested_limit = params.get("limit").and_then(Value::as_u64);
+                let metadata = fs::metadata(&path)
+                    .map_err(|error| io_error("FS_READ_FAILED", &path, error))?;
+                let bytes = if let Some(limit) = requested_limit {
+                    let limit = limit.min(1024 * 1024) as usize;
+                    let mut file = fs::File::open(&path)
+                        .map_err(|error| io_error("FS_READ_FAILED", &path, error))?;
+                    file.seek(SeekFrom::Start(offset))
+                        .map_err(|error| io_error("FS_READ_FAILED", &path, error))?;
+                    let mut bytes = vec![0; limit];
+                    let read = file
+                        .read(&mut bytes)
+                        .map_err(|error| io_error("FS_READ_FAILED", &path, error))?;
+                    bytes.truncate(read);
+                    bytes
+                } else {
+                    fs::read(&path).map_err(|error| io_error("FS_READ_FAILED", &path, error))?
+                };
                 Ok(json!({
                     "path": path,
                     "content": String::from_utf8_lossy(&bytes),
                     "digest": sha256_bytes(&bytes),
-                    "size": bytes.len(),
+                    "size": metadata.len(),
+                    "offset": offset,
+                    "bytes": bytes.len(),
+                    "eof": offset.saturating_add(bytes.len() as u64) >= metadata.len(),
                 }))
             }
             "fs.list" | "filesystem.list" => {
@@ -1959,11 +1979,24 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
 
 fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
     let (required, properties, locks, key_fields, timeout_ms, rollback, evidence) = match name {
-        "filesystem.resolve" | "filesystem.stat" | "filesystem.read" | "filesystem.list" => (
+        "filesystem.resolve" | "filesystem.stat" | "filesystem.list" => (
             vec!["filesystem"],
             json!({"path": {"type": "string"}}),
             Vec::new(),
             vec!["path"],
+            30_000,
+            RollbackStrategy::None,
+            vec!["filesystem-result"],
+        ),
+        "filesystem.read" => (
+            vec!["filesystem"],
+            json!({
+                "path": {"type": "string"},
+                "offset": {"type": "integer", "minimum": 0},
+                "limit": {"type": "integer", "minimum": 0, "maximum": 1048576}
+            }),
+            Vec::new(),
+            vec!["path", "offset", "limit"],
             30_000,
             RollbackStrategy::None,
             vec!["filesystem-result"],
@@ -2637,7 +2670,9 @@ fn output_schema(name: &str) -> Value {
         }),
         "filesystem.read" => json!({
             "path": {"type": "string"}, "content": {"type": "string"},
-            "digest": {"type": "string"}, "size": {"type": "integer"}
+            "digest": {"type": "string"}, "size": {"type": "integer"},
+            "offset": {"type": "integer"}, "bytes": {"type": "integer"},
+            "eof": {"type": "boolean"}
         }),
         "filesystem.list" => json!({"path": {"type": "string"}, "entries": {"type": "array"}}),
         "filesystem.search" => json!({
@@ -3532,10 +3567,20 @@ mod tests {
                 ))
                 .ok
         );
-        let allowed = runtime.handle(Request::new("filesystem.read", json!({
-            "path": downloads.join("fixture.txt"), "_workspaceSessionId": "workspace-a", "_readGrantId": "grant-a"
-        })));
+        let allowed = runtime.handle(Request::new(
+            "filesystem.read",
+            json!({
+                "path": downloads.join("fixture.txt"), "offset": 1, "limit": 3,
+                "_workspaceSessionId": "workspace-a", "_readGrantId": "grant-a"
+            }),
+        ));
         assert!(allowed.ok, "{:?}", allowed.error);
+        let output = allowed.result.unwrap();
+        assert_eq!(output["content"], "ixt");
+        assert_eq!(output["size"], 7);
+        assert_eq!(output["offset"], 1);
+        assert_eq!(output["bytes"], 3);
+        assert_eq!(output["eof"], false);
         let escaped = runtime.handle(Request::new("filesystem.read", json!({
             "path": downloads.join("escape.txt"), "_workspaceSessionId": "workspace-a", "_readGrantId": "grant-a"
         })));
