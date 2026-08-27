@@ -173,6 +173,10 @@ pub struct CapabilityDescriptor {
     pub emitted_evidence: Vec<String>,
     #[serde(default)]
     pub effect: Effect,
+    /// Authority the caller must already hold. This is deliberately separate
+    /// from `locks`, which only serialize one capability invocation.
+    #[serde(default)]
+    pub authority: CapabilityAuthority,
     /// Scheduler priority. Lower values are served first; zero is reserved for
     /// control-plane operations that must remain responsive under load.
     #[serde(default = "default_capability_priority")]
@@ -284,6 +288,84 @@ pub enum Effect {
     ReadOnly,
     Mutating,
     Destructive,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CapabilityAuthority {
+    #[default]
+    None,
+    WorkspaceDriver,
+    ResourceLease {
+        resource: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DriverHandoffState {
+    Requested,
+    Draining,
+    Ready,
+    Completed,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DriverHandoffRequest {
+    pub id: String,
+    pub workspace_session_id: String,
+    pub resource: String,
+    pub requested_by: String,
+    pub previous_owner: Option<String>,
+    pub state: DriverHandoffState,
+    pub created_at: u64,
+    pub expires_at: u64,
+    #[serde(default)]
+    pub completed_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentMutationOperation {
+    pub id: String,
+    pub workspace_session_id: String,
+    pub agent_id: String,
+    pub tool: String,
+    pub started_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReadGrantState {
+    Requested,
+    Approved,
+    Revoked,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadGrant {
+    pub id: String,
+    pub workspace_session_id: String,
+    pub executor_id: String,
+    pub requested_root: String,
+    pub real_root: String,
+    pub capabilities: Vec<String>,
+    pub state: ReadGrantState,
+    pub requested_by: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub approved_at: Option<u64>,
+    #[serde(default)]
+    pub revoked_at: Option<u64>,
+    #[serde(default)]
+    pub approved_by: Option<String>,
+    #[serde(default)]
+    pub audit: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -649,6 +731,8 @@ pub enum AgentState {
 #[serde(rename_all = "camelCase")]
 pub struct Handoff {
     pub id: String,
+    #[serde(default)]
+    pub kind: HandoffKind,
     pub workspace_session_id: String,
     pub objective: String,
     pub from: AgentRoleRef,
@@ -672,6 +756,16 @@ pub struct Handoff {
     pub acknowledged_at: Option<u64>,
     #[serde(default)]
     pub completed_at: Option<u64>,
+    #[serde(default)]
+    pub report: Option<Value>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum HandoffKind {
+    #[default]
+    Work,
+    Acceptance,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

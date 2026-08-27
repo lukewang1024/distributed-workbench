@@ -15,8 +15,8 @@ use std::time::Duration;
 use workbench_core::{ObservabilityStore, atomic_replace, now_ms, sha256_bytes};
 use workbench_protocol::{Request, Response, RpcError};
 use workbench_schema::{
-    CancelPolicy, CapabilityDescriptor, Effect, ExecutionKind, HealthCheck, IdempotencyContract,
-    Observation, RetryPolicy, RollbackStrategy,
+    CancelPolicy, CapabilityAuthority, CapabilityDescriptor, Effect, ExecutionKind, HealthCheck,
+    IdempotencyContract, Observation, ReadGrant, ReadGrantState, RetryPolicy, RollbackStrategy,
 };
 
 use crate::generation::{Overlay, activate, apply_overlays, materialize, record_state};
@@ -26,6 +26,7 @@ use crate::telemetry::{event_fields, request_event};
 pub struct ExecutorRuntime {
     id: String,
     allowed_roots: Vec<PathBuf>,
+    grantable_read_roots: Vec<PathBuf>,
     processes: ProcessTable,
     fences: Option<Mutex<ExecutorFences>>,
     execution: ExecutionCapacity,
@@ -170,6 +171,8 @@ struct ExecutorFences {
     path: PathBuf,
     #[serde(default)]
     resources: BTreeMap<String, FenceRecord>,
+    #[serde(default)]
+    read_grants: Vec<ReadGrant>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -180,7 +183,11 @@ struct FenceRecord {
 }
 
 impl ExecutorRuntime {
-    fn base(id: impl Into<String>, allowed_roots: Vec<PathBuf>) -> Result<Self, RpcError> {
+    fn base(
+        id: impl Into<String>,
+        allowed_roots: Vec<PathBuf>,
+        grantable_read_roots: Vec<PathBuf>,
+    ) -> Result<Self, RpcError> {
         let mut roots = Vec::with_capacity(allowed_roots.len());
         for root in allowed_roots {
             roots.push(root.canonicalize().map_err(|error| {
@@ -192,9 +199,19 @@ impl ExecutorRuntime {
             .cloned()
             .ok_or_else(|| RpcError::new("INVALID_ROOT", "at least one allowed root is required"))?
             .join(".workbench-relay");
+        let mut grantable = Vec::with_capacity(grantable_read_roots.len());
+        for root in grantable_read_roots {
+            grantable.push(root.canonicalize().map_err(|error| {
+                RpcError::new(
+                    "INVALID_GRANTABLE_ROOT",
+                    format!("{}: {error}", root.display()),
+                )
+            })?);
+        }
         Ok(Self {
             id: id.into(),
             allowed_roots: roots,
+            grantable_read_roots: grantable,
             processes: ProcessTable::default(),
             fences: None,
             execution: ExecutionCapacity::from_environment(),
@@ -208,7 +225,7 @@ impl ExecutorRuntime {
         id: impl Into<String>,
         allowed_roots: Vec<PathBuf>,
     ) -> Result<Self, RpcError> {
-        Self::base(id, allowed_roots)
+        Self::base(id, allowed_roots, Vec::new())
     }
 
     pub fn open(
@@ -216,7 +233,16 @@ impl ExecutorRuntime {
         allowed_roots: Vec<PathBuf>,
         state_path: PathBuf,
     ) -> Result<Self, RpcError> {
-        let mut runtime = Self::base(id, allowed_roots)?;
+        Self::open_with_grantable(id, allowed_roots, Vec::new(), state_path)
+    }
+
+    pub fn open_with_grantable(
+        id: impl Into<String>,
+        allowed_roots: Vec<PathBuf>,
+        grantable_read_roots: Vec<PathBuf>,
+        state_path: PathBuf,
+    ) -> Result<Self, RpcError> {
+        let mut runtime = Self::base(id, allowed_roots, grantable_read_roots)?;
         let mut fences: ExecutorFences = if state_path.exists() {
             serde_json::from_slice(&fs::read(&state_path).map_err(|error| {
                 RpcError::new(
@@ -358,10 +384,7 @@ impl ExecutorRuntime {
         let Some(contract) = contract else {
             return Ok(());
         };
-        if matches!(contract.effect, Effect::ReadOnly)
-            || (canonical == "command.run"
-                && params.get("mode").and_then(Value::as_str) == Some("readonly"))
-        {
+        if matches!(contract.authority, CapabilityAuthority::None) {
             return Ok(());
         }
         let authorities = params
@@ -379,18 +402,24 @@ impl ExecutorRuntime {
                 "authority must cover at least one resource",
             ));
         }
-        let expected_resources: Vec<String> = if contract.locks.is_empty() {
-            vec![format!(
+        let mut expected_resources: Vec<String> = match &contract.authority {
+            CapabilityAuthority::None => Vec::new(),
+            CapabilityAuthority::WorkspaceDriver => vec![format!(
                 "workspace:{}",
                 required_str(params, "_workspaceSessionId")?
-            )]
-        } else {
+            )],
+            CapabilityAuthority::ResourceLease { resource } => vec![render_authority_resource(
+                &resource.replace("${executorId}", &self.id),
+                params,
+            )?],
+        };
+        expected_resources.extend(
             contract
                 .locks
                 .iter()
                 .map(|lock| render_authority_resource(&lock.key, params))
-                .collect::<Result<_, _>>()?
-        };
+                .collect::<Result<Vec<_>, _>>()?,
+        );
         let supplied_resources: Vec<&str> = authorities
             .iter()
             .map(|authority| required_str(authority, "resource"))
@@ -449,7 +478,9 @@ impl ExecutorRuntime {
             "ping" | "status" => Ok(json!({
                 "executorId": self.id,
                 "status": "ready",
+                "protocolFeatures": ["capability-authority-v2", "driver-draining-v1", "read-grant-v1", "acceptance-handoff-v1"],
                 "allowedRoots": self.allowed_roots,
+                "grantableReadRoots": self.grantable_read_roots,
                 "capabilities": capability_catalog(),
                 "execution": {
                     "mutating": {
@@ -464,6 +495,79 @@ impl ExecutorRuntime {
                 },
             })),
             "capability.list" => Ok(serde_json::to_value(capability_catalog()).unwrap()),
+            "read-grant.resolve" => {
+                let raw = PathBuf::from(required_str(&params, "requestedRoot")?);
+                let resolved = raw
+                    .canonicalize()
+                    .map_err(|error| io_error("PATH_INVALID", &raw, error))?;
+                if !self
+                    .grantable_read_roots
+                    .iter()
+                    .any(|root| resolved.starts_with(root))
+                {
+                    return Err(RpcError::new(
+                        "READ_GRANT_ROOT_NOT_ALLOWED",
+                        format!("{} is not under a grantable read root", resolved.display()),
+                    ));
+                }
+                Ok(json!({"requestedRoot": raw, "realRoot": resolved}))
+            }
+            "read-grant.approve" => {
+                let grant: ReadGrant = serde_json::from_value(params)
+                    .map_err(|error| RpcError::new("INVALID_READ_GRANT", error.to_string()))?;
+                if grant.executor_id != self.id || grant.state != ReadGrantState::Approved {
+                    return Err(RpcError::new(
+                        "INVALID_READ_GRANT",
+                        "approved grant must target this executor",
+                    ));
+                }
+                let real = PathBuf::from(&grant.real_root)
+                    .canonicalize()
+                    .map_err(|error| RpcError::new("INVALID_READ_GRANT", error.to_string()))?;
+                if !self
+                    .grantable_read_roots
+                    .iter()
+                    .any(|root| real.starts_with(root))
+                {
+                    return Err(RpcError::new(
+                        "READ_GRANT_ROOT_NOT_ALLOWED",
+                        "grant root is outside configured grantable roots",
+                    ));
+                }
+                let fences = self.fences.as_ref().ok_or_else(|| {
+                    RpcError::new(
+                        "READ_GRANT_STATE_REQUIRED",
+                        "executor persistence is required",
+                    )
+                })?;
+                let mut table = fences.lock().expect("executor state lock");
+                table.read_grants.retain(|item| item.id != grant.id);
+                table.read_grants.push(grant.clone());
+                persist_fences(&table)?;
+                Ok(serde_json::to_value(grant).expect("grant serializes"))
+            }
+            "read-grant.revoke" => {
+                let id = required_str(&params, "grantId")?;
+                let fences = self.fences.as_ref().ok_or_else(|| {
+                    RpcError::new(
+                        "READ_GRANT_STATE_REQUIRED",
+                        "executor persistence is required",
+                    )
+                })?;
+                let mut table = fences.lock().expect("executor state lock");
+                let grant = table
+                    .read_grants
+                    .iter_mut()
+                    .find(|item| item.id == id)
+                    .ok_or_else(|| {
+                        RpcError::new("READ_GRANT_NOT_FOUND", format!("unknown read grant: {id}"))
+                    })?;
+                grant.state = ReadGrantState::Revoked;
+                grant.revoked_at = Some(now_ms());
+                let result = grant.clone();
+                persist_fences(&table)?;
+                Ok(serde_json::to_value(result).expect("grant serializes"))
+            }
             "capability.negotiate" => {
                 let name = required_str(&params, "name")?;
                 let requested = required_str(&params, "version")?;
@@ -495,7 +599,7 @@ impl ExecutorRuntime {
                 }))
             }
             "fs.stat" | "filesystem.stat" => {
-                let path = self.path(&params, "path", false)?;
+                let path = self.read_path(&params, "path", false, "filesystem.stat")?;
                 let metadata = fs::symlink_metadata(&path)
                     .map_err(|error| io_error("FS_STAT_FAILED", &path, error))?;
                 Ok(json!({
@@ -507,11 +611,11 @@ impl ExecutorRuntime {
                 }))
             }
             "fs.resolve" | "filesystem.resolve" => {
-                let path = self.path(&params, "path", false)?;
+                let path = self.read_path(&params, "path", false, "filesystem.resolve")?;
                 Ok(json!({"path": path, "exists": path.exists()}))
             }
             "fs.read" | "filesystem.read" => {
-                let path = self.path(&params, "path", true)?;
+                let path = self.read_path(&params, "path", true, "filesystem.read")?;
                 let bytes =
                     fs::read(&path).map_err(|error| io_error("FS_READ_FAILED", &path, error))?;
                 Ok(json!({
@@ -522,7 +626,7 @@ impl ExecutorRuntime {
                 }))
             }
             "fs.list" | "filesystem.list" => {
-                let path = self.path(&params, "path", true)?;
+                let path = self.read_path(&params, "path", true, "filesystem.list")?;
                 let mut entries = Vec::new();
                 for entry in
                     fs::read_dir(&path).map_err(|error| io_error("FS_LIST_FAILED", &path, error))?
@@ -542,7 +646,7 @@ impl ExecutorRuntime {
                 Ok(json!({"path": path, "entries": entries}))
             }
             "fs.search" | "filesystem.search" => {
-                let path = self.path(&params, "path", true)?;
+                let path = self.read_path(&params, "path", true, "filesystem.search")?;
                 let query = required_str(&params, "query")?;
                 let max_results = params
                     .get("maxResults")
@@ -1174,13 +1278,17 @@ impl ExecutorRuntime {
                 }
                 apply_overlays(&application_path, &overlays)
             }
-            "application.generation.record" => {
+            "application.generation.record" | "application.runtime.record" => {
                 let generation_root = self.path(&params, "generationRoot", true)?;
+                let mut evidence = params.get("evidence").cloned().unwrap_or_else(|| json!({}));
+                if let Some(marker) = params.get("runtimeMarker") {
+                    evidence["runtimeMarker"] = marker.clone();
+                }
                 record_state(
                     &generation_root,
                     required_str(&params, "generationId")?,
                     required_str(&params, "state")?,
-                    params.get("evidence").cloned().unwrap_or(Value::Null),
+                    evidence,
                 )
             }
             "application.activate" => {
@@ -1550,6 +1658,26 @@ impl ExecutorRuntime {
     }
 
     fn path(&self, params: &Value, key: &str, must_exist: bool) -> Result<PathBuf, RpcError> {
+        self.checked_path(params, key, must_exist, None)
+    }
+
+    fn read_path(
+        &self,
+        params: &Value,
+        key: &str,
+        must_exist: bool,
+        capability: &str,
+    ) -> Result<PathBuf, RpcError> {
+        self.checked_path(params, key, must_exist, Some(capability))
+    }
+
+    fn checked_path(
+        &self,
+        params: &Value,
+        key: &str,
+        must_exist: bool,
+        read_capability: Option<&str>,
+    ) -> Result<PathBuf, RpcError> {
         let raw = params
             .get(key)
             .and_then(Value::as_str)
@@ -1583,12 +1711,68 @@ impl ExecutorRuntime {
             .iter()
             .any(|root| checked.starts_with(root))
         {
+            if let Some(capability) = read_capability {
+                self.validate_read_grant(params, &checked, capability)?;
+                return Ok(checked);
+            }
             return Err(RpcError::new(
                 "PATH_OUTSIDE_ALLOWED_ROOTS",
                 format!("{} is outside executor roots", checked.display()),
             ));
         }
         Ok(checked)
+    }
+
+    fn validate_read_grant(
+        &self,
+        params: &Value,
+        checked: &Path,
+        capability: &str,
+    ) -> Result<(), RpcError> {
+        let workspace = params
+            .get("_workspaceSessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RpcError::new(
+                    "READ_GRANT_REQUIRED",
+                    "workspace-scoped read grant is required",
+                )
+            })?;
+        let grant_id = params
+            .get("_readGrantId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RpcError::new(
+                    "READ_GRANT_REQUIRED",
+                    format!("read grant required for {}", checked.display()),
+                )
+            })?;
+        let fences = self.fences.as_ref().ok_or_else(|| {
+            RpcError::new(
+                "READ_GRANT_REQUIRED",
+                "executor has no persistent read-grant state",
+            )
+        })?;
+        let table = fences.lock().expect("executor state lock");
+        let grant = table
+            .read_grants
+            .iter()
+            .find(|grant| grant.id == grant_id)
+            .ok_or_else(|| {
+                RpcError::new("READ_GRANT_REQUIRED", "read grant is unknown to executor")
+            })?;
+        if grant.state != ReadGrantState::Approved
+            || grant.workspace_session_id != workspace
+            || grant.executor_id != self.id
+            || !grant.capabilities.iter().any(|item| item == capability)
+            || !checked.starts_with(Path::new(&grant.real_root))
+        {
+            return Err(RpcError::new(
+                "READ_GRANT_DENIED",
+                "read grant does not cover this workspace, executor, capability, and real path",
+            ));
+        }
+        Ok(())
     }
 
     fn application_path(&self, params: &Value, key: &str) -> Result<PathBuf, RpcError> {
@@ -1743,6 +1927,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("application.materialize", Effect::Mutating),
         ("application.apply-artifacts", Effect::Mutating),
         ("application.generation.record", Effect::Mutating),
+        ("application.runtime.record", Effect::Mutating),
         ("application.activate", Effect::Mutating),
     ];
     #[cfg(target_os = "macos")]
@@ -1980,7 +2165,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             RollbackStrategy::RetainPreviousGeneration,
             vec!["activation-record"],
         ),
-        "application.generation.record" => (
+        "application.generation.record" | "application.runtime.record" => (
             vec!["filesystem"],
             json!({
                 "generationRoot": {"type": "string"},
@@ -2309,7 +2494,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
     let retryable_idempotent = !key_fields.is_empty();
     CapabilityDescriptor {
         name: name.to_owned(),
-        version: "1.0.0".to_owned(),
+        version: "2.0.0".to_owned(),
         input_schema: json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2345,9 +2530,43 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
         health_check: HealthCheck::Process,
         emitted_evidence: evidence.into_iter().map(str::to_owned).collect(),
         effect,
+        authority: capability_authority(name),
         priority: capability_priority(name),
         max_concurrency: capability_concurrency(name),
         cancel_policy: capability_cancel_policy(name),
+    }
+}
+
+fn capability_authority(name: &str) -> CapabilityAuthority {
+    match name {
+        "filesystem.resolve"
+        | "filesystem.stat"
+        | "filesystem.read"
+        | "filesystem.list"
+        | "filesystem.search"
+        | "artifact.describe"
+        | "process.get"
+        | "process.list"
+        | "process.events"
+        | "readiness.wait"
+        | "logs.read"
+        | "port.check"
+        | "application.inspect"
+        | "ui.inspect"
+        | "ui.evaluate"
+        | "ui.capture"
+        | "ui.native-inspect" => CapabilityAuthority::None,
+        "application.activate"
+        | "application.launch"
+        | "application.open-file"
+        | "application.stop"
+        | "application.runtime.record" => CapabilityAuthority::ResourceLease {
+            resource: "runtime:${executorId}:doubao".to_owned(),
+        },
+        "ui.automate" => CapabilityAuthority::ResourceLease {
+            resource: "acceptance:${executorId}:${remoteDebuggingPort}".to_owned(),
+        },
+        _ => CapabilityAuthority::WorkspaceDriver,
     }
 }
 
@@ -2471,7 +2690,7 @@ fn output_schema(name: &str) -> Value {
             "current": {"type": "string"}, "previous": {"type": ["string", "null"]},
             "generationId": {"type": "string"}, "activatedAt": {"type": "integer"}
         }),
-        "application.generation.record" => json!({
+        "application.generation.record" | "application.runtime.record" => json!({
             "generationId": {"type": "string"}, "state": {"type": "string"}
         }),
         "application.inspect" => json!({
@@ -3176,7 +3395,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn readonly_command_does_not_require_mutating_authority() {
+    fn readonly_command_cannot_bypass_workspace_authority() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ExecutorRuntime::open(
             "local",
@@ -3193,8 +3412,7 @@ mod tests {
                 "timeoutMs": 1_000
             }),
         ));
-        assert!(response.ok, "{:?}", response.error);
-        assert_eq!(response.result.unwrap()["stdout"], "readonly");
+        assert_eq!(response.error.unwrap().code, "EXECUTOR_AUTHORITY_REQUIRED");
     }
 
     #[cfg(unix)]
@@ -3260,6 +3478,87 @@ mod tests {
             json!({"path": path, "content": "two", "expectedDigest": "sha256:wrong"}),
         ));
         assert!(!conflict.ok);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_read_grant_is_persistent_read_only_and_symlink_safe() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = directory.path().join("managed");
+        let downloads = directory.path().join("Downloads");
+        let outside = directory.path().join("outside");
+        fs::create_dir_all(&managed).unwrap();
+        fs::create_dir_all(&downloads).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(downloads.join("fixture.txt"), "fixture").unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.txt"), downloads.join("escape.txt"))
+            .unwrap();
+        let state = directory.path().join("executor.json");
+        let runtime = ExecutorRuntime::open_with_grantable(
+            "mac",
+            vec![managed],
+            vec![downloads.clone()],
+            state.clone(),
+        )
+        .unwrap();
+        let denied = runtime.handle(Request::new(
+            "filesystem.read",
+            json!({
+                "path": downloads.join("fixture.txt"), "_workspaceSessionId": "workspace-a"
+            }),
+        ));
+        assert_eq!(denied.error.unwrap().code, "READ_GRANT_REQUIRED");
+        let grant = ReadGrant {
+            id: "grant-a".into(),
+            workspace_session_id: "workspace-a".into(),
+            executor_id: "mac".into(),
+            requested_root: downloads.display().to_string(),
+            real_root: downloads.canonicalize().unwrap().display().to_string(),
+            capabilities: vec!["filesystem.read".into()],
+            state: ReadGrantState::Approved,
+            requested_by: "devbox-agent".into(),
+            created_at: now_ms(),
+            approved_at: Some(now_ms()),
+            revoked_at: None,
+            approved_by: Some("user".into()),
+            audit: json!({}),
+        };
+        assert!(
+            runtime
+                .handle(Request::new(
+                    "read-grant.approve",
+                    serde_json::to_value(&grant).unwrap()
+                ))
+                .ok
+        );
+        let allowed = runtime.handle(Request::new("filesystem.read", json!({
+            "path": downloads.join("fixture.txt"), "_workspaceSessionId": "workspace-a", "_readGrantId": "grant-a"
+        })));
+        assert!(allowed.ok, "{:?}", allowed.error);
+        let escaped = runtime.handle(Request::new("filesystem.read", json!({
+            "path": downloads.join("escape.txt"), "_workspaceSessionId": "workspace-a", "_readGrantId": "grant-a"
+        })));
+        assert_eq!(escaped.error.unwrap().code, "READ_GRANT_DENIED");
+        let write = runtime.handle(Request::new("filesystem.write", json!({
+            "path": downloads.join("new.txt"), "content": "no", "_workspaceSessionId": "workspace-a", "_readGrantId": "grant-a",
+            "_authority": [
+                {"controllerId":"controller-a", "resource":"workspace:workspace-a", "fence":1},
+                {"controllerId":"controller-a", "resource":format!("filesystem:{}", downloads.join("new.txt").display()), "fence":1}
+            ]
+        })));
+        assert_eq!(write.error.unwrap().code, "PATH_OUTSIDE_ALLOWED_ROOTS");
+        drop(runtime);
+        let reopened = ExecutorRuntime::open_with_grantable(
+            "mac",
+            vec![directory.path().join("managed")],
+            vec![downloads.clone()],
+            state,
+        )
+        .unwrap();
+        assert!(reopened.handle(Request::new("filesystem.read", json!({
+            "path": downloads.join("fixture.txt"), "_workspaceSessionId": "workspace-a", "_readGrantId": "grant-a"
+        }))).ok);
     }
 
     #[test]
@@ -3396,13 +3695,18 @@ mod tests {
         let state = directory.path().join("fences.json");
         let path = directory.path().join("fenced.txt");
         let resource = format!("filesystem:{}", path.display());
-        let authority = |controller: &str, fence: u64| json!([{"controllerId": controller, "resource": resource, "fence": fence}]);
+        let authority = |controller: &str, fence: u64| {
+            json!([
+                {"controllerId": controller, "resource": "workspace:test", "fence": fence},
+                {"controllerId": controller, "resource": resource, "fence": fence}
+            ])
+        };
         let runtime =
             ExecutorRuntime::open("local", vec![directory.path().to_path_buf()], state.clone())
                 .unwrap();
         let first = runtime.handle(Request::new(
             "filesystem.write",
-            json!({"path": path, "content": "one", "_authority": authority("controller-a", 2)}),
+            json!({"path": path, "content": "one", "_workspaceSessionId":"test", "_authority": authority("controller-a", 2)}),
         ));
         assert!(first.ok, "{first:?}");
         drop(runtime);
@@ -3412,13 +3716,13 @@ mod tests {
         for (controller, fence) in [("controller-a", 1), ("controller-b", 2)] {
             let rejected = runtime.handle(Request::new(
                 "filesystem.write",
-                json!({"path": path, "content": "stale", "_authority": authority(controller, fence)}),
+                json!({"path": path, "content": "stale", "_workspaceSessionId":"test", "_authority": authority(controller, fence)}),
             ));
             assert_eq!(rejected.error.unwrap().code, "STALE_EXECUTOR_FENCE");
         }
         let next = runtime.handle(Request::new(
             "filesystem.write",
-            json!({"path": path, "content": "next", "_authority": authority("controller-b", 3)}),
+            json!({"path": path, "content": "next", "_workspaceSessionId":"test", "_authority": authority("controller-b", 3)}),
         ));
         assert!(next.ok, "{next:?}");
     }
@@ -3429,12 +3733,12 @@ mod tests {
         let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
         let compatible = runtime.handle(Request::new(
             "capability.negotiate",
-            json!({"name": "application.materialize", "version": "1.7.0"}),
+            json!({"name": "application.materialize", "version": "2.7.0"}),
         ));
         assert!(compatible.ok);
         let incompatible = runtime.handle(Request::new(
             "capability.negotiate",
-            json!({"name": "application.materialize", "version": "2.0.0"}),
+            json!({"name": "application.materialize", "version": "1.0.0"}),
         ));
         assert_eq!(
             incompatible.error.unwrap().code,

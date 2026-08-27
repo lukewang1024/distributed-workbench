@@ -151,6 +151,8 @@ enum ExecutorCommand {
         id: String,
         #[arg(long = "allow-root", required = true)]
         allow_roots: Vec<PathBuf>,
+        #[arg(long = "grantable-read-root")]
+        grantable_read_roots: Vec<PathBuf>,
         #[arg(long)]
         state: Option<PathBuf>,
     },
@@ -430,13 +432,15 @@ fn run_cli(cli: Cli) -> Result<()> {
                 ExecutorCommand::Serve {
                     id,
                     allow_roots,
+                    grantable_read_roots,
                     state,
                 },
         } => {
             let executor = Arc::new(
-                ExecutorRuntime::open(
+                ExecutorRuntime::open_with_grantable(
                     id,
                     allow_roots,
+                    grantable_read_roots,
                     state.unwrap_or_else(default_executor_state),
                 )
                 .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?,
@@ -699,6 +703,38 @@ fn observe_codex_hook(socket: PathBuf) -> Result<()> {
     let node_id = env::var("WORKBENCH_NODE_ID").unwrap_or_else(|_| "local".into());
     let role = env::var("WORKBENCH_AGENT_ROLE").unwrap_or_else(|_| "agent".into());
     let agent_id = env::var("WORKBENCH_AGENT_ID").ok();
+    let tool_name = input
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or("lifecycle");
+    let operation_id = input.get("tool_use_id").and_then(Value::as_str);
+    let mutation_hook = hook_tool_is_mutating(tool_name);
+    if mutation_hook
+        && matches!(event, "PreToolUse" | "PostToolUse")
+        && let (Some(workspace), Some(agent), Some(operation)) = (
+            workspace_session_id.as_deref(),
+            agent_id.as_deref(),
+            operation_id,
+        )
+    {
+        let action = if event == "PreToolUse" {
+            "agent.mutation.start"
+        } else {
+            "agent.mutation.finish"
+        };
+        let response = call_unix(
+            socket.clone(),
+            &Request::new(
+                action,
+                serde_json::json!({
+                    "workspaceSessionId": workspace, "agentId": agent, "operationId": operation, "tool": tool_name
+                }),
+            ),
+        )?;
+        if !response.ok && event == "PreToolUse" {
+            return print_response(response);
+        }
+    }
     let target_summary = env::var("WORKBENCH_RUN_SUMMARY").unwrap_or_else(|_| {
         workspace_session_id
             .as_ref()
@@ -761,6 +797,15 @@ fn observe_codex_hook(socket: PathBuf) -> Result<()> {
     } else {
         print_response(response)
     }
+}
+
+fn hook_tool_is_mutating(tool: &str) -> bool {
+    let normalized = tool.to_ascii_lowercase();
+    normalized.contains("apply_patch")
+        || normalized.contains("exec_command")
+        || normalized.contains("write_stdin")
+        || normalized.ends_with("bash")
+        || normalized.ends_with("shell")
 }
 
 fn codex_hook_state_path(session_id: &str) -> PathBuf {

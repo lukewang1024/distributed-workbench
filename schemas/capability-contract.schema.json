@@ -17,7 +17,8 @@
     "rollback",
     "healthCheck",
     "emittedEvidence",
-    "effect"
+    "effect",
+    "authority"
   ],
   "properties": {
     "name": {"type": "string", "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9-]*)+$"},
@@ -68,7 +69,14 @@
     },
     "healthCheck": {"type": "object", "required": ["type"]},
     "emittedEvidence": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
-    "effect": {"enum": ["read-only", "mutating"]},
+    "effect": {"enum": ["read-only", "mutating", "destructive"]},
+    "authority": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "none"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind"], "properties": {"kind": {"const": "workspace-driver"}}},
+        {"type": "object", "additionalProperties": false, "required": ["kind", "resource"], "properties": {"kind": {"const": "resource-lease"}, "resource": {"type": "string"}}}
+      ]
+    },
     "priority": {"type": "integer", "minimum": 0, "maximum": 255},
     "maxConcurrency": {"type": ["integer", "null"], "minimum": 1},
     "cancelPolicy": {"enum": ["cancel-on-disconnect", "continue"]}

@@ -19,6 +19,8 @@
     <string>@WORKSPACE_ROOT@</string>
     <string>--allow-root</string>
     <string>@STATE_ROOT@</string>
+    <string>--grantable-read-root</string>
+    <string>@DOWNLOADS_ROOT@</string>
   </array>
   <key>RunAtLoad</key>
   <true/>

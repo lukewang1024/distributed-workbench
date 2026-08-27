@@ -130,6 +130,7 @@ sed \
   -e "s|@CODE_ROOT@|$(escape_sed "$HOME/Code")|g" \
   -e "s|@WORKSPACE_ROOT@|$(escape_sed "$HOME/Workspace")|g" \
   -e "s|@STATE_ROOT@|$(escape_sed "$state_home")|g" \
+  -e "s|@DOWNLOADS_ROOT@|$(escape_sed "$HOME/Downloads")|g" \
   -e "s|@LOG_PATH@|$(escape_sed "$log_path")|g" \
   "$template" >"$launch_plist.$$.tmp"
 plutil -lint "$launch_plist.$$.tmp" >/dev/null

@@ -21,6 +21,7 @@
   ],
   "properties": {
     "id": {"type": "string"},
+    "kind": {"enum": ["work", "acceptance"], "default": "work"},
     "workspaceSessionId": {"type": "string"},
     "objective": {"type": "string"},
     "from": {"$ref": "#/$defs/role"},
@@ -69,7 +70,8 @@
     "blockers": {"type": "array", "items": {"type": "string"}},
     "createdAt": {"type": "integer"},
     "acknowledgedAt": {"type": ["integer", "null"]},
-    "completedAt": {"type": ["integer", "null"]}
+    "completedAt": {"type": ["integer", "null"]},
+    "report": {"type": ["object", "null"]}
   },
   "$defs": {
     "role": {
