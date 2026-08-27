@@ -5,8 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use workbench_schema::{
-    ActivationTransaction, AgentInstance, Approval, Artifact, ControllerPeer, Executor, Generation,
-    Handoff, Lease, Task, WorkspaceSession,
+    ActivationTransaction, AgentInstance, AgentMutationOperation, Approval, Artifact,
+    ControllerPeer, DriverHandoffRequest, Executor, Generation, Handoff, Lease, ReadGrant, Task,
+    WorkspaceSession,
 };
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -36,6 +37,12 @@ pub struct WorkbenchState {
     pub agents: Vec<AgentInstance>,
     #[serde(default)]
     pub handoffs: Vec<Handoff>,
+    #[serde(default)]
+    pub driver_handoff_requests: Vec<DriverHandoffRequest>,
+    #[serde(default)]
+    pub agent_mutations: Vec<AgentMutationOperation>,
+    #[serde(default)]
+    pub read_grants: Vec<ReadGrant>,
     #[serde(default)]
     pub approvals: Vec<Approval>,
 }

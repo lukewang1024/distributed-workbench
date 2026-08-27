@@ -12,11 +12,13 @@ use workbench_core::{
 };
 use workbench_protocol::{Request, Response, RpcError};
 use workbench_schema::{
-    ActivationTransaction, AgentInstance, AgentState, Approval, ApprovalState, Artifact,
-    ArtifactLocation, CapabilityDescriptor, ControllerPeer, ExecutionKind, Executor,
-    ExecutorEndpoint, Generation, GenerationState, Handoff, HealthStatus, LeaseKind, Metadata,
-    Observation, Provenance, Run, RunHealth, RunStatus, SessionAuthority, SessionState, Task,
-    TaskState, TransactionJournalEntry, TransactionState, TransactionStepState, WorkspaceSession,
+    ActivationTransaction, AgentInstance, AgentMutationOperation, AgentState, Approval,
+    ApprovalState, Artifact, ArtifactLocation, CapabilityDescriptor, ControllerPeer,
+    DriverHandoffRequest, DriverHandoffState, ExecutionKind, Executor, ExecutorEndpoint,
+    Generation, GenerationState, Handoff, HealthStatus, LeaseKind, Metadata, Observation,
+    Provenance, ReadGrant, ReadGrantState, Run, RunHealth, RunStatus, SessionAuthority,
+    SessionState, Task, TaskState, TransactionJournalEntry, TransactionState, TransactionStepState,
+    WorkspaceSession,
 };
 
 use crate::telemetry::{event_fields, request_event, task_event};
@@ -316,7 +318,7 @@ impl Controller {
         }
         match action {
             "ping" => Ok(json!({
-                "controller": {"id": self.id, "status": "ready"},
+                "controller": {"id": self.id, "status": "ready", "protocolFeatures": protocol_features()},
             })),
             "status" => {
                 let state = self.state.lock().expect("state lock");
@@ -325,7 +327,7 @@ impl Controller {
                 refresh_local_endpoint_health(&mut controllers, &mut executors);
                 if params.get("verbose").and_then(Value::as_bool) == Some(true) {
                     return Ok(json!({
-                        "controller": {"id": self.id, "status": "ready"},
+                        "controller": {"id": self.id, "status": "ready", "protocolFeatures": protocol_features()},
                         "controllers": controllers,
                         "executors": executors,
                         "leases": self.leases.lock().expect("lease lock").snapshot(),
@@ -362,7 +364,7 @@ impl Controller {
                 }
                 let leases = self.leases.lock().expect("lease lock").snapshot();
                 Ok(json!({
-                    "controller": {"id": self.id, "status": "ready"},
+                    "controller": {"id": self.id, "status": "ready", "protocolFeatures": protocol_features()},
                     "controllers": controllers,
                     "executors": executors,
                     "leases": {"count": leases.len()},
@@ -1062,10 +1064,42 @@ impl Controller {
                         ));
                     }
                 }
+                let archived_grants = if session.state == SessionState::Archived {
+                    self.state
+                        .lock()
+                        .expect("state lock")
+                        .read_grants
+                        .iter()
+                        .filter(|grant| {
+                            grant.workspace_session_id == session.metadata.id
+                                && grant.state == ReadGrantState::Approved
+                        })
+                        .map(|grant| (grant.id.clone(), grant.executor_id.clone()))
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                for (grant_id, executor_id) in &archived_grants {
+                    self.call_registered_executor(
+                        executor_id,
+                        "read-grant.revoke",
+                        json!({"grantId": grant_id}),
+                    )?;
+                }
                 let mut state = self.state.lock().expect("state lock");
                 upsert_by(&mut state.sessions, session.clone(), |item| {
                     item.metadata.id == session.metadata.id
                 });
+                for (grant_id, _) in archived_grants {
+                    if let Some(grant) = state
+                        .read_grants
+                        .iter_mut()
+                        .find(|grant| grant.id == grant_id)
+                    {
+                        grant.state = ReadGrantState::Revoked;
+                        grant.revoked_at = Some(now_ms());
+                    }
+                }
                 drop(state);
                 self.persist()?;
                 Ok(serde_json::to_value(session).expect("session serializes"))
@@ -1658,6 +1692,139 @@ impl Controller {
                 self.persist()?;
                 Ok(serde_json::to_value(result).expect("approval serializes"))
             }
+            "read-grant.request" => {
+                let workspace = required_str(&params, "workspaceSessionId")?;
+                let executor = required_str(&params, "executorId")?;
+                let requested_root = required_str(&params, "requestedRoot")?;
+                let resolved = self.call_registered_executor(
+                    executor,
+                    "read-grant.resolve",
+                    json!({"requestedRoot": requested_root}),
+                )?;
+                let real_root = required_str(&resolved, "realRoot")?.to_owned();
+                let now = now_ms();
+                let grant = ReadGrant {
+                    id: format!("read_grant_{}", Uuid::new_v4().simple()),
+                    workspace_session_id: workspace.to_owned(),
+                    executor_id: executor.to_owned(),
+                    requested_root: requested_root.to_owned(),
+                    real_root,
+                    capabilities: vec![
+                        "filesystem.resolve",
+                        "filesystem.stat",
+                        "filesystem.list",
+                        "filesystem.read",
+                        "filesystem.search",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                    state: ReadGrantState::Requested,
+                    requested_by: required_str(&params, "requestedBy")?.to_owned(),
+                    created_at: now,
+                    approved_at: None,
+                    revoked_at: None,
+                    approved_by: None,
+                    audit: params.get("audit").cloned().unwrap_or_else(|| json!({})),
+                };
+                self.state
+                    .lock()
+                    .expect("state lock")
+                    .read_grants
+                    .push(grant.clone());
+                self.persist()?;
+                Ok(serde_json::to_value(grant).expect("grant serializes"))
+            }
+            "read-grant.approve" => {
+                let id = required_str(&params, "grantId")?;
+                let approver = required_str(&params, "approvedBy")?;
+                let mut grant = {
+                    let state = self.state.lock().expect("state lock");
+                    state
+                        .read_grants
+                        .iter()
+                        .find(|grant| grant.id == id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                "READ_GRANT_NOT_FOUND",
+                                format!("unknown read grant: {id}"),
+                            )
+                        })?
+                };
+                if grant.state != ReadGrantState::Requested {
+                    return Err(RpcError::new(
+                        "INVALID_READ_GRANT_STATE",
+                        "only requested grants can be approved",
+                    ));
+                }
+                grant.state = ReadGrantState::Approved;
+                grant.approved_at = Some(now_ms());
+                grant.approved_by = Some(approver.to_owned());
+                self.call_registered_executor(
+                    &grant.executor_id,
+                    "read-grant.approve",
+                    serde_json::to_value(&grant).expect("grant serializes"),
+                )?;
+                let mut state = self.state.lock().expect("state lock");
+                let stored = state
+                    .read_grants
+                    .iter_mut()
+                    .find(|item| item.id == id)
+                    .expect("grant exists");
+                *stored = grant.clone();
+                drop(state);
+                self.persist()?;
+                Ok(serde_json::to_value(grant).expect("grant serializes"))
+            }
+            "read-grant.list" => {
+                let state = self.state.lock().expect("state lock");
+                let workspace = params.get("workspaceSessionId").and_then(Value::as_str);
+                let executor = params.get("executorId").and_then(Value::as_str);
+                let grants: Vec<_> = state
+                    .read_grants
+                    .iter()
+                    .filter(|grant| {
+                        workspace.is_none_or(|value| value == grant.workspace_session_id)
+                            && executor.is_none_or(|value| value == grant.executor_id)
+                    })
+                    .collect();
+                Ok(serde_json::to_value(grants).expect("grants serialize"))
+            }
+            "read-grant.revoke" => {
+                let id = required_str(&params, "grantId")?;
+                let executor = {
+                    let state = self.state.lock().expect("state lock");
+                    state
+                        .read_grants
+                        .iter()
+                        .find(|grant| grant.id == id)
+                        .map(|grant| grant.executor_id.clone())
+                        .ok_or_else(|| {
+                            RpcError::new(
+                                "READ_GRANT_NOT_FOUND",
+                                format!("unknown read grant: {id}"),
+                            )
+                        })?
+                };
+                self.call_registered_executor(
+                    &executor,
+                    "read-grant.revoke",
+                    json!({"grantId": id}),
+                )?;
+                let mut state = self.state.lock().expect("state lock");
+                let grant = state
+                    .read_grants
+                    .iter_mut()
+                    .find(|grant| grant.id == id)
+                    .expect("grant exists");
+                grant.state = ReadGrantState::Revoked;
+                grant.revoked_at = Some(now_ms());
+                let result = grant.clone();
+                drop(state);
+                self.persist()?;
+                Ok(serde_json::to_value(result).expect("grant serializes"))
+            }
             "capability.invoke" => {
                 let executor_id = required_str(&params, "executorId")?;
                 let capability_name = required_str(&params, "capability")?;
@@ -1710,10 +1877,54 @@ impl Controller {
                             format!("executor does not provide {capability_name}"),
                         )
                     })?;
-                let invocation_is_readonly =
-                    matches!(contract.effect, workbench_schema::Effect::ReadOnly)
-                        || (capability_name == "command.run"
-                            && input.get("mode").and_then(Value::as_str) == Some("readonly"));
+                if contract.version.split('.').next() != Some("2") {
+                    return Err(RpcError::new(
+                        "PEER_CAPABILITY_VERSION_MISMATCH",
+                        format!(
+                            "{executor_id}/{capability_name} does not implement authority protocol v2"
+                        ),
+                    ));
+                }
+                if matches!(
+                    capability_name,
+                    "filesystem.resolve"
+                        | "filesystem.stat"
+                        | "filesystem.read"
+                        | "filesystem.list"
+                        | "filesystem.search"
+                ) {
+                    input["_workspaceSessionId"] = Value::String(workspace_session_id.to_owned());
+                    if let Some(path) = input.get("path").and_then(Value::as_str) {
+                        let state = self.state.lock().expect("state lock");
+                        if let Some(grant) = state.read_grants.iter().find(|grant| {
+                            grant.workspace_session_id == workspace_session_id
+                                && grant.executor_id == executor_id
+                                && grant.state == ReadGrantState::Approved
+                                && grant
+                                    .capabilities
+                                    .iter()
+                                    .any(|item| item == capability_name)
+                                && std::path::Path::new(path)
+                                    .starts_with(std::path::Path::new(&grant.real_root))
+                        }) {
+                            input["_readGrantId"] = Value::String(grant.id.clone());
+                        }
+                    }
+                }
+                let invocation_is_readonly = matches!(
+                    contract.authority,
+                    workbench_schema::CapabilityAuthority::None
+                );
+                if matches!(
+                    contract.authority,
+                    workbench_schema::CapabilityAuthority::WorkspaceDriver
+                ) && self.workspace_is_draining(workspace_session_id, owner)
+                {
+                    return Err(RpcError::new(
+                        "DRIVER_DRAINING",
+                        "workspace driver is draining for an automatic handoff; new mutations are disabled",
+                    ));
+                }
                 if capability_name == "agent.start" {
                     let role = input
                         .get("role")
@@ -1741,27 +1952,43 @@ impl Controller {
                         json!(format!("{role} task in {workspace_session_id}")),
                     );
                 }
-                let driver_authority = if !invocation_is_readonly {
-                    // `LeaseTable::validate` returns a reference into the table. Keep the
-                    // mutex guard in an explicit scope so it is released before task
-                    // persistence reacquires the lease lock. A chained temporary here can
-                    // otherwise live through the rest of this match arm and deadlock every
-                    // mutating capability before `executor.dispatch`.
-                    {
+                let required_authority = match &contract.authority {
+                    workbench_schema::CapabilityAuthority::None => None,
+                    workbench_schema::CapabilityAuthority::WorkspaceDriver => {
+                        // `LeaseTable::validate` returns a reference into the table. Keep the
+                        // mutex guard in an explicit scope so it is released before task
+                        // persistence reacquires the lease lock. A chained temporary here can
+                        // otherwise live through the rest of this match arm and deadlock every
+                        // mutating capability before `executor.dispatch`.
+                        {
+                            let leases = self.leases.lock().expect("lease lock");
+                            Some(
+                                leases
+                                    .validate(
+                                        &format!("workspace:{workspace_session_id}"),
+                                        owner,
+                                        required_str(&params, "driverToken")?,
+                                    )
+                                    .map_err(map_lease_error)?
+                                    .clone(),
+                            )
+                        }
+                    }
+                    workbench_schema::CapabilityAuthority::ResourceLease { resource } => {
+                        let resource =
+                            render_capability_authority_resource(resource, executor_id, &input)?;
                         let leases = self.leases.lock().expect("lease lock");
                         Some(
                             leases
                                 .validate(
-                                    &format!("workspace:{workspace_session_id}"),
+                                    &resource,
                                     owner,
-                                    required_str(&params, "driverToken")?,
+                                    required_str(&params, "authorityLeaseToken")?,
                                 )
                                 .map_err(map_lease_error)?
                                 .clone(),
                         )
                     }
-                } else {
-                    None
                 };
                 validate_schema(&contract.input_schema, &input, "input")?;
                 let execution_mode = params
@@ -2005,14 +2232,8 @@ impl Controller {
                     // Resource leases. Controller-only command resources may still be
                     // acquired above, but are intentionally not forwarded as executor
                     // authority because they are not part of the executor contract.
-                    let executor_authority = if contract.locks.is_empty() {
-                        driver_authority.iter().collect::<Vec<_>>()
-                    } else {
-                        acquired
-                            .iter()
-                            .take(contract.locks.len())
-                            .collect::<Vec<_>>()
-                    };
+                    let mut executor_authority = required_authority.iter().collect::<Vec<_>>();
+                    executor_authority.extend(acquired.iter().take(contract.locks.len()));
                     input["_authority"] = Value::Array(
                         executor_authority
                             .into_iter()
@@ -2233,9 +2454,219 @@ impl Controller {
                         .expect("lease serializes"),
                 )
             }
+            "driver.handoff.status" => {
+                let workspace = required_str(&params, "workspaceSessionId")?;
+                self.refresh_driver_handoff(workspace)?;
+                let state = self.state.lock().expect("state lock");
+                Ok(serde_json::to_value(
+                    state
+                        .driver_handoff_requests
+                        .iter()
+                        .filter(|request| request.workspace_session_id == workspace)
+                        .max_by_key(|request| request.created_at),
+                )
+                .expect("handoff serializes"))
+            }
+            "agent.mutation.start" => {
+                let workspace = required_str(&params, "workspaceSessionId")?;
+                let agent = required_str(&params, "agentId")?;
+                if self.workspace_is_draining(workspace, agent) {
+                    return Err(RpcError::new(
+                        "DRIVER_DRAINING",
+                        "workspace driver is draining; mutation hook rejected new write",
+                    ));
+                }
+                let operation = AgentMutationOperation {
+                    id: required_str(&params, "operationId")?.to_owned(),
+                    workspace_session_id: workspace.to_owned(),
+                    agent_id: agent.to_owned(),
+                    tool: required_str(&params, "tool")?.to_owned(),
+                    started_at: now_ms(),
+                };
+                let mut state = self.state.lock().expect("state lock");
+                if !state
+                    .agent_mutations
+                    .iter()
+                    .any(|item| item.id == operation.id)
+                {
+                    state.agent_mutations.push(operation.clone());
+                }
+                drop(state);
+                self.persist()?;
+                Ok(serde_json::to_value(operation).expect("mutation serializes"))
+            }
+            "agent.mutation.finish" => {
+                let id = required_str(&params, "operationId")?;
+                let workspace = required_str(&params, "workspaceSessionId")?;
+                self.state
+                    .lock()
+                    .expect("state lock")
+                    .agent_mutations
+                    .retain(|item| item.id != id);
+                self.refresh_driver_handoff(workspace)?;
+                self.persist()?;
+                Ok(json!({"operationId": id, "finished": true}))
+            }
+            "driver.handoff.request" => {
+                let workspace = required_str(&params, "workspaceSessionId")?;
+                let requester = required_str(&params, "owner")?;
+                let ttl_ms = params
+                    .get("ttlMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(300_000);
+                let resource = format!("workspace:{workspace}");
+                let now = now_ms();
+                let existing = self
+                    .leases
+                    .lock()
+                    .expect("lease lock")
+                    .get(&resource)
+                    .cloned();
+                if existing
+                    .as_ref()
+                    .is_some_and(|lease| lease.owner == requester)
+                {
+                    return Err(RpcError::new(
+                        "ALREADY_DRIVER",
+                        "requester already owns workspace driver",
+                    ));
+                }
+                let request = DriverHandoffRequest {
+                    id: format!("driver_handoff_{}", Uuid::new_v4().simple()),
+                    workspace_session_id: workspace.to_owned(),
+                    resource: resource.clone(),
+                    requested_by: requester.to_owned(),
+                    previous_owner: existing.as_ref().map(|lease| lease.owner.clone()),
+                    state: if existing.is_some() {
+                        DriverHandoffState::Draining
+                    } else {
+                        DriverHandoffState::Ready
+                    },
+                    created_at: now,
+                    expires_at: now.saturating_add(ttl_ms),
+                    completed_at: None,
+                };
+                if existing.is_some() {
+                    self.leases
+                        .lock()
+                        .expect("lease lock")
+                        .request_handoff(&resource, requester)
+                        .map_err(map_lease_error)?;
+                }
+                self.state
+                    .lock()
+                    .expect("state lock")
+                    .driver_handoff_requests
+                    .push(request.clone());
+                self.refresh_driver_handoff(workspace)?;
+                self.persist()?;
+                Ok(serde_json::to_value(request).expect("handoff serializes"))
+            }
+            "driver.handoff.await" => {
+                let workspace = required_str(&params, "workspaceSessionId")?;
+                let requester = required_str(&params, "owner")?;
+                self.refresh_driver_handoff(workspace)?;
+                let resource = format!("workspace:{workspace}");
+                let ttl_ms = params
+                    .get("ttlMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(300_000);
+                let mut state = self.state.lock().expect("state lock");
+                let request = state
+                    .driver_handoff_requests
+                    .iter_mut()
+                    .rev()
+                    .find(|item| {
+                        item.workspace_session_id == workspace
+                            && item.requested_by == requester
+                            && matches!(
+                                item.state,
+                                DriverHandoffState::Ready | DriverHandoffState::Draining
+                            )
+                    })
+                    .ok_or_else(|| {
+                        RpcError::new("DRIVER_HANDOFF_NOT_FOUND", "no active handoff request")
+                    })?;
+                if request.state != DriverHandoffState::Ready {
+                    let mut error = RpcError::new(
+                        "DRIVER_HANDOFF_DRAINING",
+                        "current writer is still draining",
+                    );
+                    error.retryable = true;
+                    return Err(error);
+                }
+                let had_owner = request.previous_owner.is_some();
+                let lease = if had_owner {
+                    self.leases
+                        .lock()
+                        .expect("lease lock")
+                        .take_handoff(&resource, requester, ttl_ms)
+                } else {
+                    self.leases.lock().expect("lease lock").acquire(
+                        LeaseKind::Driver,
+                        &resource,
+                        requester,
+                        ttl_ms,
+                    )
+                }
+                .map_err(map_lease_error)?;
+                request.state = DriverHandoffState::Completed;
+                request.completed_at = Some(now_ms());
+                drop(state);
+                self.persist()?;
+                Ok(serde_json::to_value(lease).expect("lease serializes"))
+            }
+            "driver.handoff.cancel" => {
+                let workspace = required_str(&params, "workspaceSessionId")?;
+                let requester = required_str(&params, "owner")?;
+                let resource = format!("workspace:{workspace}");
+                let mut state = self.state.lock().expect("state lock");
+                let request = state
+                    .driver_handoff_requests
+                    .iter_mut()
+                    .rev()
+                    .find(|item| {
+                        item.workspace_session_id == workspace
+                            && item.requested_by == requester
+                            && matches!(
+                                item.state,
+                                DriverHandoffState::Requested
+                                    | DriverHandoffState::Draining
+                                    | DriverHandoffState::Ready
+                            )
+                    })
+                    .ok_or_else(|| {
+                        RpcError::new("DRIVER_HANDOFF_NOT_FOUND", "no active handoff request")
+                    })?;
+                if request.previous_owner.is_some() {
+                    self.leases
+                        .lock()
+                        .expect("lease lock")
+                        .cancel_handoff(&resource, requester)
+                        .map_err(map_lease_error)?;
+                }
+                request.state = DriverHandoffState::Cancelled;
+                drop(state);
+                self.persist()?;
+                Ok(json!({"cancelled": true, "workspaceSessionId": workspace}))
+            }
             "driver.acquire" | "lease.acquire" => {
                 let resource = required_str(&params, "resource")?;
                 let owner = required_str(&params, "owner")?;
+                if action == "lease.acquire" {
+                    let requested_rank = lease_order_rank(resource);
+                    let held = self.leases.lock().expect("lease lock").snapshot();
+                    if held.iter().any(|lease| {
+                        lease.owner == owner
+                            && lease.resource != resource
+                            && lease_order_rank(&lease.resource) < requested_rank
+                    }) {
+                        return Err(RpcError::new(
+                            "LEASE_ORDER_VIOLATION",
+                            "release workspace driver before runtime lease, and runtime lease before acceptance lease",
+                        ));
+                    }
+                }
                 let ttl_ms = params
                     .get("ttlMs")
                     .and_then(Value::as_u64)
@@ -2777,10 +3208,64 @@ impl Controller {
                     })?;
                 Ok(serde_json::to_value(handoff).expect("handoff serializes"))
             }
-            "handoff.list" => Ok(serde_json::to_value(
-                &self.state.lock().expect("state lock").handoffs,
-            )
-            .expect("handoffs serialize")),
+            "handoff.list" => {
+                let state = self.state.lock().expect("state lock");
+                let kind = params.get("kind").and_then(Value::as_str);
+                let agent = params.get("agentId").and_then(Value::as_str);
+                let handoffs: Vec<_> = state
+                    .handoffs
+                    .iter()
+                    .filter(|handoff| {
+                        kind.is_none_or(|value| {
+                            value
+                                == match handoff.kind {
+                                    workbench_schema::HandoffKind::Work => "work",
+                                    workbench_schema::HandoffKind::Acceptance => "acceptance",
+                                }
+                        }) && agent
+                            .is_none_or(|value| handoff.to.agent_id.as_deref() == Some(value))
+                    })
+                    .collect();
+                Ok(serde_json::to_value(handoffs).expect("handoffs serialize"))
+            }
+            "handoff.report" => {
+                let id = required_str(&params, "handoffId")?;
+                let resource = required_str(&params, "acceptanceResource")?;
+                if !resource.starts_with("acceptance:") {
+                    return Err(RpcError::new(
+                        "INVALID_ACCEPTANCE_RESOURCE",
+                        "acceptanceResource must use acceptance:<executor>:<port>",
+                    ));
+                }
+                self.leases
+                    .lock()
+                    .expect("lease lock")
+                    .validate(
+                        resource,
+                        required_str(&params, "owner")?,
+                        required_str(&params, "leaseToken")?,
+                    )
+                    .map_err(map_lease_error)?;
+                let mut state = self.state.lock().expect("state lock");
+                let handoff = state
+                    .handoffs
+                    .iter_mut()
+                    .find(|handoff| handoff.id == id)
+                    .ok_or_else(|| {
+                        RpcError::new("HANDOFF_NOT_FOUND", format!("unknown handoff: {id}"))
+                    })?;
+                if handoff.kind != workbench_schema::HandoffKind::Acceptance {
+                    return Err(RpcError::new(
+                        "INVALID_HANDOFF_KIND",
+                        "reports are only valid for acceptance handoffs",
+                    ));
+                }
+                handoff.report = Some(params.get("report").cloned().unwrap_or(Value::Null));
+                let result = handoff.clone();
+                drop(state);
+                self.persist()?;
+                Ok(serde_json::to_value(result).expect("handoff serializes"))
+            }
             "handoff.acknowledge" | "handoff.complete" => {
                 let id = required_str(&params, "handoffId")?;
                 let mut state = self.state.lock().expect("state lock");
@@ -2806,6 +3291,30 @@ impl Controller {
                             "HANDOFF_NOT_ACKNOWLEDGED",
                             "handoff must be acknowledged before completion",
                         ));
+                    }
+                    if handoff.kind == workbench_schema::HandoffKind::Acceptance {
+                        let resource = required_str(&params, "acceptanceResource")?;
+                        if !resource.starts_with("acceptance:") {
+                            return Err(RpcError::new(
+                                "INVALID_ACCEPTANCE_RESOURCE",
+                                "acceptance resource is required",
+                            ));
+                        }
+                        self.leases
+                            .lock()
+                            .expect("lease lock")
+                            .validate(
+                                resource,
+                                required_str(&params, "owner")?,
+                                required_str(&params, "leaseToken")?,
+                            )
+                            .map_err(map_lease_error)?;
+                        if handoff.report.is_none() {
+                            return Err(RpcError::new(
+                                "ACCEPTANCE_REPORT_REQUIRED",
+                                "acceptance report is required before completion",
+                            ));
+                        }
                     }
                     handoff.completed_at = Some(now);
                 }
@@ -3324,6 +3833,82 @@ impl Controller {
                 .entry(session_id.to_owned())
                 .or_insert_with(|| Arc::new(Mutex::new(()))),
         )
+    }
+
+    fn workspace_is_draining(&self, workspace: &str, owner: &str) -> bool {
+        let now = now_ms();
+        self.state
+            .lock()
+            .expect("state lock")
+            .driver_handoff_requests
+            .iter()
+            .any(|request| {
+                request.workspace_session_id == workspace
+                    && request.previous_owner.as_deref() == Some(owner)
+                    && request.expires_at > now
+                    && matches!(
+                        request.state,
+                        DriverHandoffState::Requested
+                            | DriverHandoffState::Draining
+                            | DriverHandoffState::Ready
+                    )
+            })
+    }
+
+    fn refresh_driver_handoff(&self, workspace: &str) -> Result<(), RpcError> {
+        let now = now_ms();
+        let task_busy = self
+            .tasks
+            .lock()
+            .expect("task lock")
+            .snapshot()
+            .iter()
+            .any(|task| {
+                task.workspace_session_id == workspace
+                    && matches!(
+                        task.state,
+                        TaskState::Queued | TaskState::Running | TaskState::Cancelling
+                    )
+            });
+        let mut changed = false;
+        let mut state = self.state.lock().expect("state lock");
+        let busy = task_busy
+            || state
+                .agent_mutations
+                .iter()
+                .any(|operation| operation.workspace_session_id == workspace);
+        for request in state
+            .driver_handoff_requests
+            .iter_mut()
+            .filter(|item| item.workspace_session_id == workspace)
+        {
+            if matches!(
+                request.state,
+                DriverHandoffState::Requested
+                    | DriverHandoffState::Draining
+                    | DriverHandoffState::Ready
+            ) {
+                if request.expires_at <= now {
+                    request.state = DriverHandoffState::Expired;
+                    if request.previous_owner.is_some() {
+                        let _ = self
+                            .leases
+                            .lock()
+                            .expect("lease lock")
+                            .cancel_handoff(&request.resource, &request.requested_by);
+                    }
+                    changed = true;
+                } else if !busy && request.state != DriverHandoffState::Ready {
+                    request.state = DriverHandoffState::Ready;
+                    changed = true;
+                }
+            }
+        }
+        drop(state);
+        if changed {
+            self.persist()?;
+        }
+        Ok(())
     }
 
     fn requires_session_gate(&self, action: &str) -> bool {
@@ -4153,6 +4738,36 @@ fn release_acquired(leases: &mut LeaseTable, acquired: &[workbench_schema::Lease
     }
 }
 
+fn lease_order_rank(resource: &str) -> u8 {
+    if resource.starts_with("workspace:") {
+        1
+    } else if resource.starts_with("runtime:") {
+        2
+    } else if resource.starts_with("acceptance:") {
+        3
+    } else {
+        0
+    }
+}
+
+fn protocol_features() -> [&'static str; 4] {
+    [
+        "capability-authority-v2",
+        "driver-draining-v1",
+        "read-grant-v1",
+        "acceptance-handoff-v1",
+    ]
+}
+
+fn render_capability_authority_resource(
+    template: &str,
+    executor_id: &str,
+    input: &Value,
+) -> Result<String, RpcError> {
+    let expanded = template.replace("${executorId}", executor_id);
+    render_lock(&expanded, input)
+}
+
 fn map_lease_error(error: LeaseError) -> RpcError {
     let code = match error {
         LeaseError::Active { .. } => "LEASE_ACTIVE",
@@ -4839,6 +5454,92 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("transition unblocked after handoff");
         assert!(transitioned.ok, "{:?}", transitioned.error);
+    }
+
+    #[test]
+    fn automatic_driver_handoff_drains_hooks_and_rotates_the_fence() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller = Controller::open_with_id(
+            JsonStore::new(directory.path().join("controller.json")),
+            Some("node-a".into()),
+        )
+        .unwrap();
+        assert!(controller.handle(Request::new("session.put", json!({
+            "apiVersion":"workbench.dev/v1", "metadata":{"id":"session-a","labels":{},"createdAt":1,"updatedAt":1},
+            "objective":"handoff", "state":"active"
+        }))).ok);
+        let old = controller
+            .handle(Request::new(
+                "driver.acquire",
+                json!({
+                    "resource":"workspace:session-a", "owner":"old-agent", "ttlMs":60000
+                }),
+            ))
+            .result
+            .unwrap();
+        assert!(controller.handle(Request::new("agent.mutation.start", json!({
+            "workspaceSessionId":"session-a", "agentId":"old-agent", "operationId":"patch-1", "tool":"apply_patch"
+        }))).ok);
+        let requested = controller
+            .handle(Request::new(
+                "driver.handoff.request",
+                json!({
+                    "workspaceSessionId":"session-a", "owner":"new-agent", "ttlMs":60000
+                }),
+            ))
+            .result
+            .unwrap();
+        assert_eq!(requested["state"], "draining");
+        let blocked = controller.handle(Request::new("agent.mutation.start", json!({
+            "workspaceSessionId":"session-a", "agentId":"old-agent", "operationId":"patch-2", "tool":"exec_command"
+        })));
+        assert_eq!(blocked.error.unwrap().code, "DRIVER_DRAINING");
+        assert!(controller.handle(Request::new("status", json!({}))).ok);
+        assert!(controller.handle(Request::new("agent.mutation.finish", json!({
+            "workspaceSessionId":"session-a", "agentId":"old-agent", "operationId":"patch-1", "tool":"apply_patch"
+        }))).ok);
+        let next = controller
+            .handle(Request::new(
+                "driver.handoff.await",
+                json!({
+                    "workspaceSessionId":"session-a", "owner":"new-agent", "ttlMs":60000
+                }),
+            ))
+            .result
+            .unwrap();
+        assert_eq!(next["owner"], "new-agent");
+        assert!(next["fence"].as_u64().unwrap() > old["fence"].as_u64().unwrap());
+        let stale = controller.handle(Request::new(
+            "driver.release",
+            json!({
+                "resource":"workspace:session-a", "owner":"old-agent", "token":old["token"]
+            }),
+        ));
+        assert_eq!(stale.error.unwrap().code, "LEASE_OWNED_BY_OTHER");
+    }
+
+    #[test]
+    fn lease_order_requires_release_between_publish_phases() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller =
+            Controller::open(JsonStore::new(directory.path().join("controller.json"))).unwrap();
+        assert!(
+            controller
+                .handle(Request::new(
+                    "driver.acquire",
+                    json!({
+                        "resource":"workspace:s", "owner":"publisher", "ttlMs":60000
+                    })
+                ))
+                .ok
+        );
+        let runtime = controller.handle(Request::new(
+            "lease.acquire",
+            json!({
+                "resource":"runtime:mac:doubao", "owner":"publisher", "ttlMs":60000
+            }),
+        ));
+        assert_eq!(runtime.error.unwrap().code, "LEASE_ORDER_VIOLATION");
     }
 
     #[test]

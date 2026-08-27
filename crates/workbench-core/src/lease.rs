@@ -126,6 +126,32 @@ impl LeaseTable {
         Ok(handed_off)
     }
 
+    /// Controller-authorized handoff request. The requester never learns the
+    /// current owner's token; the new token is minted only by `take_handoff`.
+    pub fn request_handoff(&mut self, resource: &str, target: &str) -> Result<Lease, LeaseError> {
+        let lease = self.leases.get_mut(resource).ok_or(LeaseError::NotFound)?;
+        if lease.expires_at <= now_ms() {
+            return Err(LeaseError::NotFound);
+        }
+        lease.handoff_to = Some(target.to_owned());
+        lease.updated_at = now_ms();
+        let mut public = lease.clone();
+        public.token.clear();
+        Ok(public)
+    }
+
+    pub fn cancel_handoff(&mut self, resource: &str, target: &str) -> Result<Lease, LeaseError> {
+        let lease = self.leases.get_mut(resource).ok_or(LeaseError::NotFound)?;
+        if lease.handoff_to.as_deref() != Some(target) {
+            return Err(LeaseError::InvalidHandoff);
+        }
+        lease.handoff_to = None;
+        lease.updated_at = now_ms();
+        let mut public = lease.clone();
+        public.token.clear();
+        Ok(public)
+    }
+
     pub fn take_handoff(
         &mut self,
         resource: &str,
@@ -235,6 +261,40 @@ mod tests {
         table
             .release("workspace:a", "agent-b", &second.token)
             .unwrap();
+    }
+
+    #[test]
+    fn controller_requested_handoff_hides_old_token_and_can_cancel() {
+        let mut table = LeaseTable::default();
+        let original = table
+            .acquire(LeaseKind::Driver, "workspace:a", "old", 60_000)
+            .unwrap();
+        let public = table.request_handoff("workspace:a", "new").unwrap();
+        assert!(public.token.is_empty());
+        assert_eq!(public.handoff_to.as_deref(), Some("new"));
+        table.cancel_handoff("workspace:a", "new").unwrap();
+        assert!(
+            table
+                .validate("workspace:a", "old", &original.token)
+                .is_ok()
+        );
+        assert!(table.get("workspace:a").unwrap().handoff_to.is_none());
+    }
+
+    #[test]
+    fn controller_requested_handoff_rotates_token_and_fence() {
+        let mut table = LeaseTable::default();
+        let original = table
+            .acquire(LeaseKind::Driver, "workspace:a", "old", 60_000)
+            .unwrap();
+        table.request_handoff("workspace:a", "new").unwrap();
+        let next = table.take_handoff("workspace:a", "new", 60_000).unwrap();
+        assert_ne!(next.token, original.token);
+        assert!(next.fence > original.fence);
+        assert!(matches!(
+            table.validate("workspace:a", "old", &original.token),
+            Err(LeaseError::OwnedByOther)
+        ));
     }
 
     #[test]
