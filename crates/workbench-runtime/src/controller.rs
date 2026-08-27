@@ -3474,6 +3474,7 @@ impl Controller {
                     destination_path,
                     mode,
                     archive,
+                    (workspace_session_id, &source_authority),
                 );
                 let _ = self.call_registered_executor(
                     source_executor,
@@ -3620,7 +3621,9 @@ impl Controller {
         destination_path: &str,
         mode: &str,
         archive: Value,
+        authority_context: (&str, &Value),
     ) -> Result<Value, RpcError> {
+        let (workspace_session_id, driver_authority) = authority_context;
         let token = required_str(&archive, "token")?.to_owned();
         let expected_digest = required_str(&archive, "digest")?.to_owned();
         let archive_size = archive
@@ -3657,8 +3660,10 @@ impl Controller {
             "{destination_path}.workbench-relay-{}",
             Uuid::new_v4().simple()
         );
-        let authority =
-            json!([{"controllerId": self.id, "resource": resource, "fence": lease.fence}]);
+        let mut authority = driver_authority.as_array().cloned().unwrap_or_default();
+        authority
+            .push(json!({"controllerId": self.id, "resource": resource, "fence": lease.fence}));
+        let authority = Value::Array(authority);
         let result = (|| {
             let prepare_started = Instant::now();
             transfer_event(
@@ -3668,7 +3673,7 @@ impl Controller {
             self.call_registered_executor(
                 destination_executor,
                 "artifact.relay.archive.prepare",
-                json!({"destination": destination_path, "staging": staging, "_authority": authority}),
+                json!({"destination": destination_path, "staging": staging, "_workspaceSessionId": workspace_session_id, "_authority": authority}),
             )
             .map_err(|error| transfer_error(error, "preparing", 0, 0))?;
             transfer_event(
@@ -3688,7 +3693,7 @@ impl Controller {
                     .call_registered_executor(
                         source_executor,
                         "artifact.relay.archive.read",
-                        json!({"token": token, "offset": offset, "limit": 8 * 1024 * 1024}),
+                        json!({"token": token, "offset": offset, "limit": 8 * 1024 * 1024, "_workspaceSessionId": workspace_session_id, "_authority": driver_authority}),
                     )
                     .map_err(|error| transfer_error(error, "reading", offset, chunks))?;
                 let bytes = chunk.get("bytes").and_then(Value::as_u64).ok_or_else(|| {
@@ -3714,7 +3719,7 @@ impl Controller {
                 self.call_registered_executor(
                     destination_executor,
                     "artifact.relay.archive.write",
-                    json!({"destination": destination_path, "staging": staging, "offset": offset, "data": chunk["data"], "_authority": authority}),
+                    json!({"destination": destination_path, "staging": staging, "offset": offset, "data": chunk["data"], "_workspaceSessionId": workspace_session_id, "_authority": authority}),
                 )
                 .map_err(|error| transfer_error(error, "writing", offset, chunks))?;
                 offset = offset.saturating_add(bytes);
@@ -3737,7 +3742,7 @@ impl Controller {
                     json!({
                         "destination": destination_path, "staging": staging,
                         "expectedDigest": expected_digest, "archiveSize": archive_size,
-                        "size": size, "files": files, "kind": kind, "_authority": authority
+                        "size": size, "files": files, "kind": kind, "_workspaceSessionId": workspace_session_id, "_authority": authority
                     }),
                 )
                 .map_err(|error| transfer_error(error, "committing", offset, chunks))?;
@@ -5082,11 +5087,20 @@ mod tests {
         // Keep the executor-owned relay scratch directory outside the artifact
         // itself, as it is in production where state lives beside the socket.
         let source_runtime = Arc::new(
-            crate::ExecutorRuntime::new("source", vec![directory.path().to_path_buf()]).unwrap(),
+            crate::ExecutorRuntime::open(
+                "source",
+                vec![directory.path().to_path_buf()],
+                directory.path().join("source-fences.json"),
+            )
+            .unwrap(),
         );
         let destination_runtime = Arc::new(
-            crate::ExecutorRuntime::new("destination", vec![directory.path().to_path_buf()])
-                .unwrap(),
+            crate::ExecutorRuntime::open(
+                "destination",
+                vec![directory.path().to_path_buf()],
+                directory.path().join("destination-fences.json"),
+            )
+            .unwrap(),
         );
         let source_socket = directory.path().join("source.sock");
         let destination_socket = directory.path().join("destination.sock");
