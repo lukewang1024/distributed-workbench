@@ -2129,7 +2129,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             json!({"path": {"type": "string"}}),
             Vec::new(),
             vec!["path"],
-            600_000,
+            3_600_000,
             RollbackStrategy::None,
             vec!["artifact-digest", "provenance"],
         ),
@@ -3834,6 +3834,12 @@ mod tests {
             contract.input_schema["required"],
             json!(["baselinePath", "generationId", "generationRoot"])
         );
+
+        let describe = capability_catalog()
+            .into_iter()
+            .find(|item| item.name == "artifact.describe")
+            .unwrap();
+        assert_eq!(describe.timeout_ms, 3_600_000);
 
         let patch = capability_catalog()
             .into_iter()
