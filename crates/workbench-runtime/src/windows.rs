@@ -340,30 +340,39 @@ fn spawn_in_active_session(
             std::io::Error::last_os_error().to_string(),
         ));
     }
+    let mut user_token: HANDLE = std::ptr::null_mut();
     let enumerated_sessions = unsafe { std::slice::from_raw_parts(sessions, count as usize) };
-    let active_session = enumerated_sessions
+    let mut candidate_found = false;
+    let mut last_token_error = None;
+    for session in enumerated_sessions
         .iter()
-        .find(|session| session.State == WTSActive)
-        .or_else(|| {
+        .filter(|session| session.State == WTSActive)
+        .chain(
             enumerated_sessions
                 .iter()
-                .find(|session| session.State == WTSDisconnected)
-        })
-        .map(|session| session.SessionId);
-    unsafe { WTSFreeMemory(sessions.cast()) };
-    let session_id = active_session.ok_or_else(|| {
-        RpcError::new(
-            "INTERACTIVE_SESSION_UNAVAILABLE",
-            "no active or disconnected Windows desktop session is available",
+                .filter(|session| session.State == WTSDisconnected),
         )
-    })?;
-
-    let mut user_token: HANDLE = std::ptr::null_mut();
-    if unsafe { WTSQueryUserToken(session_id, &mut user_token) } == 0 {
-        return Err(RpcError::new(
-            "INTERACTIVE_SESSION_TOKEN_FAILED",
-            std::io::Error::last_os_error().to_string(),
-        ));
+    {
+        candidate_found = true;
+        if unsafe { WTSQueryUserToken(session.SessionId, &mut user_token) } != 0 {
+            break;
+        }
+        last_token_error = Some(std::io::Error::last_os_error().to_string());
+    }
+    unsafe { WTSFreeMemory(sessions.cast()) };
+    if user_token.is_null() {
+        let (code, message) = if candidate_found {
+            (
+                "INTERACTIVE_SESSION_TOKEN_FAILED",
+                last_token_error.unwrap_or_else(|| "no session exposes a user token".into()),
+            )
+        } else {
+            (
+                "INTERACTIVE_SESSION_UNAVAILABLE",
+                "no active or disconnected Windows desktop session is available".into(),
+            )
+        };
+        return Err(RpcError::new(code, message));
     }
     let mut primary_token: HANDLE = std::ptr::null_mut();
     let duplicated = unsafe {
