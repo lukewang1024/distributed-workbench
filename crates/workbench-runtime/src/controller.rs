@@ -1911,6 +1911,33 @@ impl Controller {
                         }
                     }
                 }
+                if matches!(
+                    capability_name,
+                    "application.inspect" | "application.materialize"
+                ) {
+                    input["_workspaceSessionId"] = Value::String(workspace_session_id.to_owned());
+                    let path_key = if capability_name == "application.inspect" {
+                        "applicationPath"
+                    } else {
+                        "baselinePath"
+                    };
+                    if let Some(path) = input.get(path_key).and_then(Value::as_str) {
+                        let state = self.state.lock().expect("state lock");
+                        if let Some(grant) = state.read_grants.iter().find(|grant| {
+                            grant.workspace_session_id == workspace_session_id
+                                && grant.executor_id == executor_id
+                                && grant.state == ReadGrantState::Approved
+                                && grant
+                                    .capabilities
+                                    .iter()
+                                    .any(|item| item == "filesystem.read")
+                                && std::path::Path::new(path)
+                                    .starts_with(std::path::Path::new(&grant.real_root))
+                        }) {
+                            input["_readGrantId"] = Value::String(grant.id.clone());
+                        }
+                    }
+                }
                 let invocation_is_readonly = matches!(
                     contract.authority,
                     workbench_schema::CapabilityAuthority::None
