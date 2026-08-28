@@ -1276,7 +1276,7 @@ impl ExecutorRuntime {
             }
             "application.materialize" => {
                 let generation_root = self.path(&params, "generationRoot", false)?;
-                let baseline = self.application_path(&params, "baselinePath")?;
+                let baseline = self.readable_application_path(&params, "baselinePath")?;
                 Ok(serde_json::to_value(materialize(
                     &generation_root,
                     required_str(&params, "generationId")?,
@@ -1317,12 +1317,14 @@ impl ExecutorRuntime {
             }
             #[cfg(target_os = "macos")]
             "application.inspect" => {
-                let application_path = self.application_path(&params, "applicationPath")?;
+                let application_path =
+                    self.readable_application_path(&params, "applicationPath")?;
                 crate::macos::inspect(&application_path)
             }
             #[cfg(windows)]
             "application.inspect" => {
-                let application_path = self.application_path(&params, "applicationPath")?;
+                let application_path =
+                    self.readable_application_path(&params, "applicationPath")?;
                 crate::windows::inspect(&application_path)
             }
             #[cfg(target_os = "macos")]
@@ -1809,6 +1811,18 @@ impl ExecutorRuntime {
                 ),
             ));
         }
+        Ok(checked)
+    }
+
+    fn readable_application_path(&self, params: &Value, key: &str) -> Result<PathBuf, RpcError> {
+        let raw = required_str(params, key)?;
+        let checked = PathBuf::from(raw)
+            .canonicalize()
+            .map_err(|error| io_error("PATH_INVALID", Path::new(raw), error))?;
+        if self.allowed_application_path(&checked) {
+            return Ok(checked);
+        }
+        self.validate_read_grant(params, &checked, "filesystem.read")?;
         Ok(checked)
     }
 
@@ -3567,6 +3581,26 @@ mod tests {
                     serde_json::to_value(&grant).unwrap()
                 ))
                 .ok
+        );
+        let application = downloads.join("Doubao.app");
+        fs::create_dir_all(&application).unwrap();
+        let application_params = json!({
+            "applicationPath": application,
+            "_workspaceSessionId": "workspace-a",
+            "_readGrantId": "grant-a"
+        });
+        assert_eq!(
+            runtime
+                .readable_application_path(&application_params, "applicationPath")
+                .unwrap(),
+            downloads.join("Doubao.app").canonicalize().unwrap()
+        );
+        assert_eq!(
+            runtime
+                .application_path(&application_params, "applicationPath")
+                .unwrap_err()
+                .code,
+            "PATH_OUTSIDE_APPLICATION_ROOTS"
         );
         let allowed = runtime.handle(Request::new(
             "filesystem.read",
