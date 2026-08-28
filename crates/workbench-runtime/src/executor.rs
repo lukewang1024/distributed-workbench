@@ -1797,6 +1797,7 @@ impl ExecutorRuntime {
         Ok(())
     }
 
+    #[cfg(any(target_os = "macos", windows))]
     fn application_path(&self, params: &Value, key: &str) -> Result<PathBuf, RpcError> {
         let raw = required_str(params, key)?;
         let checked = PathBuf::from(raw)
@@ -3595,6 +3596,7 @@ mod tests {
                 .unwrap(),
             downloads.join("Doubao.app").canonicalize().unwrap()
         );
+        #[cfg(target_os = "macos")]
         assert_eq!(
             runtime
                 .application_path(&application_params, "applicationPath")
