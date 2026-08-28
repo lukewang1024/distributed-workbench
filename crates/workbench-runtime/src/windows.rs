@@ -17,8 +17,8 @@ use windows_sys::Win32::{
     System::{
         Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock},
         RemoteDesktop::{
-            WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSEnumerateSessionsW,
-            WTSFreeMemory, WTSQueryUserToken,
+            WTS_CURRENT_SERVER_HANDLE, WTS_SESSION_INFOW, WTSActive, WTSDisconnected,
+            WTSEnumerateSessionsW, WTSFreeMemory, WTSQueryUserToken,
         },
         Threading::{
             CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW,
@@ -340,15 +340,21 @@ fn spawn_in_active_session(
             std::io::Error::last_os_error().to_string(),
         ));
     }
-    let active_session = unsafe { std::slice::from_raw_parts(sessions, count as usize) }
+    let enumerated_sessions = unsafe { std::slice::from_raw_parts(sessions, count as usize) };
+    let active_session = enumerated_sessions
         .iter()
         .find(|session| session.State == WTSActive)
+        .or_else(|| {
+            enumerated_sessions
+                .iter()
+                .find(|session| session.State == WTSDisconnected)
+        })
         .map(|session| session.SessionId);
     unsafe { WTSFreeMemory(sessions.cast()) };
     let session_id = active_session.ok_or_else(|| {
         RpcError::new(
             "INTERACTIVE_SESSION_UNAVAILABLE",
-            "no active Windows desktop session is available",
+            "no active or disconnected Windows desktop session is available",
         )
     })?;
 
