@@ -153,6 +153,7 @@ pub fn record_state(
         "finalized",
         "smoke-passed",
         "ready",
+        "active",
         "failed",
     ];
     if !STATES.contains(&state) {
@@ -480,6 +481,34 @@ mod tests {
             read_directory_link(&root.join("previous"))
                 .unwrap()
                 .ends_with(Path::new("generations/one"))
+        );
+    }
+
+    #[test]
+    fn runtime_record_accepts_active_generation_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let baseline = directory.path().join("Example.app");
+        fs::create_dir(&baseline).unwrap();
+        let root = directory.path().join("client");
+        materialize(&root, "active-generation", &baseline).unwrap();
+
+        let result = record_state(
+            &root,
+            "active-generation",
+            "active",
+            serde_json::json!({"runtimeMarker": {"executorId": "mac-rust"}}),
+        )
+        .unwrap();
+
+        assert_eq!(result["state"], "active");
+        let marker: Value = serde_json::from_slice(
+            &fs::read(root.join("generations/active-generation/generation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["state"], "active");
+        assert_eq!(
+            marker["evidence"]["runtimeMarker"]["executorId"],
+            "mac-rust"
         );
     }
 
