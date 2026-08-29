@@ -3508,7 +3508,7 @@ mod tests {
         );
         assert!(
             descriptor
-                .evidence
+                .emitted_evidence
                 .iter()
                 .any(|item| item == "capture-backend")
         );
