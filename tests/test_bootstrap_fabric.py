@@ -33,6 +33,14 @@ class BootstrapFabricContractTest(unittest.TestCase):
         )
         self.assertIn('wait_peer_generation "$reconnect_host" "$before_generation"', script)
 
+    def test_repair_reconciles_release_drift_after_verify_failure(self) -> None:
+        script = (ROOT / "scripts/repair-fabric.sh").read_text()
+        fallback = script[script.index("verify-only failed; delegating reconciliation") :]
+
+        self.assertIn('run_with_timeout "$timeout_seconds" "$bootstrap"', fallback)
+        self.assertIn('--version "$version"', fallback)
+        self.assertNotIn("--skip-release-install", fallback)
+
     def test_windows_controller_calls_use_stdin_rpc_for_json_safety(self) -> None:
         script = (ROOT / "scripts/bootstrap-fabric.sh").read_text()
         windows_call = script[script.index("windows_call()") : script.index("remote_call()")]

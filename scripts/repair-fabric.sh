@@ -242,7 +242,6 @@ printf '%s\n' 'repair-fabric: verify-only failed; delegating reconciliation'
 run_with_timeout "$timeout_seconds" "$bootstrap" \
   --version "$version" \
   --local-id "$local_id" \
-  --skip-release-install \
   "$@"
 
 printf '%s\n' 'repair-fabric: fabric recovery verified'
