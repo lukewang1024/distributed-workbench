@@ -842,7 +842,8 @@ public static class WorkbenchInput {
 '@
 function Normalize-WorkbenchPath([string]$value) { $full=[IO.Path]::GetFullPath($value);if($full.StartsWith('\\?\')){$full=$full.Substring(4)};$full.TrimEnd('\') }
 $target=Normalize-WorkbenchPath '@TARGET@';$expected='@EXPECTED@';$metadata=Normalize-WorkbenchPath '@METADATA@'
-$actions=@(([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('@ACTIONS@'))) | ConvertFrom-Json)
+$decodedActions=([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('@ACTIONS@'))) | ConvertFrom-Json
+if($decodedActions -is [Array]){$actions=$decodedActions}else{$actions=@($decodedActions)}
 $ErrorActionPreference='Stop'
 try {
   $pids=@(Get-CimInstance Win32_Process|Where-Object{$_.ExecutablePath -and ((Normalize-WorkbenchPath $_.ExecutablePath)-eq $target)}|ForEach-Object{[uint32]$_.ProcessId})
@@ -858,7 +859,7 @@ try {
   $performed=@();foreach($action in $actions){switch($action.type){
     'focus' {[WorkbenchInput]::Focus($selected.Hwnd)}
     'click' {$x=$selected.Rect.Left+[int]$action.x;$y=$selected.Rect.Top+[int]$action.y;if($x -lt $selected.Rect.Left -or $x -ge $selected.Rect.Right -or $y -lt $selected.Rect.Top -or $y -ge $selected.Rect.Bottom){throw 'click coordinates are outside the target window'};if(-not [WorkbenchInput]::SetCursorPos($x,$y)){throw 'SetCursorPos failed'};[WorkbenchInput]::Click([string]$action.button,[int]$action.count)}
-    'key' {[WorkbenchInput]::Key([string]$action.key,@($action.modifiers))}
+    'key' {$modifiers=if($null -eq $action.modifiers){[string[]]@()}else{[string[]]@($action.modifiers|Where-Object{$_})};[WorkbenchInput]::Key([string]$action.key,$modifiers)}
     'text' {[WorkbenchInput]::Text([string]$action.text)}
     'wait' {Start-Sleep -Milliseconds ([int]$action.durationMs)}
     default {throw "unsupported action type: $($action.type)"}
