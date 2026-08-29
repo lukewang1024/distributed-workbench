@@ -658,8 +658,8 @@ function Normalize-WorkbenchPath([string]$value) {
 }
 $target=Normalize-WorkbenchPath '@TARGET@'
 $expected='@EXPECTED@'
-$output='@OUTPUT@'
-$metadata='@METADATA@'
+$output=Normalize-WorkbenchPath '@OUTPUT@'
+$metadata=Normalize-WorkbenchPath '@METADATA@'
 $ErrorActionPreference='Stop'
 try {
 $pids=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ((Normalize-WorkbenchPath $_.ExecutablePath) -eq $target) } | ForEach-Object { [uint32]$_.ProcessId })
