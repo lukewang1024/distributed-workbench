@@ -651,11 +651,16 @@ public static class WorkbenchCapture {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
 }
 '@
-$target=[IO.Path]::GetFullPath('@TARGET@')
+function Normalize-WorkbenchPath([string]$value) {
+  $full=[IO.Path]::GetFullPath($value)
+  if($full.StartsWith('\\?\')) { $full=$full.Substring(4) }
+  $full.TrimEnd('\')
+}
+$target=Normalize-WorkbenchPath '@TARGET@'
 $expected='@EXPECTED@'
 $output='@OUTPUT@'
 $metadata='@METADATA@'
-$pids=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) } | ForEach-Object { [uint32]$_.ProcessId })
+$pids=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ((Normalize-WorkbenchPath $_.ExecutablePath) -eq $target) } | ForEach-Object { [uint32]$_.ProcessId })
 $candidates=New-Object System.Collections.Generic.List[object]
 $callback=[WorkbenchCapture+EnumWindowsProc]{ param($hwnd,$unused)
   if(-not [WorkbenchCapture]::IsWindowVisible($hwnd)) { return $true }

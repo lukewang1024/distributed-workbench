@@ -2684,9 +2684,11 @@ impl Controller {
                     let requested_rank = lease_order_rank(resource);
                     let held = self.leases.lock().expect("lease lock").snapshot();
                     if held.iter().any(|lease| {
+                        let held_rank = lease_order_rank(&lease.resource);
                         lease.owner == owner
                             && lease.resource != resource
-                            && lease_order_rank(&lease.resource) < requested_rank
+                            && held_rank > 0
+                            && held_rank < requested_rank
                     }) {
                         return Err(RpcError::new(
                             "LEASE_ORDER_VIOLATION",
@@ -5649,6 +5651,33 @@ mod tests {
             }),
         ));
         assert_eq!(runtime.error.unwrap().code, "LEASE_ORDER_VIOLATION");
+    }
+
+    #[test]
+    fn unrelated_resource_lease_does_not_block_runtime_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller =
+            Controller::open(JsonStore::new(directory.path().join("controller.json"))).unwrap();
+        assert!(
+            controller
+                .handle(Request::new(
+                    "lease.acquire",
+                    json!({
+                        "resource":"datapack:C:/staging/app.pak", "owner":"publisher", "ttlMs":60000
+                    })
+                ))
+                .ok
+        );
+        let runtime = controller.handle(Request::new(
+            "lease.acquire",
+            json!({
+                "resource":"runtime:windows:doubao", "owner":"publisher", "ttlMs":60000
+            }),
+        ));
+        assert!(
+            runtime.ok,
+            "unranked resource leases must not participate in publish lease ordering"
+        );
     }
 
     #[test]
