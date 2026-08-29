@@ -859,7 +859,7 @@ try {
   $performed=@();foreach($action in $actions){switch($action.type){
     'focus' {[WorkbenchInput]::Focus($selected.Hwnd)}
     'click' {$x=$selected.Rect.Left+[int]$action.x;$y=$selected.Rect.Top+[int]$action.y;if($x -lt $selected.Rect.Left -or $x -ge $selected.Rect.Right -or $y -lt $selected.Rect.Top -or $y -ge $selected.Rect.Bottom){throw 'click coordinates are outside the target window'};if(-not [WorkbenchInput]::SetCursorPos($x,$y)){throw 'SetCursorPos failed'};[WorkbenchInput]::Click([string]$action.button,[int]$action.count)}
-    'key' {$modifiers=if($null -eq $action.modifiers){[string[]]@()}else{[string[]]@($action.modifiers|Where-Object{$_})};[WorkbenchInput]::Key([string]$action.key,$modifiers)}
+    'key' {[string[]]$modifiers=@();if($null -ne $action.modifiers){$modifiers=[string[]]@($action.modifiers|Where-Object{$_})};[WorkbenchInput]::Key([string]$action.key,$modifiers)}
     'text' {[WorkbenchInput]::Text([string]$action.text)}
     'wait' {Start-Sleep -Milliseconds ([int]$action.durationMs)}
     default {throw "unsupported action type: $($action.type)"}
