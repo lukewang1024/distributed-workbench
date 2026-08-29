@@ -32,6 +32,30 @@ if ($LASTEXITCODE -ne 0) { throw "failed to grant fabric IPC directory access" }
 $serviceNamespace = if ($Namespace -eq "stable") { "" } else { (Get-Culture).TextInfo.ToTitleCase($Namespace) }
 $controllerService = "DistributedWorkbench" + $serviceNamespace + "Controller"
 $executorService = "DistributedWorkbench" + $serviceNamespace + "Executor"
+
+# Upgrades must not silently narrow an executor's filesystem grants. Callers
+# may omit machine-specific roots that were supplied during initial bootstrap
+# (for example a data drive backing a junction below C:\Users). Preserve those
+# roots from the existing managed service command line and merge them with the
+# newly requested set.
+$effectiveAllowRoots = [System.Collections.Generic.List[string]]::new()
+function Add-AllowRoot([string]$Root) {
+  if ([string]::IsNullOrWhiteSpace($Root)) { return }
+  if (-not [System.IO.Path]::IsPathRooted($Root)) {
+    throw "allow-root must be absolute: $Root"
+  }
+  if (-not ($effectiveAllowRoots | Where-Object { $_.Equals($Root, [System.StringComparison]::OrdinalIgnoreCase) })) {
+    $effectiveAllowRoots.Add($Root)
+  }
+}
+foreach ($root in $AllowRoot) { Add-AllowRoot $root }
+$existingExecutor = Get-CimInstance Win32_Service -Filter "Name='$executorService'" -ErrorAction SilentlyContinue
+if ($existingExecutor -and $existingExecutor.PathName) {
+  foreach ($match in [regex]::Matches($existingExecutor.PathName, '(?i)--allow-root\s+"([^"]+)"')) {
+    Add-AllowRoot $match.Groups[1].Value
+  }
+}
+
 foreach ($serviceName in @($controllerService, $executorService)) {
   if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
@@ -74,10 +98,8 @@ $executorParts = @(
   "executor", "serve", "--id", (Quote-Arg ($NodeId + "-native"))
   "--state", (Quote-Arg $executorState)
 )
-foreach ($root in @($AllowRoot + $stateRoot)) {
-  if (-not [System.IO.Path]::IsPathRooted($root)) {
-    throw "allow-root must be absolute: $root"
-  }
+Add-AllowRoot $stateRoot
+foreach ($root in $effectiveAllowRoots) {
   $executorParts += @("--allow-root", (Quote-Arg $root))
 }
 $executorArgs = $executorParts -join " "

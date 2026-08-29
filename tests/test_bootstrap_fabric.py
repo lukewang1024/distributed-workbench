@@ -80,6 +80,15 @@ class BootstrapFabricContractTest(unittest.TestCase):
             script,
         )
 
+    def test_windows_upgrade_preserves_existing_allow_roots(self) -> None:
+        script = (ROOT / "scripts/install-windows.ps1").read_text()
+
+        self.assertIn("$existingExecutor.PathName", script)
+        self.assertIn(r"""'(?i)--allow-root\s+"([^"]+)"'""", script)
+        self.assertIn("Add-AllowRoot $match.Groups[1].Value", script)
+        self.assertIn("[System.StringComparison]::OrdinalIgnoreCase", script)
+        self.assertIn("foreach ($root in $effectiveAllowRoots)", script)
+
     def test_os_installers_isolate_canary_namespaces(self) -> None:
         linux = (ROOT / "scripts/install-linux-user.sh").read_text()
         macos = (ROOT / "scripts/install-macos-app.sh").read_text()
