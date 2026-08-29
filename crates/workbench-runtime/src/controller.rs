@@ -4724,6 +4724,11 @@ fn wait_for_tunnel_readiness(
             json!({"processId": process_id, "timeoutMs": timeout_ms}),
         ),
     );
+    if waited.as_ref().is_ok_and(|response| response.ok) {
+        let mut ready = result;
+        ready["observedState"] = json!("ready");
+        return Ok(ready);
+    }
     let current = call_executor(
         endpoint,
         &traced_request("tunnel.get", json!({"tunnelId": tunnel_id})),
@@ -4733,12 +4738,6 @@ fn wait_for_tunnel_readiness(
         && let Some(mut value) = current.result
     {
         if value.get("observedState").and_then(Value::as_str) == Some("ready") {
-            return Ok(value);
-        }
-        if waited.as_ref().is_ok_and(|response| response.ok)
-            && value.get("state").and_then(Value::as_str) == Some("running")
-        {
-            value["observedState"] = json!("ready");
             return Ok(value);
         }
         if let Ok(response) = &waited
@@ -5080,7 +5079,7 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_wait_trusts_successful_readiness_over_a_transient_second_probe() {
+    fn tunnel_wait_returns_after_successful_readiness_without_a_second_query() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("tunnel-ready.sock");
         let server_socket = socket.clone();
@@ -5090,14 +5089,6 @@ mod tests {
                     "readiness.wait" => Response::success(
                         request.request_id,
                         json!({"id": "tunnel-signal", "readiness": {"state": "ready"}}),
-                    ),
-                    "tunnel.get" => Response::success(
-                        request.request_id,
-                        json!({
-                            "tunnelId": "signal",
-                            "state": "running",
-                            "observedState": "starting"
-                        }),
                     ),
                     other => panic!("unexpected action: {other}"),
                 })
@@ -5118,6 +5109,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ready["observedState"], "ready");
+        assert_eq!(ready["state"], "running");
     }
 
     #[test]
