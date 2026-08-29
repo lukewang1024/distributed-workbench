@@ -8,6 +8,13 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 class BootstrapFabricContractTest(unittest.TestCase):
+    def test_supports_linux_local_peer_services(self) -> None:
+        script = (ROOT / "scripts/bootstrap-fabric.sh").read_text()
+
+        self.assertIn("Linux) local_service_manager=systemd", script)
+        self.assertIn("systemctl --user enable --now", script)
+        self.assertIn("distributed-workbench-peer-$peer_host.service", script)
+
     def test_initial_peer_bootstrap_does_not_immediately_kickstart(self) -> None:
         script = (ROOT / "scripts/bootstrap-fabric.sh").read_text()
         install_peer = script[script.index("install_peer_service()") : script.index("reconcile_local_peer_services()")]
@@ -29,6 +36,10 @@ class BootstrapFabricContractTest(unittest.TestCase):
 
         self.assertIn(
             'launchctl kickstart -k "gui/$(id -u)/dev.distributed-workbench.peer.$reconnect_host"',
+            script,
+        )
+        self.assertIn(
+            'systemctl --user restart "distributed-workbench-peer-$reconnect_host.service"',
             script,
         )
         self.assertIn('wait_peer_generation "$reconnect_host" "$before_generation"', script)

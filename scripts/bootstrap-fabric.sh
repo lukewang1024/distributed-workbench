@@ -111,8 +111,14 @@ controller_socket=$state_home/distributed-workbench/controller.sock
 executor_socket=$state_home/distributed-workbench/executor.sock
 peer_root=$state_home/distributed-workbench/peers
 launch_agents=$HOME/Library/LaunchAgents
+systemd_user=$HOME/.config/systemd/user
 peer_template=$script_dir/../packaging/dev.distributed-workbench.peer.plist.in
 remote_peer_template=$script_dir/../packaging/distributed-workbench-peer.service.in
+case $(uname -s) in
+  Darwin) local_service_manager=launchd ;;
+  Linux) local_service_manager=systemd ;;
+  *) printf 'bootstrap-fabric: unsupported local platform: %s\n' "$(uname -s)" >&2; exit 1 ;;
+esac
 app_binary=${XDG_DATA_HOME:-"$HOME/.local/share"}/distributed-workbench/Agent\ Workbench.app/Contents/MacOS/workbench-macos-agent
 if [ -n "${DISTRIBUTED_WORKBENCH_BINARY:-}" ]; then
   workbench=$DISTRIBUTED_WORKBENCH_BINARY
@@ -210,8 +216,30 @@ install_peer_service() {
     remote_state_root=$remote_home/.local/state/distributed-workbench
     remote_executable=.local/bin/workbench
   fi
+  mkdir -p "$peer_dir"
+  if [ "$local_service_manager" = systemd ]; then
+    unit=distributed-workbench-peer-$peer_host.service
+    mkdir -p "$systemd_user"
+    sed \
+      -e "s|@BINARY@|$(escape_sed "$workbench")|g" \
+      -e "s|@PEER_ID@|$peer_host|g" \
+      -e "s|@LOCAL_ID@|$local_id|g" \
+      -e "s|@HOST@|$peer_host|g" \
+      -e "s|@EXPOSE_CONTROLLER_SOCKET@|$(escape_sed "$expose_controller")|g" \
+      -e "s|@EXPOSE_EXECUTOR_SOCKET@|$(escape_sed "$expose_executor")|g" \
+      -e "s|@REMOTE_STATE_ROOT@|$(escape_sed "$remote_state_root")|g" \
+      -e "s|@REMOTE_EXECUTABLE@|$(escape_sed "$remote_executable")|g" \
+      -e "s|@REMOTE_PLATFORM@|$remote_platform|g" \
+      -e "s|@STATE_PATH@|$(escape_sed "$peer_state")|g" \
+      "$remote_peer_template" >"$systemd_user/$unit"
+    if [ -f "$peer_state" ]; then mv "$peer_state" "$peer_state.previous"; fi
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$unit" >/dev/null
+    systemctl --user restart "$unit"
+    return
+  fi
   plist=$launch_agents/dev.distributed-workbench.peer.$peer_host.plist
-  mkdir -p "$peer_dir" "$launch_agents"
+  mkdir -p "$launch_agents"
   plist_temporary=$(mktemp "$plist.tmp.XXXXXX")
   sed \
     -e "s|@EXECUTABLE@|$(escape_sed "$workbench")|g" \
@@ -235,6 +263,34 @@ install_peer_service() {
 }
 
 reconcile_local_peer_services() {
+  if [ "$local_service_manager" = systemd ]; then
+    for stale_unit_path in "$systemd_user"/distributed-workbench-peer-*.service; do
+      test -f "$stale_unit_path" || continue
+      stale_unit=${stale_unit_path##*/}
+      stale_peer=${stale_unit#distributed-workbench-peer-}
+      stale_peer=${stale_peer%.service}
+      case " $nodes " in *" $stale_peer "*) continue ;; esac
+      case $stale_peer in
+        *[!0-9A-Za-z._-]*|'')
+          printf 'bootstrap-fabric: refusing invalid managed peer name: %s\n' "$stale_peer" >&2
+          return 1
+          ;;
+      esac
+      systemctl --user disable --now "$stale_unit" >/dev/null 2>&1 || true
+      rm -f "$stale_unit_path"
+      stale_dir=$peer_root/$stale_peer
+      if [ -d "$stale_dir" ]; then find "$stale_dir" -depth -delete; fi
+      "$workbench" --socket "$controller_socket" call controller.unregister \
+        "{\"controllerId\":\"$stale_peer\"}" >/dev/null
+      "$workbench" --socket "$controller_socket" call executor.unregister \
+        "{\"executorId\":\"$stale_peer-rust\"}" >/dev/null
+      "$workbench" --socket "$controller_socket" call executor.unregister \
+        "{\"executorId\":\"$stale_peer-native\"}" >/dev/null
+      printf 'bootstrap-fabric: removed unselected local peer service: %s\n' "$stale_peer"
+    done
+    systemctl --user daemon-reload
+    return
+  fi
   domain=gui/$(id -u)
   for stale_plist in "$launch_agents"/dev.distributed-workbench.peer.*.plist; do
     test -f "$stale_plist" || continue
@@ -698,7 +754,11 @@ if [ "$verify_only" = false ]; then
       printf 'bootstrap-fabric: missing peer generation before reconnect: %s\n' "$reconnect_host" >&2
       exit 1
     }
-    launchctl kickstart -k "gui/$(id -u)/dev.distributed-workbench.peer.$reconnect_host"
+    if [ "$local_service_manager" = systemd ]; then
+      systemctl --user restart "distributed-workbench-peer-$reconnect_host.service"
+    else
+      launchctl kickstart -k "gui/$(id -u)/dev.distributed-workbench.peer.$reconnect_host"
+    fi
     wait_peer_generation "$reconnect_host" "$before_generation"
   done
 
