@@ -1543,6 +1543,16 @@ impl ExecutorRuntime {
                     &output,
                 )
             }
+            #[cfg(windows)]
+            "ui.capture" => {
+                let application_path = self.application_path(&params, "applicationPath")?;
+                let output = self.path(&params, "output", false)?;
+                crate::windows::capture_window(
+                    &application_path,
+                    params.get("expectedWindowTitle").and_then(Value::as_str),
+                    &output,
+                )
+            }
             #[cfg(target_os = "macos")]
             "ui.native-inspect" => {
                 let application_path = self.application_path(&params, "applicationPath")?;
@@ -2010,6 +2020,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("application.launch", Effect::Mutating),
         ("application.open-file", Effect::Mutating),
         ("ui.evaluate", Effect::ReadOnly),
+        ("ui.capture", Effect::ReadOnly),
         ("ui.native-inspect", Effect::ReadOnly),
     ]);
     capabilities
@@ -2363,6 +2374,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             RollbackStrategy::None,
             vec!["automation-result"],
         ),
+        #[cfg(target_os = "macos")]
         "ui.capture" => (
             vec!["cdp"],
             json!({
@@ -2375,6 +2387,20 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             30_000,
             RollbackStrategy::None,
             vec!["screenshot"],
+        ),
+        #[cfg(windows)]
+        "ui.capture" => (
+            vec!["windows-desktop", "printwindow"],
+            json!({
+                "applicationPath": {"type": "string"},
+                "expectedWindowTitle": {"type": "string"},
+                "output": {"type": "string"}
+            }),
+            Vec::new(),
+            vec!["applicationPath", "expectedWindowTitle", "output"],
+            30_000,
+            RollbackStrategy::None,
+            vec!["screenshot", "capture-backend", "window-bounds"],
         ),
         "ui.native-inspect" => (
             vec!["macos-accessibility"],
@@ -2819,9 +2845,17 @@ fn output_schema(name: &str) -> Value {
         }),
         "ui.inspect" => json!({"targets": {"type": "array"}}),
         "ui.automate" => json!({"target": {"type": "object"}, "result": {}}),
+        #[cfg(target_os = "macos")]
         "ui.capture" => json!({
             "path": {"type": "string"}, "target": {"type": "object"},
             "bytes": {"type": "integer"}, "capturedAt": {"type": "integer"}
+        }),
+        #[cfg(windows)]
+        "ui.capture" => json!({
+            "path": {"type": "string"},
+            "applicationPath": {"type": "string"}, "executable": {"type": "string"},
+            "capture": {"type": "object"}, "bytes": {"type": "integer"},
+            "capturedAt": {"type": "integer"}
         }),
         "logs.read" => json!({
             "processId": {"type": "string"}, "path": {"type": "string"},
@@ -3457,6 +3491,30 @@ mod tests {
                 .iter()
                 .any(|field| field == "handlerPath"),
             "handlerPath is an explicit override, not a required Browser path"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_capture_contract_requires_a_scoped_application_and_output() {
+        let descriptor = contract("ui.capture", Effect::ReadOnly);
+        assert_eq!(
+            descriptor.input_schema["properties"]["applicationPath"]["type"],
+            "string"
+        );
+        assert_eq!(
+            descriptor.input_schema["properties"]["output"]["type"],
+            "string"
+        );
+        assert!(
+            descriptor
+                .evidence
+                .iter()
+                .any(|item| item == "capture-backend")
+        );
+        assert_eq!(
+            descriptor.output_schema["properties"]["capture"]["type"],
+            "object"
         );
     }
 
