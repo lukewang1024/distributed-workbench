@@ -660,6 +660,8 @@ $target=Normalize-WorkbenchPath '@TARGET@'
 $expected='@EXPECTED@'
 $output='@OUTPUT@'
 $metadata='@METADATA@'
+$ErrorActionPreference='Stop'
+try {
 $pids=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ((Normalize-WorkbenchPath $_.ExecutablePath) -eq $target) } | ForEach-Object { [uint32]$_.ProcessId })
 $candidates=New-Object System.Collections.Generic.List[object]
 $callback=[WorkbenchCapture+EnumWindowsProc]{ param($hwnd,$unused)
@@ -715,6 +717,10 @@ $result=[pscustomobject]@{
   width=$width;height=$height;originX=$rect.Left;originY=$rect.Top;metrics=$capture.Metrics
 }
 [IO.File]::WriteAllText($metadata,($result|ConvertTo-Json -Depth 5 -Compress),(New-Object Text.UTF8Encoding($false)))
+} catch {
+  $failure=[pscustomobject]@{error=$_.Exception.ToString();scriptStack=$_.ScriptStackTrace}
+  [IO.File]::WriteAllText($metadata,($failure|ConvertTo-Json -Depth 5 -Compress),(New-Object Text.UTF8Encoding($false)))
+}
 "#
     .replace("@TARGET@", &quote(&executable))
     .replace(
@@ -734,7 +740,7 @@ $result=[pscustomobject]@{
         application,
     )?;
     let deadline = Instant::now() + Duration::from_secs(15);
-    while (!metadata_path.is_file() || !output.is_file()) && Instant::now() < deadline {
+    while !metadata_path.is_file() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(100));
     }
     let metadata = fs::read(&metadata_path)
@@ -742,6 +748,11 @@ $result=[pscustomobject]@{
     let _ = fs::remove_file(&metadata_path);
     let capture: Value = serde_json::from_slice(&metadata)
         .map_err(|error| RpcError::new("WINDOW_CAPTURE_FAILED", error.to_string()))?;
+    if let Some(error) = capture.get("error").and_then(Value::as_str) {
+        let mut failure = RpcError::new("WINDOW_CAPTURE_FAILED", error);
+        failure.details = capture;
+        return Err(failure);
+    }
     let bytes = fs::metadata(output)
         .map_err(|error| RpcError::new("WINDOW_CAPTURE_FAILED", error.to_string()))?
         .len();
