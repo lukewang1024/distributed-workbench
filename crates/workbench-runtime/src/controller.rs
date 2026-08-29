@@ -4735,6 +4735,12 @@ fn wait_for_tunnel_readiness(
         if value.get("observedState").and_then(Value::as_str) == Some("ready") {
             return Ok(value);
         }
+        if waited.as_ref().is_ok_and(|response| response.ok)
+            && value.get("state").and_then(Value::as_str) == Some("running")
+        {
+            value["observedState"] = json!("ready");
+            return Ok(value);
+        }
         if let Ok(response) = &waited
             && !response.ok
             && let Some(error) = &response.error
@@ -5071,6 +5077,47 @@ mod tests {
         assert_eq!(pending["observedState"], "pending");
         assert_eq!(pending["pendingReason"], "tunnel probe timed out");
         assert_eq!(pending["retryable"], true);
+    }
+
+    #[test]
+    fn tunnel_wait_trusts_successful_readiness_over_a_transient_second_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("tunnel-ready.sock");
+        let server_socket = socket.clone();
+        std::thread::spawn(move || {
+            RpcServer::new(server_socket)
+                .serve(move |request| match request.action.as_str() {
+                    "readiness.wait" => Response::success(
+                        request.request_id,
+                        json!({"id": "tunnel-signal", "readiness": {"state": "ready"}}),
+                    ),
+                    "tunnel.get" => Response::success(
+                        request.request_id,
+                        json!({
+                            "tunnelId": "signal",
+                            "state": "running",
+                            "observedState": "starting"
+                        }),
+                    ),
+                    other => panic!("unexpected action: {other}"),
+                })
+                .unwrap()
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let endpoint: ExecutorEndpoint =
+            serde_json::from_value(json!({"transport": "local", "socket": socket})).unwrap();
+        let ready = wait_for_tunnel_readiness(
+            &endpoint,
+            &json!({"tunnelId": "signal", "readinessTimeoutMs": 2_000}),
+            json!({"tunnelId": "signal", "state": "running", "observedState": "starting"}),
+        )
+        .unwrap();
+        assert_eq!(ready["observedState"], "ready");
     }
 
     #[test]
