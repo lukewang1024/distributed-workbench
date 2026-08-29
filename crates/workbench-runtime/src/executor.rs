@@ -1563,6 +1563,20 @@ impl ExecutorRuntime {
                     &output,
                 )
             }
+            #[cfg(windows)]
+            "ui.input" => {
+                let application_path = self.application_path(&params, "applicationPath")?;
+                crate::windows::input_window(
+                    &application_path,
+                    params.get("expectedWindowTitle").and_then(Value::as_str),
+                    params
+                        .get("actions")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| {
+                            RpcError::new("INVALID_PARAMS", "actions must be an array")
+                        })?,
+                )
+            }
             #[cfg(target_os = "macos")]
             "ui.native-inspect" => {
                 let application_path = self.application_path(&params, "applicationPath")?;
@@ -2021,6 +2035,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("application.open-file", Effect::Mutating),
         ("ui.evaluate", Effect::ReadOnly),
         ("ui.capture", Effect::ReadOnly),
+        ("ui.input", Effect::Mutating),
         ("ui.native-inspect", Effect::ReadOnly),
     ]);
     capabilities
@@ -2402,6 +2417,42 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             RollbackStrategy::None,
             vec!["screenshot", "capture-backend", "window-bounds"],
         ),
+        #[cfg(windows)]
+        "ui.input" => (
+            vec!["windows-desktop", "send-input"],
+            json!({
+                "applicationPath": {"type": "string"},
+                "expectedWindowTitle": {"type": "string"},
+                "remoteDebuggingPort": {"type": "integer"},
+                "actions": {
+                    "type": "array", "minItems": 1, "maxItems": 100,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"enum": ["focus", "click", "key", "text", "wait"]},
+                            "x": {"type": "integer"}, "y": {"type": "integer"},
+                            "button": {"enum": ["left", "right", "middle"]},
+                            "count": {"type": "integer", "minimum": 1, "maximum": 3},
+                            "key": {"type": "string"},
+                            "modifiers": {"type": "array", "items": {"enum": ["ALT", "CTRL", "SHIFT", "WIN"]}},
+                            "text": {"type": "string", "maxLength": 16384},
+                            "durationMs": {"type": "integer", "minimum": 0, "maximum": 5000}
+                        },
+                        "required": ["type"], "additionalProperties": false
+                    }
+                }
+            }),
+            vec!["ui-target:${remoteDebuggingPort}"],
+            vec![
+                "applicationPath",
+                "expectedWindowTitle",
+                "remoteDebuggingPort",
+                "actions",
+            ],
+            30_000,
+            RollbackStrategy::None,
+            vec!["input-actions", "target-window", "window-bounds"],
+        ),
         "ui.native-inspect" => (
             vec!["macos-accessibility"],
             json!({
@@ -2680,7 +2731,7 @@ fn capability_authority(name: &str) -> CapabilityAuthority {
         | "application.runtime.record" => CapabilityAuthority::ResourceLease {
             resource: "runtime:${executorId}:doubao".to_owned(),
         },
-        "ui.automate" => CapabilityAuthority::ResourceLease {
+        "ui.automate" | "ui.input" => CapabilityAuthority::ResourceLease {
             resource: "acceptance:${executorId}:${remoteDebuggingPort}".to_owned(),
         },
         _ => CapabilityAuthority::WorkspaceDriver,
@@ -2856,6 +2907,12 @@ fn output_schema(name: &str) -> Value {
             "applicationPath": {"type": "string"}, "executable": {"type": "string"},
             "capture": {"type": "object"}, "bytes": {"type": "integer"},
             "capturedAt": {"type": "integer"}
+        }),
+        #[cfg(windows)]
+        "ui.input" => json!({
+            "applicationPath": {"type": "string"}, "executable": {"type": "string"},
+            "target": {"type": "object"}, "actions": {"type": "array"},
+            "inputAt": {"type": "integer"}
         }),
         "logs.read" => json!({
             "processId": {"type": "string"}, "path": {"type": "string"},
@@ -3644,6 +3701,26 @@ mod tests {
             descriptor.output_schema["properties"]["capture"]["type"],
             "object"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_input_contract_is_scoped_and_acceptance_fenced() {
+        let descriptor = contract("ui.input", Effect::Mutating);
+        assert_eq!(
+            descriptor.input_schema["properties"]["applicationPath"]["type"],
+            "string"
+        );
+        assert_eq!(
+            descriptor.input_schema["properties"]["actions"]["maxItems"],
+            100
+        );
+        assert_eq!(descriptor.locks[0].key, "ui-target:${remoteDebuggingPort}");
+        assert!(matches!(
+            descriptor.authority,
+            CapabilityAuthority::ResourceLease { .. }
+        ));
+        assert_eq!(descriptor.effect, Effect::Mutating);
     }
 
     #[test]

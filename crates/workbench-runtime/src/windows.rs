@@ -1,4 +1,5 @@
-use serde_json::{Value, json};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use serde_json::{Map, Value, json};
 use std::{
     fs,
     io::{Read, Write},
@@ -764,6 +765,255 @@ $result=[pscustomobject]@{
         "capture": capture,
         "capturedAt": now_ms(),
     }))
+}
+
+pub fn input_window(
+    application: &Path,
+    expected_window_title: Option<&str>,
+    actions: &[Value],
+) -> Result<Value, RpcError> {
+    let executable = find_executable(application)
+        .ok_or_else(|| RpcError::new("WINDOW_INPUT_FAILED", "application executable is missing"))?;
+    if actions.is_empty() || actions.len() > 100 {
+        return Err(RpcError::new(
+            "INVALID_PARAMS",
+            "actions must contain between 1 and 100 items",
+        ));
+    }
+    let normalized = actions
+        .iter()
+        .enumerate()
+        .map(|(index, action)| normalize_input_action(index, action))
+        .collect::<Result<Vec<_>, _>>()?;
+    let parent = application.parent().unwrap_or(application);
+    let metadata_path = parent.join(format!(
+        ".workbench-window-input-{}-{}.json",
+        std::process::id(),
+        now_ms()
+    ));
+    let payload = BASE64.encode(
+        serde_json::to_vec(&normalized)
+            .map_err(|error| RpcError::new("WINDOW_INPUT_FAILED", error.to_string()))?,
+    );
+    let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
+    let script = r###"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+public static class WorkbenchInput {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public InputUnion U; }
+  [StructLayout(LayoutKind.Explicit)] public struct InputUnion { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
+  [StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx,dy; public uint mouseData,dwFlags,time; public UIntPtr dwExtraInfo; }
+  [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk,wScan; public uint dwFlags,time; public UIntPtr dwExtraInfo; }
+  [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr value);
+  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr window, out RECT rect);
+  [DllImport("user32.dll")] public static extern int GetWindowTextLengthW(IntPtr window);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr window,StringBuilder text,int count);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
+  [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr window);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr window,int command);
+  [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+  [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+  [DllImport("user32.dll")] static extern bool AttachThreadInput(uint source,uint target,bool attach);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y);
+  [DllImport("user32.dll",SetLastError=true)] static extern uint SendInput(uint count,INPUT[] inputs,int size);
+  const uint Keyboard=1,Mouse=0,KeyUp=2,Unicode=4;
+  static INPUT K(ushort vk,ushort scan,uint flags) { return new INPUT { type=Keyboard,U=new InputUnion { ki=new KEYBDINPUT { wVk=vk,wScan=scan,dwFlags=flags } } }; }
+  static INPUT M(uint flags) { return new INPUT { type=Mouse,U=new InputUnion { mi=new MOUSEINPUT { dwFlags=flags } } }; }
+  static void Send(INPUT[] values) { if(SendInput((uint)values.Length,values,Marshal.SizeOf(typeof(INPUT)))!=values.Length) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"SendInput failed"); }
+  public static void Focus(IntPtr window) { uint ignored;uint foreground=GetWindowThreadProcessId(GetForegroundWindow(),out ignored);uint current=GetCurrentThreadId();bool attached=foreground!=0&&foreground!=current&&AttachThreadInput(current,foreground,true);try{ShowWindowAsync(window,9);BringWindowToTop(window);if(!SetForegroundWindow(window))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"SetForegroundWindow failed");}finally{if(attached)AttachThreadInput(current,foreground,false);} }
+  public static void Text(string value) { foreach(char ch in value) Send(new[]{K(0,ch,Unicode),K(0,ch,Unicode|KeyUp)}); }
+  public static void Click(string button,int count) { uint down=2,up=4; if(button=="right"){down=8;up=16;} if(button=="middle"){down=32;up=64;} for(int i=0;i<count;i++){Send(new[]{M(down),M(up)});Thread.Sleep(80);} }
+  static ushort Modifier(string value) { switch(value){case "ALT":return 18;case "CTRL":return 17;case "SHIFT":return 16;case "WIN":return 91;default:throw new ArgumentException("unsupported modifier: "+value);} }
+  static ushort KeyCode(string value) {
+    var keys=new Dictionary<string,ushort>{{"BACKSPACE",8},{"TAB",9},{"ENTER",13},{"ESC",27},{"SPACE",32},{"PAGEUP",33},{"PAGEDOWN",34},{"END",35},{"HOME",36},{"LEFT",37},{"UP",38},{"RIGHT",39},{"DOWN",40},{"INSERT",45},{"DELETE",46},{"F1",112},{"F2",113},{"F3",114},{"F4",115},{"F5",116},{"F6",117},{"F7",118},{"F8",119},{"F9",120},{"F10",121},{"F11",122},{"F12",123}};
+    ushort code;if(keys.TryGetValue(value,out code))return code;if(value.Length==1){char ch=Char.ToUpperInvariant(value[0]);if((ch>='A'&&ch<='Z')||(ch>='0'&&ch<='9'))return ch;}throw new ArgumentException("unsupported key: "+value);
+  }
+  public static void Key(string key,string[] modifiers) { var values=new List<INPUT>();foreach(string modifier in modifiers)values.Add(K(Modifier(modifier),0,0));ushort code=KeyCode(key);values.Add(K(code,0,0));values.Add(K(code,0,KeyUp));for(int i=modifiers.Length-1;i>=0;i--)values.Add(K(Modifier(modifiers[i]),0,KeyUp));Send(values.ToArray()); }
+}
+'@
+function Normalize-WorkbenchPath([string]$value) { $full=[IO.Path]::GetFullPath($value);if($full.StartsWith('\\?\')){$full=$full.Substring(4)};$full.TrimEnd('\') }
+$target=Normalize-WorkbenchPath '@TARGET@';$expected='@EXPECTED@';$metadata=Normalize-WorkbenchPath '@METADATA@'
+$actions=@(([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('@ACTIONS@'))) | ConvertFrom-Json)
+$ErrorActionPreference='Stop'
+try {
+  $pids=@(Get-CimInstance Win32_Process|Where-Object{$_.ExecutablePath -and ((Normalize-WorkbenchPath $_.ExecutablePath)-eq $target)}|ForEach-Object{[uint32]$_.ProcessId})
+  $windows=New-Object Collections.Generic.List[object]
+  $callback=[WorkbenchInput+EnumWindowsProc]{param($hwnd,$unused)
+    if(-not [WorkbenchInput]::IsWindowVisible($hwnd)){return $true};$pidValue=[uint32]0;[WorkbenchInput]::GetWindowThreadProcessId($hwnd,[ref]$pidValue)|Out-Null;if($pids -notcontains $pidValue){return $true}
+    $rect=New-Object WorkbenchInput+RECT;if(-not [WorkbenchInput]::GetWindowRect($hwnd,[ref]$rect)){return $true};$length=[WorkbenchInput]::GetWindowTextLengthW($hwnd);$builder=New-Object Text.StringBuilder ($length+1);[WorkbenchInput]::GetWindowTextW($hwnd,$builder,$builder.Capacity)|Out-Null;$title=$builder.ToString()
+    $matches=[string]::IsNullOrWhiteSpace($expected)-or $title.IndexOf($expected,[StringComparison]::OrdinalIgnoreCase)-ge 0;$area=[int64]($rect.Right-$rect.Left)*[int64]($rect.Bottom-$rect.Top);$windows.Add([pscustomobject]@{Hwnd=$hwnd;Pid=$pidValue;Rect=$rect;Title=$title;Matches=$matches;Area=$area});return $true
+  }
+  [WorkbenchInput]::EnumWindows($callback,[IntPtr]::Zero)|Out-Null;$selected=$windows|Sort-Object @{Expression='Matches';Descending=$true},@{Expression='Area';Descending=$true}|Select-Object -First 1
+  if(-not $selected){throw 'no visible application window found'};if(-not $selected.Matches){throw "no application window matched expected title '$expected'"}
+  [WorkbenchInput]::Focus($selected.Hwnd);Start-Sleep -Milliseconds 250
+  $performed=@();foreach($action in $actions){switch($action.type){
+    'focus' {[WorkbenchInput]::Focus($selected.Hwnd)}
+    'click' {$x=$selected.Rect.Left+[int]$action.x;$y=$selected.Rect.Top+[int]$action.y;if($x -lt $selected.Rect.Left -or $x -ge $selected.Rect.Right -or $y -lt $selected.Rect.Top -or $y -ge $selected.Rect.Bottom){throw 'click coordinates are outside the target window'};if(-not [WorkbenchInput]::SetCursorPos($x,$y)){throw 'SetCursorPos failed'};[WorkbenchInput]::Click([string]$action.button,[int]$action.count)}
+    'key' {[WorkbenchInput]::Key([string]$action.key,@($action.modifiers))}
+    'text' {[WorkbenchInput]::Text([string]$action.text)}
+    'wait' {Start-Sleep -Milliseconds ([int]$action.durationMs)}
+    default {throw "unsupported action type: $($action.type)"}
+  };$performed+=$action.type;Start-Sleep -Milliseconds 60}
+  $result=[pscustomobject]@{applicationPath='@APPLICATION@';executable=$target;target=[pscustomobject]@{pid=$selected.Pid;handle=[int64]$selected.Hwnd;title=$selected.Title;left=$selected.Rect.Left;top=$selected.Rect.Top;width=($selected.Rect.Right-$selected.Rect.Left);height=($selected.Rect.Bottom-$selected.Rect.Top)};actions=$performed;inputAt=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()}
+  [IO.File]::WriteAllText($metadata,($result|ConvertTo-Json -Depth 6 -Compress),(New-Object Text.UTF8Encoding($false)))
+} catch {$failure=[pscustomobject]@{error=$_.Exception.ToString();scriptStack=$_.ScriptStackTrace};[IO.File]::WriteAllText($metadata,($failure|ConvertTo-Json -Depth 5 -Compress),(New-Object Text.UTF8Encoding($false)))}
+"###
+    .replace("@TARGET@", &quote(&executable))
+    .replace(
+        "@EXPECTED@",
+        &expected_window_title.unwrap_or_default().replace('\'', "''"),
+    )
+    .replace("@METADATA@", &quote(&metadata_path))
+    .replace("@APPLICATION@", &quote(application))
+    .replace("@ACTIONS@", &payload);
+    spawn_in_active_session(
+        Path::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+        &[
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-STA".to_owned(),
+            "-Command".to_owned(),
+            script,
+        ],
+        application,
+    )?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !metadata_path.is_file() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(100));
+    }
+    let metadata = fs::read(&metadata_path)
+        .map_err(|error| RpcError::new("WINDOW_INPUT_FAILED", error.to_string()))?;
+    let _ = fs::remove_file(&metadata_path);
+    let result: Value = serde_json::from_slice(&metadata)
+        .map_err(|error| RpcError::new("WINDOW_INPUT_FAILED", error.to_string()))?;
+    if let Some(error) = result.get("error").and_then(Value::as_str) {
+        let mut failure = RpcError::new("WINDOW_INPUT_FAILED", error);
+        failure.details = result;
+        return Err(failure);
+    }
+    Ok(result)
+}
+
+fn normalize_input_action(index: usize, action: &Value) -> Result<Value, RpcError> {
+    let object = action
+        .as_object()
+        .ok_or_else(|| invalid_action(index, "must be an object"))?;
+    let kind = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_action(index, "type is required"))?;
+    let mut result = Map::new();
+    result.insert("type".to_owned(), json!(kind));
+    match kind {
+        "focus" => ensure_action_fields(index, object, &["type"]),
+        "click" => {
+            ensure_action_fields(index, object, &["type", "x", "y", "button", "count"])?;
+            let x = action_i64(index, object, "x")?;
+            let y = action_i64(index, object, "y")?;
+            let button = object
+                .get("button")
+                .and_then(Value::as_str)
+                .unwrap_or("left");
+            if !matches!(button, "left" | "right" | "middle") {
+                return Err(invalid_action(index, "invalid button"));
+            }
+            let count = object.get("count").and_then(Value::as_u64).unwrap_or(1);
+            if !(1..=3).contains(&count) {
+                return Err(invalid_action(index, "count must be 1..3"));
+            }
+            result.extend([
+                ("x".into(), json!(x)),
+                ("y".into(), json!(y)),
+                ("button".into(), json!(button)),
+                ("count".into(), json!(count)),
+            ]);
+            Ok(())
+        }
+        "key" => {
+            ensure_action_fields(index, object, &["type", "key", "modifiers"])?;
+            let key = object
+                .get("key")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| invalid_action(index, "key is required"))?;
+            let modifiers = object
+                .get("modifiers")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if modifiers.len() > 4
+                || modifiers
+                    .iter()
+                    .any(|value| !matches!(value.as_str(), Some("ALT" | "CTRL" | "SHIFT" | "WIN")))
+            {
+                return Err(invalid_action(index, "invalid modifier"));
+            }
+            result.insert("key".into(), json!(key));
+            result.insert("modifiers".into(), json!(modifiers));
+            Ok(())
+        }
+        "text" => {
+            ensure_action_fields(index, object, &["type", "text"])?;
+            let text = object
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid_action(index, "text is required"))?;
+            if text.encode_utf16().count() > 16_384 {
+                return Err(invalid_action(index, "text is too long"));
+            }
+            result.insert("text".into(), json!(text));
+            Ok(())
+        }
+        "wait" => {
+            ensure_action_fields(index, object, &["type", "durationMs"])?;
+            let duration = object
+                .get("durationMs")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| invalid_action(index, "durationMs is required"))?;
+            if duration > 5_000 {
+                return Err(invalid_action(index, "durationMs exceeds 5000"));
+            }
+            result.insert("durationMs".into(), json!(duration));
+            Ok(())
+        }
+        _ => Err(invalid_action(index, "unsupported action type")),
+    }?;
+    Ok(Value::Object(result))
+}
+
+fn ensure_action_fields(
+    index: usize,
+    object: &Map<String, Value>,
+    allowed: &[&str],
+) -> Result<(), RpcError> {
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(invalid_action(
+            index,
+            &format!("unsupported field: {field}"),
+        ));
+    }
+    Ok(())
+}
+fn action_i64(index: usize, object: &Map<String, Value>, field: &str) -> Result<i64, RpcError> {
+    object
+        .get(field)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| invalid_action(index, &format!("{field} must be an integer")))
+}
+fn invalid_action(index: usize, message: &str) -> RpcError {
+    RpcError::new("INVALID_PARAMS", format!("actions[{index}]: {message}"))
 }
 
 fn cdp_json(port: u16, path: &str) -> Result<Value, RpcError> {
