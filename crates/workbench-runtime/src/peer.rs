@@ -186,6 +186,20 @@ impl Drop for PeerSocketLease {
     }
 }
 
+#[cfg(unix)]
+impl Drop for PeerSocketLease {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // Release synchronously. Relying only on close makes the immediate
+        // supervisor restart test timing-sensitive when the test harness is
+        // concurrently opening other advisory locks in the same process.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PeerBridge {
     writer: SharedWriter,
