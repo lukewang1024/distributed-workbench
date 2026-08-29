@@ -80,6 +80,15 @@ class BootstrapFabricContractTest(unittest.TestCase):
             script,
         )
 
+    def test_remote_reconcile_preserves_non_fabric_executors(self) -> None:
+        script = (ROOT / "scripts/bootstrap-fabric.sh").read_text()
+        reconcile = script[
+            script.index("reconcile_remote_posix_peer_services()") : script.index("platform_of()")
+        ]
+
+        self.assertIn("managed_controllers=' '", reconcile)
+        self.assertIn('case \\\"\\$managed_controllers\\\" in', reconcile)
+
     def test_windows_upgrade_preserves_existing_allow_roots(self) -> None:
         script = (ROOT / "scripts/install-windows.ps1").read_text()
 
