@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use workbench_core::{atomic_replace, now_ms};
 use workbench_protocol::RpcError;
@@ -137,6 +139,268 @@ pub fn apply_overlays(application_path: &Path, overlays: &[Overlay]) -> Result<V
         }));
     }
     Ok(serde_json::json!({"applied": applied}))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataPackResourceTree {
+    pub root_relative: PathBuf,
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub exclude_source_maps: bool,
+    #[serde(default)]
+    pub exclude_root_files: Vec<String>,
+}
+
+/// Rebuild the Chromium DataPack consumed by Windows Doubao Office from the
+/// final expanded resource tree. This intentionally runs after every overlay,
+/// so the pack and the loose runtime cannot represent different generations.
+pub fn pack_chromium_datapack(
+    root_path: &Path,
+    resource_trees: &[DataPackResourceTree],
+    output_relative: &Path,
+    platform: &str,
+    arch: &str,
+    bundle_name: &str,
+) -> Result<Value, RpcError> {
+    validate_relative(output_relative)?;
+    let mut resources = Vec::new();
+    for tree in resource_trees {
+        validate_relative(&tree.root_relative)?;
+        if !tree.prefix.is_empty()
+            && (tree.prefix.starts_with('/')
+                || tree.prefix.contains('\\')
+                || tree
+                    .prefix
+                    .split('/')
+                    .any(|part| part.is_empty() || part == "." || part == ".."))
+        {
+            return Err(RpcError::new(
+                "DATAPACK_PREFIX_INVALID",
+                format!(
+                    "DataPack prefix is not a safe resource path: {}",
+                    tree.prefix
+                ),
+            ));
+        }
+        let tree_root = root_path.join(&tree.root_relative);
+        if !tree_root.is_dir() {
+            return Err(RpcError::new(
+                "DATAPACK_INPUT_MISSING",
+                format!("DataPack resource root is missing: {}", tree_root.display()),
+            ));
+        }
+        collect_pack_tree(
+            &tree_root,
+            &tree_root,
+            &tree.prefix,
+            tree.exclude_source_maps,
+            &tree.exclude_root_files,
+            &mut resources,
+        )?;
+    }
+    resources.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    for pair in resources.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            return Err(RpcError::new(
+                "OFFICE_PACK_DUPLICATE_PATH",
+                format!("duplicate packed resource path: {}", pair[0].0),
+            ));
+        }
+    }
+    if resources.is_empty() {
+        return Err(RpcError::new(
+            "OFFICE_PACK_EMPTY",
+            "no Office resources to pack",
+        ));
+    }
+    let resource_count = resources.len() + 1;
+    if resource_count > u16::MAX as usize {
+        return Err(RpcError::new(
+            "OFFICE_PACK_RESOURCE_LIMIT",
+            format!("DataPack resource limit exceeded: {resource_count}"),
+        ));
+    }
+
+    let mut content_digest = Sha256::new();
+    for (relative, path) in &resources {
+        content_digest.update(relative.as_bytes());
+        content_digest.update([0]);
+        hash_file_into(path, &mut content_digest)?;
+    }
+    let content_hash = hex::encode(content_digest.finalize());
+    let manifest = serde_json::to_vec(&serde_json::json!({
+        "arch": arch,
+        "bundle_name": bundle_name,
+        "code_cache": Value::Null,
+        "content_hash": content_hash.clone(),
+        "entries": resources.iter().enumerate().map(|(index, (relative, _))| {
+            serde_json::json!({"id": index + 2, "path": relative})
+        }).collect::<Vec<_>>(),
+        "platform": platform,
+        "tool_version": "1",
+        "v8_version": "",
+    }))
+    .expect("Office pack manifest serializes");
+
+    let header_size = 12_u64;
+    let index_size = ((resource_count + 1) * 6) as u64;
+    let mut offsets = Vec::with_capacity(resource_count + 1);
+    offsets.push(header_size + index_size);
+    offsets.push(offsets[0] + manifest.len() as u64);
+    for (_, path) in &resources {
+        let size = fs::metadata(path)
+            .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?
+            .len();
+        offsets.push(offsets.last().copied().unwrap_or(0) + size);
+    }
+    if offsets.last().copied().unwrap_or(0) > u32::MAX as u64 {
+        return Err(RpcError::new(
+            "OFFICE_PACK_SIZE_LIMIT",
+            format!(
+                "DataPack exceeds 4 GiB offset limit: {}",
+                offsets.last().unwrap()
+            ),
+        ));
+    }
+
+    let output = root_path.join(output_relative);
+    let parent = output.parent().ok_or_else(|| {
+        RpcError::new(
+            "OFFICE_PACK_OUTPUT_INVALID",
+            "Office pack output has no parent",
+        )
+    })?;
+    fs::create_dir_all(parent)
+        .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", parent, error))?;
+    let temporary = parent.join(format!(".doubao_office.pak.{}.tmp", std::process::id()));
+    let result = (|| -> Result<(), RpcError> {
+        let mut target = fs::File::create(&temporary)
+            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        target
+            .write_all(&5_u32.to_le_bytes())
+            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        target
+            .write_all(&[0, 0, 0, 0])
+            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        target
+            .write_all(&(resource_count as u16).to_le_bytes())
+            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        target
+            .write_all(&0_u16.to_le_bytes())
+            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        for (index, offset) in offsets.iter().take(resource_count).enumerate() {
+            target
+                .write_all(&((index + 1) as u16).to_le_bytes())
+                .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            target
+                .write_all(&(*offset as u32).to_le_bytes())
+                .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        }
+        target
+            .write_all(&0_u16.to_le_bytes())
+            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        target
+            .write_all(&(offsets[resource_count] as u32).to_le_bytes())
+            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        target
+            .write_all(&manifest)
+            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        for (_, path) in &resources {
+            let mut source = fs::File::open(path)
+                .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?;
+            std::io::copy(&mut source, &mut target)
+                .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        }
+        target
+            .sync_all()
+            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        atomic_replace(&temporary, &output)
+            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &output, error))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+
+    let mut digest = Sha256::new();
+    hash_file_into(&output, &mut digest)?;
+    Ok(serde_json::json!({
+        "output": output,
+        "resources": resource_count,
+        "entries": resources.len(),
+        "size": fs::metadata(&output).map_err(|error| io_error("OFFICE_PACK_READ_FAILED", &output, error))?.len(),
+        "sha256": format!("sha256:{}", hex::encode(digest.finalize())),
+        "contentHash": format!("sha256:{content_hash}"),
+    }))
+}
+
+fn collect_pack_tree(
+    root: &Path,
+    current: &Path,
+    prefix: &str,
+    exclude_source_maps: bool,
+    exclude_root_files: &[String],
+    resources: &mut Vec<(String, PathBuf)>,
+) -> Result<(), RpcError> {
+    let mut entries = fs::read_dir(current)
+        .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", current, error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", current, error))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", &path, error))?;
+        if metadata.is_dir() {
+            collect_pack_tree(
+                root,
+                &path,
+                prefix,
+                exclude_source_maps,
+                exclude_root_files,
+                resources,
+            )?;
+        } else if metadata.is_file() {
+            let relative = path.strip_prefix(root).expect("walk remains under root");
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if (!relative.contains('/')
+                && exclude_root_files
+                    .iter()
+                    .any(|excluded| excluded == &relative))
+                || (exclude_source_maps && relative.ends_with(".map"))
+            {
+                continue;
+            }
+            resources.push((
+                if prefix.is_empty() {
+                    relative
+                } else {
+                    format!("{prefix}/{relative}")
+                },
+                path,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hash_file_into(path: &Path, digest: &mut Sha256) -> Result<(), RpcError> {
+    let mut source =
+        fs::File::open(path).map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?;
+    let mut buffer = [0_u8; 1024 * 1024];
+    loop {
+        let count = source
+            .read(&mut buffer)
+            .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(())
 }
 
 pub fn record_state(
@@ -537,6 +801,67 @@ mod tests {
             fs::read_to_string(application.join("runtime/current")).unwrap(),
             "release"
         );
+    }
+
+    #[test]
+    fn office_pack_uses_final_overlay_tree_and_flow_biz_resources() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = directory.path().join("Doubao");
+        let webcontents = application.join("resources/local_webcontents");
+        let office = webcontents.join("apps/doubao-office");
+        let word = office.join("static/v/w");
+        let biz = webcontents.join("biz/static/js");
+        fs::create_dir_all(&word).unwrap();
+        fs::create_dir_all(&biz).unwrap();
+        fs::write(office.join("index.html"), "office").unwrap();
+        fs::write(word.join("runtime.js"), "selected-bear").unwrap();
+        fs::write(word.join("formula.js"), "equation").unwrap();
+        fs::write(biz.join("entry.js"), "flow").unwrap();
+        fs::write(biz.join("entry.js.map"), "source-map").unwrap();
+        fs::write(office.join("doubao_office.pak"), "stale-pack").unwrap();
+
+        let result = pack_chromium_datapack(
+            &application,
+            &[
+                DataPackResourceTree {
+                    root_relative: PathBuf::from("resources/local_webcontents/apps/doubao-office"),
+                    prefix: String::new(),
+                    exclude_source_maps: false,
+                    exclude_root_files: vec!["doubao_office.pak".to_owned()],
+                },
+                DataPackResourceTree {
+                    root_relative: PathBuf::from("resources/local_webcontents/biz"),
+                    prefix: "biz".to_owned(),
+                    exclude_source_maps: true,
+                    exclude_root_files: Vec::new(),
+                },
+            ],
+            Path::new("resources/local_webcontents/apps/doubao-office/doubao_office.pak"),
+            "win",
+            "x64",
+            "doubao-office",
+        )
+        .unwrap();
+
+        assert_eq!(result["entries"], 4);
+        assert!(result["sha256"].as_str().unwrap().starts_with("sha256:"));
+        let packed = fs::read(result["output"].as_str().unwrap()).unwrap();
+        assert_eq!(u32::from_le_bytes(packed[0..4].try_into().unwrap()), 5);
+        let manifest_offset = u32::from_le_bytes(packed[14..18].try_into().unwrap()) as usize;
+        let next_offset = u32::from_le_bytes(packed[20..24].try_into().unwrap()) as usize;
+        let manifest: Value =
+            serde_json::from_slice(&packed[manifest_offset..next_offset]).unwrap();
+        let paths = manifest["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"static/v/w/runtime.js"));
+        assert!(paths.contains(&"static/v/w/formula.js"));
+        assert!(paths.contains(&"biz/static/js/entry.js"));
+        assert!(!paths.contains(&"biz/static/js/entry.js.map"));
+        assert!(!paths.contains(&"doubao_office.pak"));
     }
 
     #[test]

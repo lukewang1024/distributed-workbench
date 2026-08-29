@@ -19,7 +19,10 @@ use workbench_schema::{
     IdempotencyContract, Observation, ReadGrant, ReadGrantState, RetryPolicy, RollbackStrategy,
 };
 
-use crate::generation::{Overlay, activate, apply_overlays, materialize, record_state};
+use crate::generation::{
+    DataPackResourceTree, Overlay, activate, apply_overlays, materialize, pack_chromium_datapack,
+    record_state,
+};
 use crate::process::ProcessTable;
 use crate::telemetry::{event_fields, request_event};
 
@@ -1298,6 +1301,28 @@ impl ExecutorRuntime {
                 }
                 apply_overlays(&application_path, &overlays)
             }
+            "artifact.pack-chromium-datapack" => {
+                let root_path = self.path(&params, "rootPath", true)?;
+                let resource_trees: Vec<DataPackResourceTree> =
+                    serde_json::from_value(params.get("resourceTrees").cloned().ok_or_else(
+                        || RpcError::new("INVALID_PARAMS", "resourceTrees are required"),
+                    )?)
+                    .map_err(|error| RpcError::new("INVALID_PARAMS", error.to_string()))?;
+                pack_chromium_datapack(
+                    &root_path,
+                    &resource_trees,
+                    Path::new(required_str(&params, "outputRelative")?),
+                    params
+                        .get("platform")
+                        .and_then(Value::as_str)
+                        .unwrap_or("win"),
+                    params.get("arch").and_then(Value::as_str).unwrap_or("x64"),
+                    params
+                        .get("bundleName")
+                        .and_then(Value::as_str)
+                        .unwrap_or("doubao-office"),
+                )
+            }
             "application.generation.record" | "application.runtime.record" => {
                 let generation_root = self.path(&params, "generationRoot", true)?;
                 let mut evidence = params.get("evidence").cloned().unwrap_or_else(|| json!({}));
@@ -1961,6 +1986,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("agent.stop", Effect::Mutating),
         ("application.materialize", Effect::Mutating),
         ("application.apply-artifacts", Effect::Mutating),
+        ("artifact.pack-chromium-datapack", Effect::Mutating),
         ("application.generation.record", Effect::Mutating),
         ("application.runtime.record", Effect::Mutating),
         ("application.activate", Effect::Mutating),
@@ -2184,6 +2210,22 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             3_600_000,
             RollbackStrategy::RetainPreviousGeneration,
             vec!["applied-artifacts", "generation-marker"],
+        ),
+        "artifact.pack-chromium-datapack" => (
+            vec!["chromium-datapack"],
+            json!({
+                "rootPath": {"type": "string"},
+                "resourceTrees": {"type": "array"},
+                "outputRelative": {"type": "string"},
+                "platform": {"type": "string"},
+                "arch": {"type": "string"},
+                "bundleName": {"type": "string"}
+            }),
+            vec!["datapack:${rootPath}/${outputRelative}"],
+            vec!["rootPath", "resourceTrees", "outputRelative"],
+            3_600_000,
+            RollbackStrategy::RetainPreviousGeneration,
+            vec!["packed-resource-digest", "packed-resource-manifest"],
         ),
         "application.finalize" => (
             vec!["macos-codesign"],
@@ -2761,6 +2803,11 @@ fn output_schema(name: &str) -> Value {
         }),
         "application.apply-artifacts" => json!({
             "applied": {"type": "array"}
+        }),
+        "artifact.pack-chromium-datapack" => json!({
+            "output": {"type": "string"}, "resources": {"type": "integer"},
+            "entries": {"type": "integer"}, "size": {"type": "integer"},
+            "sha256": {"type": "string"}, "contentHash": {"type": "string"}
         }),
         "application.open-file" => json!({
             "applicationPath": {"type": "string"}, "handlerPath": {"type": "string"},
