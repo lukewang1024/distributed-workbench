@@ -1182,6 +1182,16 @@ impl ExecutorRuntime {
                 metadata["desiredState"] = Value::String("stopped".to_owned());
                 self.processes.update_metadata(&process_id, metadata)?;
                 let record = self.processes.stop(&process_id)?;
+                let ssh_config_path = record
+                    .cwd
+                    .join(format!(".workbench-{process_id}.ssh-config"));
+                match fs::remove_file(&ssh_config_path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(RpcError::new("SSH_CONFIG_REMOVE_FAILED", error.to_string()));
+                    }
+                }
                 Ok(tunnel_view(&record, false))
             }
             "process.start" | "agent.start" => {
@@ -1620,41 +1630,31 @@ impl ExecutorRuntime {
         } else {
             cwd.join(format!(".workbench-{process_id}.log"))
         };
-        let forward = format!("{bind_host}:{bind_port}:{target_host}:{target_port}");
-        let mut argv = vec![
-            "ssh".to_owned(),
-            "-N".to_owned(),
-            "-C".to_owned(),
-            "-o".to_owned(),
-            "ClearAllForwardings=yes".to_owned(),
-            if direction == "local-forward" {
-                "-L"
-            } else {
-                "-R"
-            }
-            .to_owned(),
-            forward,
-            "-o".to_owned(),
-            "ExitOnForwardFailure=yes".to_owned(),
-            "-o".to_owned(),
-            "ServerAliveInterval=10".to_owned(),
-            "-o".to_owned(),
-            "ServerAliveCountMax=3".to_owned(),
-            "-o".to_owned(),
-            "StrictHostKeyChecking=accept-new".to_owned(),
-        ];
+        let ssh_config_path = cwd.join(format!(".workbench-{process_id}.ssh-config"));
+        write_tunnel_ssh_config(ssh_host, &ssh_config_path)?;
+        let mut argv = tunnel_ssh_argv(
+            ssh_host,
+            &ssh_config_path,
+            direction,
+            bind_host,
+            bind_port,
+            target_host,
+            target_port,
+        );
         if params
             .get("knownHostsFile")
             .and_then(Value::as_str)
             .is_some()
         {
             let known_hosts = self.path(params, "knownHostsFile", false)?;
-            argv.extend([
-                "-o".to_owned(),
-                format!("UserKnownHostsFile={}", known_hosts.display()),
-            ]);
+            argv.splice(
+                argv.len() - 1..argv.len() - 1,
+                [
+                    "-o".to_owned(),
+                    format!("UserKnownHostsFile={}", known_hosts.display()),
+                ],
+            );
         }
-        argv.push(ssh_host.to_owned());
         let readiness = (direction == "local-forward").then(|| {
             json!({
                 "type": "tcp", "host": bind_host, "port": bind_port,
@@ -2963,6 +2963,92 @@ fn validate_resource_id(value: &str) -> Result<(), RpcError> {
     Ok(())
 }
 
+fn tunnel_ssh_argv(
+    ssh_host: &str,
+    ssh_config_path: &Path,
+    direction: &str,
+    bind_host: &str,
+    bind_port: u16,
+    target_host: &str,
+    target_port: u16,
+) -> Vec<String> {
+    let forward = format!("{bind_host}:{bind_port}:{target_host}:{target_port}");
+    vec![
+        "ssh".to_owned(),
+        "-F".to_owned(),
+        ssh_config_path.display().to_string(),
+        "-N".to_owned(),
+        "-C".to_owned(),
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        "PreferredAuthentications=publickey".to_owned(),
+        "-o".to_owned(),
+        "GSSAPIAuthentication=no".to_owned(),
+        "-o".to_owned(),
+        "ConnectTimeout=8".to_owned(),
+        "-o".to_owned(),
+        "ConnectionAttempts=1".to_owned(),
+        if direction == "local-forward" {
+            "-L"
+        } else {
+            "-R"
+        }
+        .to_owned(),
+        forward,
+        "-o".to_owned(),
+        "ExitOnForwardFailure=yes".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveInterval=10".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveCountMax=3".to_owned(),
+        "-o".to_owned(),
+        "StrictHostKeyChecking=accept-new".to_owned(),
+        ssh_host.to_owned(),
+    ]
+}
+
+fn write_tunnel_ssh_config(ssh_host: &str, path: &Path) -> Result<(), RpcError> {
+    let output = Command::new("ssh")
+        .args(["-G", ssh_host])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| RpcError::new("SSH_CONFIG_RESOLVE_FAILED", error.to_string()))?;
+    if !output.status.success() {
+        return Err(RpcError::new(
+            "SSH_CONFIG_RESOLVE_FAILED",
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let resolved = String::from_utf8(output.stdout)
+        .map_err(|error| RpcError::new("SSH_CONFIG_RESOLVE_FAILED", error.to_string()))?;
+    let sanitized = sanitize_tunnel_ssh_config(&resolved);
+    fs::write(path, sanitized)
+        .map_err(|error| RpcError::new("SSH_CONFIG_WRITE_FAILED", error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| RpcError::new("SSH_CONFIG_WRITE_FAILED", error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn sanitize_tunnel_ssh_config(resolved: &str) -> String {
+    let mut sanitized = resolved
+        .lines()
+        .filter(|line| {
+            !matches!(
+                line.split_whitespace().next(),
+                Some("localforward" | "remoteforward" | "dynamicforward" | "clearallforwardings")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    sanitized.push('\n');
+    sanitized
+}
+
 fn require_tunnel_record(record: &crate::process::ProcessRecord) -> Result<(), RpcError> {
     if record.metadata.get("kind").and_then(Value::as_str) != Some("tunnel") {
         return Err(RpcError::new(
@@ -3422,6 +3508,48 @@ mod tests {
             "direction": "remote-forward",
             "source": {"host": "127.0.0.1", "port": port}
         })));
+    }
+
+    #[test]
+    fn tunnel_ssh_is_noninteractive_and_clears_configured_forwards() {
+        let argv = tunnel_ssh_argv(
+            "cndevbox",
+            Path::new("/tmp/tunnel.ssh-config"),
+            "local-forward",
+            "127.0.0.1",
+            4107,
+            "127.0.0.1",
+            4107,
+        );
+        assert_eq!(argv.first().map(String::as_str), Some("ssh"));
+        assert_eq!(argv.last().map(String::as_str), Some("cndevbox"));
+        for option in [
+            "BatchMode=yes",
+            "PreferredAuthentications=publickey",
+            "GSSAPIAuthentication=no",
+            "ConnectTimeout=8",
+            "ConnectionAttempts=1",
+            "ExitOnForwardFailure=yes",
+        ] {
+            assert!(argv.iter().any(|arg| arg == option), "missing {option}");
+        }
+        assert!(
+            argv.windows(2)
+                .any(|args| args == ["-L", "127.0.0.1:4107:127.0.0.1:4107"])
+        );
+        assert!(
+            argv.windows(2)
+                .any(|args| args == ["-F", "/tmp/tunnel.ssh-config"])
+        );
+    }
+
+    #[test]
+    fn tunnel_ssh_config_removes_only_inherited_forwards() {
+        let resolved = "host cndevbox\nhostname 10.37.115.223\nuser wangyuanlv\nlocalforward /tmp/a /tmp/b\nremoteforward 19998 [localhost]:19998\ndynamicforward /tmp/proxy.sock\nclearallforwardings no\nidentityfile ~/.ssh/id_ed25519\n";
+        let sanitized = sanitize_tunnel_ssh_config(resolved);
+        assert!(sanitized.contains("hostname 10.37.115.223\n"));
+        assert!(sanitized.contains("identityfile ~/.ssh/id_ed25519\n"));
+        assert!(!sanitized.contains("forward"));
     }
 
     #[test]
