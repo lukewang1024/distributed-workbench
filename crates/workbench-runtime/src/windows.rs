@@ -861,6 +861,7 @@ try {
     'click' {$x=$selected.Rect.Left+[int]$action.x;$y=$selected.Rect.Top+[int]$action.y;if($x -lt $selected.Rect.Left -or $x -ge $selected.Rect.Right -or $y -lt $selected.Rect.Top -or $y -ge $selected.Rect.Bottom){throw 'click coordinates are outside the target window'};if(-not [WorkbenchInput]::SetCursorPos($x,$y)){throw 'SetCursorPos failed'};[WorkbenchInput]::Click([string]$action.button,[int]$action.count)}
     'key' {[string[]]$modifiers=@();if($null -ne $action.modifiers){$modifiers=[string[]]@($action.modifiers|Where-Object{$_})};[WorkbenchInput]::Key([string]$action.key,$modifiers)}
     'text' {[WorkbenchInput]::Text([string]$action.text)}
+    'paste' {$clipboardSet=$false;for($attempt=0;$attempt -lt 10 -and -not $clipboardSet;$attempt++){try{[Windows.Forms.Clipboard]::SetText([string]$action.text);$clipboardSet=$true}catch{if($attempt -eq 9){throw};Start-Sleep -Milliseconds 50}};[WorkbenchInput]::Key('V',[string[]]@('CTRL'))}
     'wait' {Start-Sleep -Milliseconds ([int]$action.durationMs)}
     default {throw "unsupported action type: $($action.type)"}
   };$performed+=$action.type;Start-Sleep -Milliseconds 60}
@@ -962,7 +963,7 @@ fn normalize_input_action(index: usize, action: &Value) -> Result<Value, RpcErro
             result.insert("modifiers".into(), json!(modifiers));
             Ok(())
         }
-        "text" => {
+        "text" | "paste" => {
             ensure_action_fields(index, object, &["type", "text"])?;
             let text = object
                 .get("text")
@@ -1215,5 +1216,16 @@ mod tests {
         assert_eq!(state["saman"]["other"], 1);
         assert_eq!(state["saman"]["use_file_resource"], true);
         assert_eq!(state["saman"]["hotfix"]["is_enabled"], false);
+    }
+
+    #[test]
+    fn paste_input_action_is_normalized_as_bounded_text() {
+        assert_eq!(
+            normalize_input_action(0, &json!({"type": "paste", "text": "x^2"})).unwrap(),
+            json!({"type": "paste", "text": "x^2"})
+        );
+        assert!(
+            normalize_input_action(0, &json!({"type": "paste", "text": "x", "key": "V"})).is_err()
+        );
     }
 }

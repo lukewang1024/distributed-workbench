@@ -2429,7 +2429,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "type": {"enum": ["focus", "click", "key", "text", "wait"]},
+                            "type": {"enum": ["focus", "click", "key", "text", "paste", "wait"]},
                             "x": {"type": "integer"}, "y": {"type": "integer"},
                             "button": {"enum": ["left", "right", "middle"]},
                             "count": {"type": "integer", "minimum": 1, "maximum": 3},
@@ -3714,6 +3714,11 @@ mod tests {
         assert_eq!(
             descriptor.input_schema["properties"]["actions"]["maxItems"],
             100
+        );
+        assert!(
+            descriptor.input_schema["properties"]["actions"]["items"]["properties"]["type"]["enum"]
+                .as_array()
+                .is_some_and(|values| values.iter().any(|value| value == "paste"))
         );
         assert_eq!(descriptor.locks[0].key, "ui-target:${remoteDebuggingPort}");
         assert!(matches!(
