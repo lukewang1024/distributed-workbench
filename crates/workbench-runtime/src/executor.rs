@@ -2325,7 +2325,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "args",
                 "terminateConflictingInstances",
             ],
-            60_000,
+            // Native launch readiness can legitimately consume the full
+            // 60-second product smoke window. Leave transport headroom so the
+            // Controller does not fence a healthy launch just before the
+            // Executor returns its terminal readiness evidence.
+            120_000,
             RollbackStrategy::Compensate {
                 capability: "process.stop".to_owned(),
             },
@@ -3664,6 +3668,7 @@ mod tests {
             "application-instance:${bundleIdentifier}"
         );
         assert_eq!(descriptor.locks.len(), 1);
+        assert_eq!(descriptor.timeout_ms, 120_000);
     }
 
     #[test]
