@@ -68,6 +68,7 @@ pub fn inspect(application: &Path) -> Result<Value, RpcError> {
 
 pub struct LaunchOptions<'a> {
     pub user_data_dir: Option<&'a Path>,
+    pub runtime_shadow_dir: Option<&'a Path>,
     pub chromium_local_state_path: Option<&'a Path>,
     pub chromium_local_state_patch: Option<&'a Value>,
     pub chromium_local_state_settle_ms: u64,
@@ -81,7 +82,7 @@ pub fn launch(
     args: &[String],
     options: LaunchOptions<'_>,
 ) -> Result<Value, RpcError> {
-    let executable = find_executable(application).ok_or_else(|| {
+    let installed_executable = find_executable(application).ok_or_else(|| {
         RpcError::new(
             "APPLICATION_LAUNCH_FAILED",
             "application executable is missing",
@@ -93,7 +94,7 @@ pub fn launch(
     }
     let terminated = if options.terminate_conflicting_instances {
         terminate_process_trees(
-            &executable,
+            &installed_executable,
             options.user_data_dir,
             options.remote_debugging_port,
         )?
@@ -134,13 +135,24 @@ pub fn launch(
     if let Some(file) = options.file {
         launch_args.push(file.to_string_lossy().into_owned());
     }
-    // The packaged client writes a relative debug.log at startup. A prepared
-    // generation is immutable, so never use its application directory as the
-    // working directory when an isolated runtime profile is available.
+    // The packaged client rewrites debug.log beside its executable regardless
+    // of the process working directory. Launch from a same-volume shadow whose
+    // read-only files are hard-linked but whose known mutable files are copied.
+    // This keeps the prepared generation byte-for-byte immutable.
+    let runtime_application = match options.runtime_shadow_dir {
+        Some(shadow) => create_runtime_shadow(application, shadow)?,
+        None => application.to_path_buf(),
+    };
+    let executable = find_executable(&runtime_application).ok_or_else(|| {
+        RpcError::new(
+            "APPLICATION_LAUNCH_FAILED",
+            "runtime shadow executable is missing",
+        )
+    })?;
     let working_directory = options
         .user_data_dir
         .or_else(|| options.file.and_then(Path::parent))
-        .unwrap_or(application);
+        .unwrap_or(&runtime_application);
     let pid = spawn_in_active_session(&executable, &launch_args, working_directory)?;
     if options.chromium_local_state_patch.is_some() && options.chromium_local_state_settle_ms > 0 {
         thread::sleep(Duration::from_millis(
@@ -160,6 +172,7 @@ pub fn launch(
         };
     Ok(json!({
         "applicationPath": application,
+        "runtimeApplicationPath": runtime_application,
         "executable": executable,
         "pid": pid,
         "launcherPid": pid,
@@ -174,6 +187,57 @@ pub fn launch(
         "cdp": Value::Null,
         "readyAt": now_ms(),
     }))
+}
+
+fn create_runtime_shadow(application: &Path, shadow: &Path) -> Result<PathBuf, RpcError> {
+    if shadow.exists() {
+        return Err(RpcError::new(
+            "RUNTIME_SHADOW_EXISTS",
+            format!("runtime shadow already exists: {}", shadow.display()),
+        ));
+    }
+    let parent = shadow
+        .parent()
+        .ok_or_else(|| RpcError::new("RUNTIME_SHADOW_FAILED", "runtime shadow has no parent"))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| RpcError::new("RUNTIME_SHADOW_FAILED", error.to_string()))?;
+    let temporary = parent.join(format!(
+        ".runtime-shadow.{}.{}.tmp",
+        std::process::id(),
+        now_ms()
+    ));
+    if let Err(error) = shadow_tree(application, &temporary, application) {
+        let _ = fs::remove_dir_all(&temporary);
+        return Err(error);
+    }
+    fs::rename(&temporary, shadow)
+        .map_err(|error| RpcError::new("RUNTIME_SHADOW_FAILED", error.to_string()))?;
+    Ok(shadow.to_path_buf())
+}
+
+fn shadow_tree(source: &Path, target: &Path, root: &Path) -> Result<(), RpcError> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| RpcError::new("RUNTIME_SHADOW_FAILED", error.to_string()))?;
+    if metadata.is_dir() {
+        fs::create_dir(target)
+            .map_err(|error| RpcError::new("RUNTIME_SHADOW_FAILED", error.to_string()))?;
+        for entry in fs::read_dir(source)
+            .map_err(|error| RpcError::new("RUNTIME_SHADOW_FAILED", error.to_string()))?
+        {
+            let entry =
+                entry.map_err(|error| RpcError::new("RUNTIME_SHADOW_FAILED", error.to_string()))?;
+            shadow_tree(&entry.path(), &target.join(entry.file_name()), root)?;
+        }
+        return Ok(());
+    }
+    let relative = source.strip_prefix(root).unwrap_or(source);
+    let mutable = relative == Path::new("debug.log");
+    if !mutable && fs::hard_link(source, target).is_ok() {
+        return Ok(());
+    }
+    fs::copy(source, target)
+        .map(|_| ())
+        .map_err(|error| RpcError::new("RUNTIME_SHADOW_FAILED", error.to_string()))
 }
 
 fn merge_json(target: &mut Value, patch: &Value) {

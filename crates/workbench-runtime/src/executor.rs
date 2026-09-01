@@ -1463,6 +1463,11 @@ impl ExecutorRuntime {
                     .and_then(Value::as_str)
                     .map(|_| self.path(&params, "userDataDir", false))
                     .transpose()?;
+                let runtime_shadow_dir = params
+                    .get("runtimeShadowDir")
+                    .and_then(Value::as_str)
+                    .map(|_| self.path(&params, "runtimeShadowDir", false))
+                    .transpose()?;
                 let chromium_local_state_path = params
                     .get("chromiumLocalStatePath")
                     .and_then(Value::as_str)
@@ -1478,6 +1483,7 @@ impl ExecutorRuntime {
                     &string_array(&params, "args")?,
                     crate::windows::LaunchOptions {
                         user_data_dir: user_data_dir.as_deref(),
+                        runtime_shadow_dir: runtime_shadow_dir.as_deref(),
                         chromium_local_state_path: chromium_local_state_path.as_deref(),
                         chromium_local_state_patch: params.get("chromiumLocalStatePatch"),
                         chromium_local_state_settle_ms: params
@@ -2334,6 +2340,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "bundleIdentifier": {"type": "string"},
                 "args": {"type": "array", "items": {"type": "string"}},
                 "userDataDir": {"type": "string"},
+                "runtimeShadowDir": {"type": "string"},
                 "chromiumLocalStatePath": {"type": "string"},
                 "chromiumLocalStatePatch": {"type": "object"},
                 "chromiumLocalStateSettleMs": {"type": "integer", "minimum": 0, "maximum": 30000},
@@ -2908,6 +2915,7 @@ fn output_schema(name: &str) -> Value {
         }),
         "application.launch" => json!({
             "applicationPath": {"type": "string"}, "pid": {"type": "integer"},
+            "runtimeApplicationPath": {"type": ["string", "null"]},
             "launcherPid": {"type": ["integer", "null"]},
             "file": {"type": ["string", "null"]},
             "args": {"type": "array"}, "cdp": {"type": ["object", "null"]}
