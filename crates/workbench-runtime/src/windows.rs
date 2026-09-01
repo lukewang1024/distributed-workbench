@@ -134,7 +134,14 @@ pub fn launch(
     if let Some(file) = options.file {
         launch_args.push(file.to_string_lossy().into_owned());
     }
-    let pid = spawn_in_active_session(&executable, &launch_args, application)?;
+    // The packaged client writes a relative debug.log at startup. A prepared
+    // generation is immutable, so never use its application directory as the
+    // working directory when an isolated runtime profile is available.
+    let working_directory = options
+        .user_data_dir
+        .or_else(|| options.file.and_then(Path::parent))
+        .unwrap_or(application);
+    let pid = spawn_in_active_session(&executable, &launch_args, working_directory)?;
     if options.chromium_local_state_patch.is_some() && options.chromium_local_state_settle_ms > 0 {
         thread::sleep(Duration::from_millis(
             options.chromium_local_state_settle_ms,
@@ -315,10 +322,13 @@ pub fn open_file(
         .map(Path::to_path_buf)
         .or_else(|| find_executable(application))
         .ok_or_else(|| RpcError::new("OPEN_FILE_FAILED", "application executable is missing"))?;
+    // Opening a document can start a second client process. Keep relative
+    // runtime output beside the disposable fixture, outside the generation.
+    let working_directory = file.parent().unwrap_or(application);
     spawn_in_active_session(
         &executable,
         &[file.to_string_lossy().into_owned()],
-        application,
+        working_directory,
     )?;
     Ok(
         json!({"applicationPath": application, "handlerPath": executable, "file": file, "openedAt": now_ms()}),
