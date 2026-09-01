@@ -2683,6 +2683,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                                     | "chromiumLocalStatePath"
                                     | "chromiumLocalStateSettleMs"
                                     | "file"
+                                    | "runtimeShadowDir"
                                     | "userDataDir"
                             ) | ("application.open-file", "handlerPath")
                                 | ("application.materialize", "derivedFrom")
@@ -3696,6 +3697,14 @@ mod tests {
                 .iter()
                 .any(|field| field == "file"),
             "application.launch must support an app-only launch"
+        );
+        assert!(
+            !descriptor.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "runtimeShadowDir"),
+            "the Windows runtime shadow must remain optional for Mac launches"
         );
         assert!(
             descriptor.input_schema["properties"]["browserExecutableRelative"].is_null(),
