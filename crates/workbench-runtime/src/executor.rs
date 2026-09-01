@@ -2237,7 +2237,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "generationRoot": {"type": "string"},
                 "generationId": {"type": "string"},
                 "baselinePath": {"type": "string"},
-                "derivedFrom": {"type": "string"}
+                "derivedFrom": {"type": ["string", "null"]}
             }),
             vec!["generation:${generationRoot}/${generationId}"],
             vec!["generationRoot", "generationId", "baselinePath"],
@@ -4183,6 +4183,10 @@ mod tests {
         assert_eq!(
             contract.input_schema["required"],
             json!(["baselinePath", "generationId", "generationRoot"])
+        );
+        assert_eq!(
+            contract.input_schema["properties"]["derivedFrom"]["type"],
+            json!(["string", "null"])
         );
 
         let describe = capability_catalog()
