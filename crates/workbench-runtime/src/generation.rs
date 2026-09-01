@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use workbench_core::{atomic_replace, now_ms};
 use workbench_protocol::RpcError;
@@ -15,6 +16,19 @@ pub struct MaterializedGeneration {
     pub application_path: PathBuf,
     pub marker_path: PathBuf,
     pub created_at: u64,
+    pub derived_from: Option<String>,
+    pub clone_hits: u64,
+    pub link_hits: u64,
+    pub copied_files: u64,
+    pub copied_bytes: u64,
+}
+
+#[derive(Debug, Default)]
+struct MaterializeStats {
+    clone_hits: u64,
+    link_hits: u64,
+    copied_files: u64,
+    copied_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -26,10 +40,11 @@ pub struct Overlay {
     pub replace: bool,
 }
 
-pub fn materialize(
+pub fn materialize_derived(
     generation_root: &Path,
     generation_id: &str,
     baseline: &Path,
+    derived_from: Option<&str>,
 ) -> Result<MaterializedGeneration, RpcError> {
     validate_generation_id(generation_id)?;
     if generation_root
@@ -64,6 +79,20 @@ pub fn materialize(
                 ),
                 marker_path,
                 created_at: marker.get("createdAt").and_then(Value::as_u64).unwrap_or(0),
+                derived_from: marker
+                    .get("derivedFrom")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                clone_hits: marker.get("cloneHits").and_then(Value::as_u64).unwrap_or(0),
+                link_hits: marker.get("linkHits").and_then(Value::as_u64).unwrap_or(0),
+                copied_files: marker
+                    .get("copiedFiles")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                copied_bytes: marker
+                    .get("copiedBytes")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
             });
         }
         return Err(RpcError::new(
@@ -83,7 +112,13 @@ pub fn materialize(
         .map(|position| &baseline_name[..position + 4])
         .unwrap_or(baseline_name);
     let application_path = temporary.join(application_name);
-    if let Err(error) = copy_tree(baseline, &application_path) {
+    let mut stats = MaterializeStats::default();
+    if let Err(error) = copy_tree(
+        baseline,
+        &application_path,
+        derived_from.is_some(),
+        &mut stats,
+    ) {
         let marker = serde_json::json!({
             "generationId": generation_id,
             "state": "failed",
@@ -103,6 +138,11 @@ pub fn materialize(
         "state": "materialized",
         "applicationName": application_name,
         "baseline": baseline,
+        "derivedFrom": derived_from,
+        "cloneHits": stats.clone_hits,
+        "linkHits": stats.link_hits,
+        "copiedFiles": stats.copied_files,
+        "copiedBytes": stats.copied_bytes,
         "createdAt": created_at,
     });
     let marker_path = temporary.join("generation.json");
@@ -119,6 +159,11 @@ pub fn materialize(
         marker_path: root.join("generation.json"),
         root,
         created_at,
+        derived_from: derived_from.map(str::to_owned),
+        clone_hits: stats.clone_hits,
+        link_hits: stats.link_hits,
+        copied_files: stats.copied_files,
+        copied_bytes: stats.copied_bytes,
     })
 }
 
@@ -127,11 +172,7 @@ pub fn apply_overlays(application_path: &Path, overlays: &[Overlay]) -> Result<V
     for overlay in overlays {
         validate_relative(&overlay.target_relative_path)?;
         let target = application_path.join(&overlay.target_relative_path);
-        if overlay.replace && target.exists() {
-            fs::remove_dir_all(&target)
-                .map_err(|error| io_error("OVERLAY_REPLACE_FAILED", &target, error))?;
-        }
-        copy_tree(&overlay.source, &target)?;
+        apply_overlay_tree(&overlay.source, &target, overlay.replace)?;
         applied.push(serde_json::json!({
             "source": overlay.source,
             "target": target,
@@ -163,6 +204,9 @@ pub fn pack_chromium_datapack(
     platform: &str,
     arch: &str,
     bundle_name: &str,
+    base_pack_path: Option<&Path>,
+    base_pack_digest: Option<&str>,
+    changed_prefixes: &[String],
 ) -> Result<Value, RpcError> {
     validate_relative(output_relative)?;
     let mut resources = Vec::new();
@@ -215,6 +259,32 @@ pub fn pack_chromium_datapack(
             "no Office resources to pack",
         ));
     }
+    let base_entries = if let Some(base_path) = base_pack_path {
+        let expected = base_pack_digest.ok_or_else(|| {
+            RpcError::new(
+                "BASE_DATAPACK_DIGEST_REQUIRED",
+                "incremental DataPack requires the base pak digest",
+            )
+        })?;
+        let mut digest = Sha256::new();
+        hash_file_into(base_path, &mut digest)?;
+        let actual = format!("sha256:{}", hex::encode(digest.finalize()));
+        if actual != expected {
+            return Err(RpcError::new(
+                "BASE_DATAPACK_DRIFT",
+                format!("base DataPack digest changed: expected {expected}, got {actual}"),
+            ));
+        }
+        Some((base_path.to_path_buf(), parse_datapack_entries(base_path)?))
+    } else {
+        None
+    };
+    if base_entries.is_some() && changed_prefixes.is_empty() {
+        return Err(RpcError::new(
+            "DATAPACK_CHANGED_PREFIX_REQUIRED",
+            "incremental DataPack requires at least one changed prefix",
+        ));
+    }
     let resource_count = resources.len() + 1;
     if resource_count > u16::MAX as usize {
         return Err(RpcError::new(
@@ -227,7 +297,19 @@ pub fn pack_chromium_datapack(
     for (relative, path) in &resources {
         content_digest.update(relative.as_bytes());
         content_digest.update([0]);
-        hash_file_into(path, &mut content_digest)?;
+        if let Some((base_path, entries)) = &base_entries
+            && !path_matches_prefix(relative, changed_prefixes)
+        {
+            let (offset, length) = entries.get(relative).ok_or_else(|| {
+                RpcError::new(
+                    "BASE_DATAPACK_ENTRY_MISSING",
+                    format!("unchanged entry is absent from base pak: {relative}"),
+                )
+            })?;
+            hash_file_range_into(base_path, *offset, *length, &mut content_digest)?;
+        } else {
+            hash_file_into(path, &mut content_digest)?;
+        }
     }
     let content_hash = hex::encode(content_digest.finalize());
     let manifest = serde_json::to_vec(&serde_json::json!({
@@ -249,10 +331,24 @@ pub fn pack_chromium_datapack(
     let mut offsets = Vec::with_capacity(resource_count + 1);
     offsets.push(header_size + index_size);
     offsets.push(offsets[0] + manifest.len() as u64);
-    for (_, path) in &resources {
-        let size = fs::metadata(path)
-            .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?
-            .len();
+    for (relative, path) in &resources {
+        let size = if let Some((_, entries)) = &base_entries
+            && !path_matches_prefix(relative, changed_prefixes)
+        {
+            entries
+                .get(relative)
+                .ok_or_else(|| {
+                    RpcError::new(
+                        "BASE_DATAPACK_ENTRY_MISSING",
+                        format!("unchanged entry is absent from base pak: {relative}"),
+                    )
+                })?
+                .1
+        } else {
+            fs::metadata(path)
+                .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?
+                .len()
+        };
         offsets.push(offsets.last().copied().unwrap_or(0) + size);
     }
     if offsets.last().copied().unwrap_or(0) > u32::MAX as u64 {
@@ -307,11 +403,18 @@ pub fn pack_chromium_datapack(
         target
             .write_all(&manifest)
             .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
-        for (_, path) in &resources {
-            let mut source = fs::File::open(path)
-                .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?;
-            std::io::copy(&mut source, &mut target)
-                .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+        for (relative, path) in &resources {
+            if let Some((base_path, entries)) = &base_entries
+                && !path_matches_prefix(relative, changed_prefixes)
+            {
+                let (offset, length) = entries.get(relative).expect("base entry validated");
+                copy_file_range(base_path, *offset, *length, &mut target)?;
+            } else {
+                let mut source = fs::File::open(path)
+                    .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?;
+                std::io::copy(&mut source, &mut target)
+                    .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            }
         }
         target
             .sync_all()
@@ -333,7 +436,159 @@ pub fn pack_chromium_datapack(
         "size": fs::metadata(&output).map_err(|error| io_error("OFFICE_PACK_READ_FAILED", &output, error))?.len(),
         "sha256": format!("sha256:{}", hex::encode(digest.finalize())),
         "contentHash": format!("sha256:{content_hash}"),
+        "incremental": base_entries.is_some(),
+        "basePack": base_pack_path,
+        "changedPrefixes": changed_prefixes,
     }))
+}
+
+fn path_matches_prefix(path: &str, prefixes: &[String]) -> bool {
+    prefixes.iter().any(|prefix| {
+        path == prefix
+            || path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+fn parse_datapack_entries(path: &Path) -> Result<HashMap<String, (u64, u64)>, RpcError> {
+    let mut source =
+        fs::File::open(path).map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
+    let mut header = [0_u8; 12];
+    source
+        .read_exact(&mut header)
+        .map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
+    if u32::from_le_bytes(header[0..4].try_into().unwrap()) != 5 {
+        return Err(RpcError::new(
+            "BASE_DATAPACK_INVALID",
+            "base pak is not DataPack version 5",
+        ));
+    }
+    let count = u16::from_le_bytes(header[8..10].try_into().unwrap()) as usize;
+    if count < 1 {
+        return Err(RpcError::new(
+            "BASE_DATAPACK_INVALID",
+            "base pak has no manifest entry",
+        ));
+    }
+    let mut index = vec![0_u8; (count + 1) * 6];
+    source
+        .read_exact(&mut index)
+        .map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
+    let offsets = (0..=count)
+        .map(|position| {
+            let start = position * 6 + 2;
+            u32::from_le_bytes(index[start..start + 4].try_into().unwrap()) as u64
+        })
+        .collect::<Vec<_>>();
+    if offsets.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err(RpcError::new(
+            "BASE_DATAPACK_INVALID",
+            "base pak offsets are not monotonic",
+        ));
+    }
+    let file_size = source
+        .metadata()
+        .map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?
+        .len();
+    if offsets.last().copied().unwrap_or(0) > file_size {
+        return Err(RpcError::new(
+            "BASE_DATAPACK_INVALID",
+            "base pak offsets exceed file size",
+        ));
+    }
+    source
+        .seek(SeekFrom::Start(offsets[0]))
+        .map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
+    let mut manifest = vec![0_u8; (offsets[1] - offsets[0]) as usize];
+    source
+        .read_exact(&mut manifest)
+        .map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
+    let manifest: Value = serde_json::from_slice(&manifest)
+        .map_err(|error| RpcError::new("BASE_DATAPACK_INVALID", error.to_string()))?;
+    let entries = manifest
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            RpcError::new("BASE_DATAPACK_INVALID", "base pak manifest has no entries")
+        })?;
+    if entries.len() + 1 != count {
+        return Err(RpcError::new(
+            "BASE_DATAPACK_INVALID",
+            "base pak manifest/index entry counts differ",
+        ));
+    }
+    let mut result = HashMap::new();
+    for (position, entry) in entries.iter().enumerate() {
+        let name = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| RpcError::new("BASE_DATAPACK_INVALID", "base pak entry has no path"))?;
+        result.insert(
+            name.to_owned(),
+            (
+                offsets[position + 1],
+                offsets[position + 2] - offsets[position + 1],
+            ),
+        );
+    }
+    Ok(result)
+}
+
+fn hash_file_range_into(
+    path: &Path,
+    offset: u64,
+    length: u64,
+    digest: &mut Sha256,
+) -> Result<(), RpcError> {
+    let mut source =
+        fs::File::open(path).map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
+    source
+        .seek(SeekFrom::Start(offset))
+        .map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
+    let mut limited = source.take(length);
+    let copied = std::io::copy(&mut limited, &mut DigestWriter(digest))
+        .map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
+    if copied != length {
+        return Err(RpcError::new(
+            "BASE_DATAPACK_INVALID",
+            "base pak entry is truncated",
+        ));
+    }
+    Ok(())
+}
+
+struct DigestWriter<'a>(&'a mut Sha256);
+impl Write for DigestWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn copy_file_range(
+    path: &Path,
+    offset: u64,
+    length: u64,
+    target: &mut fs::File,
+) -> Result<(), RpcError> {
+    let mut source =
+        fs::File::open(path).map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
+    source
+        .seek(SeekFrom::Start(offset))
+        .map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
+    let copied = std::io::copy(&mut source.take(length), target)
+        .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", path, error))?;
+    if copied != length {
+        return Err(RpcError::new(
+            "BASE_DATAPACK_INVALID",
+            "base pak entry is truncated",
+        ));
+    }
+    Ok(())
 }
 
 fn collect_pack_tree(
@@ -507,7 +762,12 @@ pub fn activate(generation_root: &Path, generation_id: &str) -> Result<Value, Rp
     }))
 }
 
-fn copy_tree(source: &Path, target: &Path) -> Result<(), RpcError> {
+fn copy_tree(
+    source: &Path,
+    target: &Path,
+    derived: bool,
+    stats: &mut MaterializeStats,
+) -> Result<(), RpcError> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| io_error("MATERIALIZE_FAILED", source, error))?;
     if metadata.file_type().is_symlink() {
@@ -527,20 +787,91 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), RpcError> {
             fs::read_dir(source).map_err(|error| io_error("MATERIALIZE_FAILED", source, error))?
         {
             let entry = entry.map_err(|error| io_error("MATERIALIZE_FAILED", source, error))?;
-            copy_tree(&entry.path(), &target.join(entry.file_name()))?;
+            copy_tree(
+                &entry.path(),
+                &target.join(entry.file_name()),
+                derived,
+                stats,
+            )?;
         }
     } else if metadata.is_file() {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| io_error("MATERIALIZE_FAILED", parent, error))?;
         }
-        clone_or_copy(source, target)?;
+        clone_link_or_copy(source, target, derived, stats)?;
         copy_permissions(&metadata, target)?;
     } else {
         return Err(RpcError::new(
             "MATERIALIZE_FAILED",
             format!("unsupported baseline entry: {}", source.display()),
         ));
+    }
+    Ok(())
+}
+
+fn apply_overlay_tree(source: &Path, target: &Path, replace: bool) -> Result<(), RpcError> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| io_error("OVERLAY_APPLY_FAILED", source, error))?;
+    if metadata.is_dir() && !replace {
+        fs::create_dir_all(target)
+            .map_err(|error| io_error("OVERLAY_APPLY_FAILED", target, error))?;
+        for entry in
+            fs::read_dir(source).map_err(|error| io_error("OVERLAY_APPLY_FAILED", source, error))?
+        {
+            let entry = entry.map_err(|error| io_error("OVERLAY_APPLY_FAILED", source, error))?;
+            apply_overlay_tree(&entry.path(), &target.join(entry.file_name()), false)?;
+        }
+        return Ok(());
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| RpcError::new("OVERLAY_APPLY_FAILED", "overlay target has no parent"))?;
+    fs::create_dir_all(parent).map_err(|error| io_error("OVERLAY_APPLY_FAILED", parent, error))?;
+    let temporary = parent.join(format!(".overlay.{}.{}.tmp", std::process::id(), now_ms()));
+    let mut stats = MaterializeStats::default();
+    copy_tree(source, &temporary, false, &mut stats)?;
+    if target.exists() || target.is_symlink() {
+        let old = parent.join(format!(".overlay.{}.{}.old", std::process::id(), now_ms()));
+        fs::rename(target, &old)
+            .map_err(|error| io_error("OVERLAY_REPLACE_FAILED", target, error))?;
+        if let Err(error) = fs::rename(&temporary, target) {
+            let _ = fs::rename(&old, target);
+            return Err(io_error("OVERLAY_REPLACE_FAILED", target, error));
+        }
+        if old.is_dir() {
+            fs::remove_dir_all(old)
+        } else {
+            fs::remove_file(old)
+        }
+        .map_err(|error| io_error("OVERLAY_REPLACE_FAILED", target, error))?;
+    } else {
+        fs::rename(&temporary, target)
+            .map_err(|error| io_error("OVERLAY_REPLACE_FAILED", target, error))?;
+    }
+    Ok(())
+}
+
+fn clone_link_or_copy(
+    source: &Path,
+    target: &Path,
+    _derived: bool,
+    stats: &mut MaterializeStats,
+) -> Result<(), RpcError> {
+    #[cfg(windows)]
+    if _derived && fs::hard_link(source, target).is_ok() {
+        stats.link_hits += 1;
+        return Ok(());
+    }
+    let size = fs::metadata(source)
+        .map_err(|error| io_error("MATERIALIZE_FAILED", source, error))?
+        .len();
+    let cloned = clone_or_copy(source, target)?;
+    if cloned {
+        stats.clone_hits += 1;
+    } else {
+        stats.copied_files += 1;
+        stats.copied_bytes += size;
     }
     Ok(())
 }
@@ -636,7 +967,7 @@ fn copy_permissions(_metadata: &fs::Metadata, _target: &Path) -> Result<(), RpcE
 }
 
 #[cfg(target_os = "macos")]
-fn clone_or_copy(source: &Path, target: &Path) -> Result<(), RpcError> {
+fn clone_or_copy(source: &Path, target: &Path) -> Result<bool, RpcError> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -645,17 +976,17 @@ fn clone_or_copy(source: &Path, target: &Path) -> Result<(), RpcError> {
     let target_c = CString::new(target.as_os_str().as_bytes())
         .map_err(|_| RpcError::new("MATERIALIZE_FAILED", "target path contains NUL"))?;
     if unsafe { libc::clonefile(source_c.as_ptr(), target_c.as_ptr(), 0) } == 0 {
-        return Ok(());
+        return Ok(true);
     }
     fs::copy(source, target)
-        .map(|_| ())
+        .map(|_| false)
         .map_err(|error| io_error("MATERIALIZE_FAILED", target, error))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn clone_or_copy(source: &Path, target: &Path) -> Result<(), RpcError> {
+fn clone_or_copy(source: &Path, target: &Path) -> Result<bool, RpcError> {
     fs::copy(source, target)
-        .map(|_| ())
+        .map(|_| false)
         .map_err(|error| io_error("MATERIALIZE_FAILED", target, error))
 }
 
@@ -705,7 +1036,8 @@ mod tests {
         let baseline = directory.path().join("Baseline.app");
         fs::create_dir_all(&baseline).unwrap();
         let error =
-            materialize(&directory.path().join("generations"), "g1", &baseline).unwrap_err();
+            materialize_derived(&directory.path().join("generations"), "g1", &baseline, None)
+                .unwrap_err();
         assert_eq!(error.code, "INVALID_GENERATION_ROOT");
     }
 
@@ -719,7 +1051,7 @@ mod tests {
         fs::create_dir(&overlay).unwrap();
         fs::write(overlay.join("added"), "new").unwrap();
         let root = directory.path().join("client");
-        let first = materialize(&root, "one", &baseline).unwrap();
+        let first = materialize_derived(&root, "one", &baseline, None).unwrap();
         apply_overlays(
             &first.application_path,
             &[Overlay {
@@ -733,7 +1065,7 @@ mod tests {
         record_state(&root, "one", "ready", Value::Null).unwrap();
         assert!(first.application_path.join("runtime/added").exists());
         activate(&root, "one").unwrap();
-        materialize(&root, "two", &baseline).unwrap();
+        materialize_derived(&root, "two", &baseline, None).unwrap();
         record_state(&root, "two", "ready", Value::Null).unwrap();
         activate(&root, "two").unwrap();
         assert!(
@@ -754,7 +1086,7 @@ mod tests {
         let baseline = directory.path().join("Example.app");
         fs::create_dir(&baseline).unwrap();
         let root = directory.path().join("client");
-        materialize(&root, "active-generation", &baseline).unwrap();
+        materialize_derived(&root, "active-generation", &baseline, None).unwrap();
 
         let result = record_state(
             &root,
@@ -804,6 +1136,49 @@ mod tests {
     }
 
     #[test]
+    fn overlay_replaces_a_shared_file_without_mutating_its_peer() {
+        let directory = tempfile::tempdir().unwrap();
+        let application = directory.path().join("application");
+        fs::create_dir(&application).unwrap();
+        let base = directory.path().join("base");
+        fs::write(&base, "baseline-long-value").unwrap();
+        fs::hard_link(&base, application.join("runtime.js")).unwrap();
+        let overlay = directory.path().join("runtime.js");
+        fs::write(&overlay, "new").unwrap();
+        apply_overlays(
+            &application,
+            &[Overlay {
+                source: overlay,
+                target_relative_path: PathBuf::from("runtime.js"),
+                replace: false,
+            }],
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(base).unwrap(), "baseline-long-value");
+        assert_eq!(
+            fs::read_to_string(application.join("runtime.js")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn derived_generation_survives_removal_of_its_base() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base/Doubao.app");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("payload"), "base").unwrap();
+        let root = directory.path().join("client");
+        let derived =
+            materialize_derived(&root, "derived", &base, Some("base-generation")).unwrap();
+        fs::remove_dir_all(base.parent().unwrap()).unwrap();
+        assert_eq!(
+            fs::read_to_string(derived.application_path.join("payload")).unwrap(),
+            "base"
+        );
+        assert_eq!(derived.derived_from.as_deref(), Some("base-generation"));
+    }
+
+    #[test]
     fn office_pack_uses_final_overlay_tree_and_flow_biz_resources() {
         let directory = tempfile::tempdir().unwrap();
         let application = directory.path().join("Doubao");
@@ -840,6 +1215,9 @@ mod tests {
             "win",
             "x64",
             "doubao-office",
+            None,
+            None,
+            &[],
         )
         .unwrap();
 
@@ -862,6 +1240,69 @@ mod tests {
         assert!(paths.contains(&"biz/static/js/entry.js"));
         assert!(!paths.contains(&"biz/static/js/entry.js.map"));
         assert!(!paths.contains(&"doubao_office.pak"));
+
+        let base_pack = directory.path().join("base-doubao-office.pak");
+        fs::copy(result["output"].as_str().unwrap(), &base_pack).unwrap();
+        let base_digest = result["sha256"].as_str().unwrap().to_owned();
+        fs::write(word.join("runtime.js"), "selected-bear-v2-longer").unwrap();
+        let full = pack_chromium_datapack(
+            &application,
+            &[
+                DataPackResourceTree {
+                    root_relative: PathBuf::from("resources/local_webcontents/apps/doubao-office"),
+                    prefix: String::new(),
+                    exclude_source_maps: false,
+                    exclude_root_files: vec!["doubao_office.pak".to_owned()],
+                },
+                DataPackResourceTree {
+                    root_relative: PathBuf::from("resources/local_webcontents/biz"),
+                    prefix: "biz".to_owned(),
+                    exclude_source_maps: true,
+                    exclude_root_files: Vec::new(),
+                },
+            ],
+            Path::new("resources/local_webcontents/apps/doubao-office/doubao_office.pak"),
+            "win",
+            "x64",
+            "doubao-office",
+            None,
+            None,
+            &[],
+        )
+        .unwrap();
+        let full_bytes = fs::read(full["output"].as_str().unwrap()).unwrap();
+        let incremental = pack_chromium_datapack(
+            &application,
+            &[
+                DataPackResourceTree {
+                    root_relative: PathBuf::from("resources/local_webcontents/apps/doubao-office"),
+                    prefix: String::new(),
+                    exclude_source_maps: false,
+                    exclude_root_files: vec!["doubao_office.pak".to_owned()],
+                },
+                DataPackResourceTree {
+                    root_relative: PathBuf::from("resources/local_webcontents/biz"),
+                    prefix: "biz".to_owned(),
+                    exclude_source_maps: true,
+                    exclude_root_files: Vec::new(),
+                },
+            ],
+            Path::new("resources/local_webcontents/apps/doubao-office/doubao_office.pak"),
+            "win",
+            "x64",
+            "doubao-office",
+            Some(&base_pack),
+            Some(&base_digest),
+            &["static/v/w".to_owned()],
+        )
+        .unwrap();
+        assert!(incremental["incremental"].as_bool().unwrap());
+        assert_eq!(
+            fs::read(incremental["output"].as_str().unwrap()).unwrap(),
+            full_bytes
+        );
+        assert_eq!(incremental["sha256"], full["sha256"]);
+        assert_eq!(incremental["contentHash"], full["contentHash"]);
     }
 
     #[test]
@@ -871,7 +1312,7 @@ mod tests {
         fs::create_dir(&baseline).unwrap();
         fs::write(baseline.join("payload"), b"ok").unwrap();
         let root = directory.path().join("client");
-        let generation = materialize(&root, "generation-1", &baseline).unwrap();
+        let generation = materialize_derived(&root, "generation-1", &baseline, None).unwrap();
         assert_eq!(
             generation.application_path.file_name().unwrap(),
             "Example.app"

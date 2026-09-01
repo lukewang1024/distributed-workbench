@@ -913,7 +913,12 @@ fn processes_for_snapshot_roots(
         let Some(application_root) = outer_application_root(Path::new(command)) else {
             continue;
         };
-        let in_selected_root = roots.contains(&application_root);
+        // A generation may be launched through the mutable `current` symlink
+        // while later lifecycle calls address its immutable generation path
+        // (or vice versa). Treat both spellings as the same bundle.
+        let in_selected_root = roots
+            .iter()
+            .any(|root| same_application_root(root, &application_root));
         let orphan_repair = include_orphan_repair
             && command.contains("Browser Helper (Repair).app/Contents/MacOS/")
             && application_bundle_identifier(&application_root)
@@ -930,6 +935,14 @@ fn processes_for_snapshot_roots(
         }
     }
     Ok(values)
+}
+
+fn same_application_root(left: &Path, right: &Path) -> bool {
+    left == right
+        || match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
 }
 
 fn outer_application_root(executable: &Path) -> Option<PathBuf> {
@@ -1070,6 +1083,33 @@ mod tests {
             processes_for_snapshot_roots(&processes, &[target], false, "example.target").unwrap();
         assert_eq!(selected.len(), 2);
         assert!(selected.iter().all(|item| item["pid"] != 3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_selection_matches_a_generation_through_current_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temporary =
+            std::env::temp_dir().join(format!("workbench-macos-roots-{}", std::process::id()));
+        let generation = temporary.join("generation-a/Doubao.app");
+        std::fs::create_dir_all(&generation).unwrap();
+        let current = temporary.join("current");
+        symlink(temporary.join("generation-a"), &current).unwrap();
+        let processes = vec![json!({
+            "pid": 42,
+            "command": current.join("Doubao.app/Contents/MacOS/Doubao")
+        })];
+
+        let selected = processes_for_snapshot_roots(
+            &processes,
+            std::slice::from_ref(&generation),
+            false,
+            "example.target",
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 1);
+        std::fs::remove_dir_all(&temporary).unwrap();
     }
 
     #[test]

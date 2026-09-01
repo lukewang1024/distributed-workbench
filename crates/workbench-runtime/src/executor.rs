@@ -20,8 +20,8 @@ use workbench_schema::{
 };
 
 use crate::generation::{
-    DataPackResourceTree, Overlay, activate, apply_overlays, materialize, pack_chromium_datapack,
-    record_state,
+    DataPackResourceTree, Overlay, activate, apply_overlays, materialize_derived,
+    pack_chromium_datapack, record_state,
 };
 use crate::process::ProcessTable;
 use crate::telemetry::{event_fields, request_event};
@@ -1290,10 +1290,11 @@ impl ExecutorRuntime {
             "application.materialize" => {
                 let generation_root = self.path(&params, "generationRoot", false)?;
                 let baseline = self.readable_application_path(&params, "baselinePath")?;
-                Ok(serde_json::to_value(materialize(
+                Ok(serde_json::to_value(materialize_derived(
                     &generation_root,
                     required_str(&params, "generationId")?,
                     &baseline,
+                    params.get("derivedFrom").and_then(Value::as_str),
                 )?)
                 .expect("generation serializes"))
             }
@@ -1318,6 +1319,11 @@ impl ExecutorRuntime {
                         || RpcError::new("INVALID_PARAMS", "resourceTrees are required"),
                     )?)
                     .map_err(|error| RpcError::new("INVALID_PARAMS", error.to_string()))?;
+                let base_pack_path = params
+                    .get("basePackPath")
+                    .and_then(Value::as_str)
+                    .map(|path| self.path(&json!({"path": path}), "path", true))
+                    .transpose()?;
                 pack_chromium_datapack(
                     &root_path,
                     &resource_trees,
@@ -1331,6 +1337,19 @@ impl ExecutorRuntime {
                         .get("bundleName")
                         .and_then(Value::as_str)
                         .unwrap_or("doubao-office"),
+                    base_pack_path.as_deref(),
+                    params.get("basePackDigest").and_then(Value::as_str),
+                    &params
+                        .get("changedPrefixes")
+                        .and_then(Value::as_array)
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
                 )
             }
             "application.generation.record" | "application.runtime.record" => {
@@ -2217,7 +2236,8 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             json!({
                 "generationRoot": {"type": "string"},
                 "generationId": {"type": "string"},
-                "baselinePath": {"type": "string"}
+                "baselinePath": {"type": "string"},
+                "derivedFrom": {"type": "string"}
             }),
             vec!["generation:${generationRoot}/${generationId}"],
             vec!["generationRoot", "generationId", "baselinePath"],
@@ -2245,7 +2265,10 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "outputRelative": {"type": "string"},
                 "platform": {"type": "string"},
                 "arch": {"type": "string"},
-                "bundleName": {"type": "string"}
+                "bundleName": {"type": "string"},
+                "basePackPath": {"type": "string"},
+                "basePackDigest": {"type": "string"},
+                "changedPrefixes": {"type": "array", "items": {"type": "string"}}
             }),
             vec!["datapack:${rootPath}/${outputRelative}"],
             vec!["rootPath", "resourceTrees", "outputRelative"],
@@ -2655,6 +2678,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                                     | "file"
                                     | "userDataDir"
                             ) | ("application.open-file", "handlerPath")
+                                | ("application.materialize", "derivedFrom")
+                                | (
+                                    "artifact.pack-chromium-datapack",
+                                    "basePackPath" | "basePackDigest" | "changedPrefixes"
+                                )
                                 | ("filesystem.read", "offset" | "limit")
                         )
                         || (name == "filesystem.write" && key.as_str() == "expectedDigest"))
@@ -2858,7 +2886,9 @@ fn output_schema(name: &str) -> Value {
         "application.materialize" => json!({
             "generationId": {"type": "string"}, "root": {"type": "string"},
             "applicationPath": {"type": "string"}, "markerPath": {"type": "string"},
-            "createdAt": {"type": "integer"}
+            "createdAt": {"type": "integer"}, "derivedFrom": {"type": ["string", "null"]},
+            "cloneHits": {"type": "integer"}, "linkHits": {"type": "integer"},
+            "copiedFiles": {"type": "integer"}, "copiedBytes": {"type": "integer"}
         }),
         "application.activate" => json!({
             "current": {"type": "string"}, "previous": {"type": ["string", "null"]},
