@@ -2979,7 +2979,18 @@ fn output_schema(name: &str) -> Value {
     };
     let required = properties
         .as_object()
-        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .map(|object| {
+            object
+                .keys()
+                .filter(|key| {
+                    !matches!(
+                        (name, key.as_str()),
+                        ("application.launch", "runtimeApplicationPath")
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     json!({
         "type": "object", "properties": properties,
@@ -3705,6 +3716,14 @@ mod tests {
                 .iter()
                 .any(|field| field == "runtimeShadowDir"),
             "the Windows runtime shadow must remain optional for Mac launches"
+        );
+        assert!(
+            !descriptor.output_schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "runtimeApplicationPath"),
+            "Mac launch output does not include a Windows runtime shadow"
         );
         assert!(
             descriptor.input_schema["properties"]["browserExecutableRelative"].is_null(),
