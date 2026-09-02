@@ -197,6 +197,7 @@ pub struct DataPackResourceTree {
 /// Rebuild the Chromium DataPack consumed by Windows Doubao Office from the
 /// final expanded resource tree. This intentionally runs after every overlay,
 /// so the pack and the loose runtime cannot represent different generations.
+#[allow(clippy::too_many_arguments)]
 pub fn pack_chromium_datapack(
     root_path: &Path,
     resource_trees: &[DataPackResourceTree],
