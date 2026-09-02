@@ -2774,6 +2774,9 @@ fn capability_authority(name: &str) -> CapabilityAuthority {
         "ui.automate" | "ui.input" => CapabilityAuthority::ResourceLease {
             resource: "acceptance:${executorId}:${remoteDebuggingPort}".to_owned(),
         },
+        "tunnel.ensure" | "tunnel.stop" => CapabilityAuthority::ResourceLease {
+            resource: "tunnel:${executorId}:${tunnelId}".to_owned(),
+        },
         _ => CapabilityAuthority::WorkspaceDriver,
     }
 }
@@ -3797,6 +3800,19 @@ mod tests {
             CapabilityAuthority::ResourceLease { .. }
         ));
         assert_eq!(descriptor.effect, Effect::Mutating);
+    }
+
+    #[test]
+    fn tunnel_mutations_use_tunnel_resource_authority() {
+        for name in ["tunnel.ensure", "tunnel.stop"] {
+            let descriptor = contract(name, Effect::Mutating);
+            assert_eq!(
+                descriptor.authority,
+                CapabilityAuthority::ResourceLease {
+                    resource: "tunnel:${executorId}:${tunnelId}".to_owned(),
+                }
+            );
+        }
     }
 
     #[test]
