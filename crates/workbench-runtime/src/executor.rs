@@ -517,6 +517,31 @@ impl ExecutorRuntime {
                 }
                 Ok(json!({"requestedRoot": raw, "realRoot": resolved}))
             }
+            "read-grant.find" => {
+                let workspace = required_str(&params, "workspaceSessionId")?;
+                let capability = required_str(&params, "capability")?;
+                let raw = PathBuf::from(required_str(&params, "path")?);
+                let checked = raw
+                    .canonicalize()
+                    .map_err(|error| io_error("PATH_INVALID", &raw, error))?;
+                let fences = self.fences.as_ref().ok_or_else(|| {
+                    RpcError::new(
+                        "READ_GRANT_STATE_REQUIRED",
+                        "executor persistence is required",
+                    )
+                })?;
+                let table = fences.lock().expect("executor state lock");
+                let grant = table.read_grants.iter().find(|grant| {
+                    grant.state == ReadGrantState::Approved
+                        && grant.workspace_session_id == workspace
+                        && grant.executor_id == self.id
+                        && grant.capabilities.iter().any(|item| item == capability)
+                        && checked.starts_with(Path::new(&grant.real_root))
+                });
+                Ok(grant
+                    .map(|grant| serde_json::to_value(grant).expect("grant serializes"))
+                    .unwrap_or(Value::Null))
+            }
             "read-grant.approve" => {
                 let grant: ReadGrant = serde_json::from_value(params)
                     .map_err(|error| RpcError::new("INVALID_READ_GRANT", error.to_string()))?;

@@ -1702,6 +1702,27 @@ impl Controller {
                     json!({"requestedRoot": requested_root}),
                 )?;
                 let real_root = required_str(&resolved, "realRoot")?.to_owned();
+                if let Some(grant) =
+                    self.find_read_grant(executor, workspace, "filesystem.read", &real_root)?
+                {
+                    return Ok(serde_json::to_value(grant).expect("grant serializes"));
+                }
+                if let Some(grant) = self
+                    .state
+                    .lock()
+                    .expect("state lock")
+                    .read_grants
+                    .iter()
+                    .find(|grant| {
+                        grant.workspace_session_id == workspace
+                            && grant.executor_id == executor
+                            && grant.state == ReadGrantState::Requested
+                            && grant.real_root == real_root
+                    })
+                    .cloned()
+                {
+                    return Ok(serde_json::to_value(grant).expect("grant serializes"));
+                }
                 let now = now_ms();
                 let grant = ReadGrant {
                     id: format!("read_grant_{}", Uuid::new_v4().simple()),
@@ -1895,18 +1916,12 @@ impl Controller {
                 ) {
                     input["_workspaceSessionId"] = Value::String(workspace_session_id.to_owned());
                     if let Some(path) = input.get("path").and_then(Value::as_str) {
-                        let state = self.state.lock().expect("state lock");
-                        if let Some(grant) = state.read_grants.iter().find(|grant| {
-                            grant.workspace_session_id == workspace_session_id
-                                && grant.executor_id == executor_id
-                                && grant.state == ReadGrantState::Approved
-                                && grant
-                                    .capabilities
-                                    .iter()
-                                    .any(|item| item == capability_name)
-                                && std::path::Path::new(path)
-                                    .starts_with(std::path::Path::new(&grant.real_root))
-                        }) {
+                        if let Some(grant) = self.find_read_grant(
+                            executor_id,
+                            workspace_session_id,
+                            capability_name,
+                            path,
+                        )? {
                             input["_readGrantId"] = Value::String(grant.id.clone());
                         }
                     }
@@ -1922,18 +1937,12 @@ impl Controller {
                         "baselinePath"
                     };
                     if let Some(path) = input.get(path_key).and_then(Value::as_str) {
-                        let state = self.state.lock().expect("state lock");
-                        if let Some(grant) = state.read_grants.iter().find(|grant| {
-                            grant.workspace_session_id == workspace_session_id
-                                && grant.executor_id == executor_id
-                                && grant.state == ReadGrantState::Approved
-                                && grant
-                                    .capabilities
-                                    .iter()
-                                    .any(|item| item == "filesystem.read")
-                                && std::path::Path::new(path)
-                                    .starts_with(std::path::Path::new(&grant.real_root))
-                        }) {
+                        if let Some(grant) = self.find_read_grant(
+                            executor_id,
+                            workspace_session_id,
+                            "filesystem.read",
+                            path,
+                        )? {
                             input["_readGrantId"] = Value::String(grant.id.clone());
                         }
                     }
@@ -3393,6 +3402,53 @@ impl Controller {
                 .error
                 .unwrap_or_else(|| RpcError::new("EXECUTOR_FAILED", "executor failed")))
         }
+    }
+
+    fn find_read_grant(
+        &self,
+        executor_id: &str,
+        workspace_session_id: &str,
+        capability: &str,
+        path: &str,
+    ) -> Result<Option<ReadGrant>, RpcError> {
+        if let Some(grant) = self
+            .state
+            .lock()
+            .expect("state lock")
+            .read_grants
+            .iter()
+            .find(|grant| {
+                grant.workspace_session_id == workspace_session_id
+                    && grant.executor_id == executor_id
+                    && grant.state == ReadGrantState::Approved
+                    && grant.capabilities.iter().any(|item| item == capability)
+                    && std::path::Path::new(path)
+                        .starts_with(std::path::Path::new(&grant.real_root))
+            })
+            .cloned()
+        {
+            return Ok(Some(grant));
+        }
+        let value = self.call_registered_executor(
+            executor_id,
+            "read-grant.find",
+            json!({
+                "workspaceSessionId": workspace_session_id,
+                "capability": capability,
+                "path": path,
+            }),
+        )?;
+        if value.is_null() {
+            return Ok(None);
+        }
+        let grant: ReadGrant = serde_json::from_value(value)
+            .map_err(|error| RpcError::new("INVALID_READ_GRANT", error.to_string()))?;
+        let mut state = self.state.lock().expect("state lock");
+        state.read_grants.retain(|item| item.id != grant.id);
+        state.read_grants.push(grant.clone());
+        drop(state);
+        self.persist()?;
+        Ok(Some(grant))
     }
 
     fn call_peer_until_success(&self, action: &str, params: Value) -> Result<Value, RpcError> {
@@ -5017,6 +5073,81 @@ mod tests {
         ).unwrap();
         assert_eq!(ready["readiness"]["state"], "ready");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_read_grant_is_reused_across_controllers() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = directory.path().join("managed");
+        let downloads = directory.path().join("Downloads");
+        std::fs::create_dir_all(&managed).unwrap();
+        std::fs::create_dir_all(&downloads).unwrap();
+        let runtime = Arc::new(
+            crate::ExecutorRuntime::open_with_grantable(
+                "mac",
+                vec![managed],
+                vec![downloads.clone()],
+                directory.path().join("executor-fences.json"),
+            )
+            .unwrap(),
+        );
+        let socket = directory.path().join("executor.sock");
+        std::thread::spawn({
+            let runtime = Arc::clone(&runtime);
+            let socket = socket.clone();
+            move || {
+                RpcServer::new(socket)
+                    .serve(move |request| runtime.handle(request))
+                    .unwrap()
+            }
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let controller_a =
+            Controller::open(JsonStore::new(directory.path().join("controller-a.json"))).unwrap();
+        let controller_b =
+            Controller::open(JsonStore::new(directory.path().join("controller-b.json"))).unwrap();
+        for controller in [&controller_a, &controller_b] {
+            assert!(
+                controller
+                    .handle(Request::new(
+                        "executor.register",
+                        json!({"executorId":"mac","endpoint":{"transport":"local","socket":socket}}),
+                    ))
+                    .ok
+            );
+        }
+
+        let request = || {
+            Request::new(
+                "read-grant.request",
+                json!({
+                    "workspaceSessionId":"workspace-a",
+                    "executorId":"mac",
+                    "requestedRoot":downloads,
+                    "requestedBy":"agent",
+                }),
+            )
+        };
+        let first = controller_a.handle(request()).result.unwrap();
+        let approved = controller_a.handle(Request::new(
+            "read-grant.approve",
+            json!({"grantId":first["id"],"approvedBy":"user"}),
+        ));
+        assert!(approved.ok, "{:?}", approved.error);
+
+        let reused = controller_b.handle(request());
+        assert!(reused.ok, "{:?}", reused.error);
+        let reused = reused.result.unwrap();
+        assert_eq!(reused["id"], first["id"]);
+        assert_eq!(reused["state"], "approved");
+        assert_eq!(controller_b.state.lock().unwrap().read_grants.len(), 1);
     }
 
     #[test]
