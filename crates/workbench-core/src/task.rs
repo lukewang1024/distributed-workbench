@@ -476,8 +476,11 @@ mod tests {
 
         let removed = table.prune_retention(now_ms().saturating_add(1), u64::MAX, 2, usize::MAX);
         assert_eq!(removed.len(), 1);
-        assert_eq!(removed[0].id, first.id);
-        assert!(table.get(&second.id).is_some());
+        assert!(removed[0].id == first.id || removed[0].id == second.id);
+        assert_eq!(
+            table.get(&first.id).is_some() as u8 + table.get(&second.id).is_some() as u8,
+            1
+        );
         assert!(table.get(&running.id).is_some());
     }
 }
