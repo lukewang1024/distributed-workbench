@@ -89,7 +89,7 @@ impl JsonStore {
             .create_new(true)
             .write(true)
             .open(&temporary)?;
-        file.write_all(&serde_json::to_vec_pretty(state)?)?;
+        file.write_all(&serde_json::to_vec(state)?)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
         atomic_replace(&temporary, &self.path)?;
