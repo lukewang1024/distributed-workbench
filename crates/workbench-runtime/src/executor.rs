@@ -423,6 +423,8 @@ impl ExecutorRuntime {
                 .map(|lock| render_authority_resource(&lock.key, params))
                 .collect::<Result<Vec<_>, _>>()?,
         );
+        expected_resources.sort();
+        expected_resources.dedup();
         let supplied_resources: Vec<&str> = authorities
             .iter()
             .map(|authority| required_str(authority, "resource"))
@@ -2753,6 +2755,11 @@ fn capability_authority(name: &str) -> CapabilityAuthority {
         | "filesystem.list"
         | "filesystem.search"
         | "artifact.describe"
+        | "artifact.relay.archive.create"
+        | "artifact.relay.archive.read"
+        | "artifact.relay.archive.remove"
+        | "artifact.relay.manifest"
+        | "artifact.relay.read"
         | "process.get"
         | "process.list"
         | "process.events"
@@ -2776,6 +2783,14 @@ fn capability_authority(name: &str) -> CapabilityAuthority {
         },
         "tunnel.ensure" | "tunnel.stop" => CapabilityAuthority::ResourceLease {
             resource: "tunnel:${executorId}:${tunnelId}".to_owned(),
+        },
+        "artifact.relay.archive.prepare"
+        | "artifact.relay.archive.write"
+        | "artifact.relay.archive.commit"
+        | "artifact.relay.prepare"
+        | "artifact.relay.write"
+        | "artifact.relay.commit" => CapabilityAuthority::ResourceLease {
+            resource: "artifact-relay:${destination}".to_owned(),
         },
         _ => CapabilityAuthority::WorkspaceDriver,
     }
@@ -3810,6 +3825,37 @@ mod tests {
                 descriptor.authority,
                 CapabilityAuthority::ResourceLease {
                     resource: "tunnel:${executorId}:${tunnelId}".to_owned(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_relay_reads_are_unfenced_and_writes_use_destination_resource() {
+        for name in [
+            "artifact.relay.archive.create",
+            "artifact.relay.archive.read",
+            "artifact.relay.archive.remove",
+            "artifact.relay.manifest",
+            "artifact.relay.read",
+        ] {
+            assert_eq!(
+                contract(name, Effect::ReadOnly).authority,
+                CapabilityAuthority::None
+            );
+        }
+        for name in [
+            "artifact.relay.archive.prepare",
+            "artifact.relay.archive.write",
+            "artifact.relay.archive.commit",
+            "artifact.relay.prepare",
+            "artifact.relay.write",
+            "artifact.relay.commit",
+        ] {
+            assert_eq!(
+                contract(name, Effect::Mutating).authority,
+                CapabilityAuthority::ResourceLease {
+                    resource: "artifact-relay:${destination}".to_owned(),
                 }
             );
         }

@@ -3452,25 +3452,6 @@ impl Controller {
         let source_path = required_str(source, "path")?;
         let destination_executor = required_str(destination, "executorId")?;
         let destination_path = required_str(destination, "path")?;
-        let workspace_session_id = required_str(params, "workspaceSessionId")?;
-        let owner = required_str(params, "owner")?;
-        let driver_token = required_str(params, "driverToken")?;
-        let driver = {
-            let leases = self.leases.lock().expect("lease lock");
-            leases
-                .validate(
-                    &format!("workspace:{workspace_session_id}"),
-                    owner,
-                    driver_token,
-                )
-                .map_err(map_lease_error)?
-                .clone()
-        };
-        let source_authority = json!([{
-            "controllerId": self.id,
-            "resource": driver.resource,
-            "fence": executor_execution_fence(driver.fence),
-        }]);
         let mode = params
             .get("mode")
             .and_then(Value::as_str)
@@ -3489,7 +3470,7 @@ impl Controller {
         match self.call_registered_executor(
             source_executor,
             "artifact.relay.archive.create",
-            json!({"path": source_path, "_workspaceSessionId": workspace_session_id, "_authority": source_authority}),
+            json!({"path": source_path}),
         ) {
             Ok(archive) => {
                 transfer_event(
@@ -3503,12 +3484,11 @@ impl Controller {
                     destination_path,
                     mode,
                     archive,
-                    (workspace_session_id, &source_authority),
                 );
                 let _ = self.call_registered_executor(
                     source_executor,
                     "artifact.relay.archive.remove",
-                    json!({"token": token, "_workspaceSessionId": workspace_session_id, "_authority": source_authority}),
+                    json!({"token": token}),
                 );
                 return result.map(|mut value| {
                     value["transfer"]["totalDurationMs"] =
@@ -3650,9 +3630,7 @@ impl Controller {
         destination_path: &str,
         mode: &str,
         archive: Value,
-        authority_context: (&str, &Value),
     ) -> Result<Value, RpcError> {
-        let (workspace_session_id, driver_authority) = authority_context;
         let token = required_str(&archive, "token")?.to_owned();
         let expected_digest = required_str(&archive, "digest")?.to_owned();
         let archive_size = archive
@@ -3689,10 +3667,11 @@ impl Controller {
             "{destination_path}.workbench-relay-{}",
             Uuid::new_v4().simple()
         );
-        let mut authority = driver_authority.as_array().cloned().unwrap_or_default();
-        authority
-            .push(json!({"controllerId": self.id, "resource": resource, "fence": lease.fence}));
-        let authority = Value::Array(authority);
+        let authority = json!([{
+            "controllerId": self.id,
+            "resource": resource,
+            "fence": lease.fence
+        }]);
         let result = (|| {
             let prepare_started = Instant::now();
             transfer_event(
@@ -3702,7 +3681,7 @@ impl Controller {
             self.call_registered_executor(
                 destination_executor,
                 "artifact.relay.archive.prepare",
-                json!({"destination": destination_path, "staging": staging, "_workspaceSessionId": workspace_session_id, "_authority": authority}),
+                json!({"destination": destination_path, "staging": staging, "_authority": authority}),
             )
             .map_err(|error| transfer_error(error, "preparing", 0, 0))?;
             transfer_event(
@@ -3722,7 +3701,7 @@ impl Controller {
                     .call_registered_executor(
                         source_executor,
                         "artifact.relay.archive.read",
-                        json!({"token": token, "offset": offset, "limit": 8 * 1024 * 1024, "_workspaceSessionId": workspace_session_id, "_authority": driver_authority}),
+                        json!({"token": token, "offset": offset, "limit": 8 * 1024 * 1024}),
                     )
                     .map_err(|error| transfer_error(error, "reading", offset, chunks))?;
                 let bytes = chunk.get("bytes").and_then(Value::as_u64).ok_or_else(|| {
@@ -3748,7 +3727,7 @@ impl Controller {
                 self.call_registered_executor(
                     destination_executor,
                     "artifact.relay.archive.write",
-                    json!({"destination": destination_path, "staging": staging, "offset": offset, "data": chunk["data"], "_workspaceSessionId": workspace_session_id, "_authority": authority}),
+                    json!({"destination": destination_path, "staging": staging, "offset": offset, "data": chunk["data"], "_authority": authority}),
                 )
                 .map_err(|error| transfer_error(error, "writing", offset, chunks))?;
                 offset = offset.saturating_add(bytes);
@@ -3771,7 +3750,7 @@ impl Controller {
                     json!({
                         "destination": destination_path, "staging": staging,
                         "expectedDigest": expected_digest, "archiveSize": archive_size,
-                        "size": size, "files": files, "kind": kind, "_workspaceSessionId": workspace_session_id, "_authority": authority
+                        "size": size, "files": files, "kind": kind, "_authority": authority
                     }),
                 )
                 .map_err(|error| transfer_error(error, "committing", offset, chunks))?;
@@ -5141,7 +5120,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_relays_artifacts_between_executors_without_hostnames() {
+    fn controller_relays_artifacts_while_another_agent_holds_workspace_driver() {
         let directory = tempfile::tempdir().unwrap();
         let source_root = directory.path().join("source");
         let destination_root = directory.path().join("destination");
@@ -5196,21 +5175,20 @@ mod tests {
         ] {
             assert!(controller.handle(Request::new("executor.register", json!({"executorId": id, "endpoint": {"transport": "local", "socket": socket}}))).ok);
         }
-        let driver = controller
-            .handle(Request::new(
-                "driver.acquire",
-                json!({"resource": "workspace:relay-test", "owner": "relay-agent", "ttlMs": 60_000}),
-            ))
-            .result
-            .unwrap();
-        let driver_token = driver["token"].as_str().unwrap();
+        assert!(
+            controller
+                .handle(Request::new(
+                    "driver.acquire",
+                    json!({"resource": "workspace:relay-test", "owner": "diagnostic-agent", "ttlMs": 60_000}),
+                ))
+                .ok
+        );
         let transferred = controller.handle(Request::new(
             "artifact.transfer",
             json!({
                 "source": {"executorId": "source", "path": source_root},
                 "destination": {"executorId": "destination", "path": destination_root.join("copy")},
-                "mode": "mirror",
-                "workspaceSessionId": "relay-test", "owner": "relay-agent", "driverToken": driver_token
+                "mode": "mirror"
             }),
         ));
         assert!(transferred.ok, "{:?}", transferred.error);
@@ -5243,8 +5221,7 @@ mod tests {
             json!({
                 "source": {"executorId": "destination", "path": destination_root.join("copy")},
                 "destination": {"executorId": "source", "path": source_root.join("roundtrip")},
-                "mode": "mirror",
-                "workspaceSessionId": "relay-test", "owner": "relay-agent", "driverToken": driver_token
+                "mode": "mirror"
             }),
         ));
         assert!(reverse.ok, "{:?}", reverse.error);
