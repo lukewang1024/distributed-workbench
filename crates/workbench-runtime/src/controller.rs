@@ -24,6 +24,11 @@ use workbench_schema::{
 use crate::telemetry::{event_fields, request_event, task_event};
 use crate::transport::{call_executor, call_executor_with_timeout};
 
+const DEFAULT_TASK_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+const DEFAULT_TASK_MAX_COUNT: usize = 5_000;
+const DEFAULT_TASK_MAX_BYTES: usize = 128 * 1024 * 1024;
+const MAX_PERSISTED_TASK_OUTPUT_BYTES: usize = 256 * 1024;
+
 #[derive(Clone, Default)]
 struct TraceContext {
     correlation_id: String,
@@ -180,7 +185,13 @@ impl Controller {
         let reaped = leases.reap_expired();
         let mut tasks = TaskTable::from_tasks(state.tasks.clone());
         let recovered = tasks.recover_orphans();
-        if identity_changed || compacted || !reaped.is_empty() || !recovered.is_empty() {
+        let pruned = prune_task_retention(&mut tasks);
+        if identity_changed
+            || compacted
+            || !reaped.is_empty()
+            || !recovered.is_empty()
+            || !pruned.is_empty()
+        {
             state.leases = leases.persistence_snapshot();
             state.lease_fences = leases.fence_snapshot();
             state.tasks = tasks.persistence_snapshot();
@@ -1915,15 +1926,15 @@ impl Controller {
                         | "filesystem.search"
                 ) {
                     input["_workspaceSessionId"] = Value::String(workspace_session_id.to_owned());
-                    if let Some(path) = input.get("path").and_then(Value::as_str) {
-                        if let Some(grant) = self.find_read_grant(
+                    if let Some(path) = input.get("path").and_then(Value::as_str)
+                        && let Some(grant) = self.find_read_grant(
                             executor_id,
                             workspace_session_id,
                             capability_name,
                             path,
-                        )? {
-                            input["_readGrantId"] = Value::String(grant.id.clone());
-                        }
+                        )?
+                    {
+                        input["_readGrantId"] = Value::String(grant.id.clone());
                     }
                 }
                 if matches!(
@@ -1936,15 +1947,15 @@ impl Controller {
                     } else {
                         "baselinePath"
                     };
-                    if let Some(path) = input.get(path_key).and_then(Value::as_str) {
-                        if let Some(grant) = self.find_read_grant(
+                    if let Some(path) = input.get(path_key).and_then(Value::as_str)
+                        && let Some(grant) = self.find_read_grant(
                             executor_id,
                             workspace_session_id,
                             "filesystem.read",
                             path,
-                        )? {
-                            input["_readGrantId"] = Value::String(grant.id.clone());
-                        }
+                        )?
+                    {
+                        input["_readGrantId"] = Value::String(grant.id.clone());
                     }
                 }
                 let invocation_is_readonly = matches!(
@@ -4112,7 +4123,10 @@ impl Controller {
         state.leases = leases.persistence_snapshot();
         state.lease_fences = leases.fence_snapshot();
         drop(leases);
-        state.tasks = self.tasks.lock().expect("task lock").persistence_snapshot();
+        let mut tasks = self.tasks.lock().expect("task lock");
+        prune_task_retention(&mut tasks);
+        state.tasks = tasks.persistence_snapshot();
+        compact_task_outputs(&mut state.tasks);
         self.store
             .save(&state)
             .map_err(|error| RpcError::new("STATE_WRITE_FAILED", error.to_string()))
@@ -4430,6 +4444,58 @@ fn retained_task_output(capability: &str, result: &Value) -> Value {
     })
 }
 
+fn configured_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn configured_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn prune_task_retention(tasks: &mut TaskTable) -> Vec<Task> {
+    tasks.prune_retention(
+        now_ms(),
+        configured_u64("WORKBENCH_TASK_RETENTION_MS", DEFAULT_TASK_RETENTION_MS),
+        configured_usize("WORKBENCH_TASK_MAX_COUNT", DEFAULT_TASK_MAX_COUNT),
+        configured_usize("WORKBENCH_TASK_MAX_BYTES", DEFAULT_TASK_MAX_BYTES),
+    )
+}
+
+fn bounded_task_output(result: &Value) -> Value {
+    let encoded = serde_json::to_vec(result).unwrap_or_default();
+    if encoded.len() <= MAX_PERSISTED_TASK_OUTPUT_BYTES {
+        return result.clone();
+    }
+    let mut summary = serde_json::Map::new();
+    for key in [
+        "id",
+        "path",
+        "destination",
+        "digest",
+        "size",
+        "encoding",
+        "truncated",
+        "nextOffset",
+    ] {
+        if let Some(value) = result.get(key) {
+            summary.insert(key.to_owned(), value.clone());
+        }
+    }
+    summary.insert("_workbenchOutputOmitted".to_owned(), Value::Bool(true));
+    summary.insert("originalBytes".to_owned(), json!(encoded.len()));
+    summary.insert(
+        "outputDigest".to_owned(),
+        Value::String(sha256_bytes(&encoded)),
+    );
+    Value::Object(summary)
+}
+
 fn collect_native_accessible_names(value: &Value, names: &mut Vec<String>, limit: usize) {
     if names.len() >= limit {
         return;
@@ -4466,10 +4532,9 @@ fn collect_native_accessible_names(value: &Value, names: &mut Vec<String>, limit
 fn compact_task_outputs(tasks: &mut [Task]) -> bool {
     let mut changed = false;
     for task in tasks {
-        if task.capability == "ui.native-inspect"
-            && let Some(output) = task.output.as_ref()
-        {
-            let compact = retained_task_output(&task.capability, output);
+        if let Some(output) = task.output.as_ref() {
+            let specialized = retained_task_output(&task.capability, output);
+            let compact = bounded_task_output(&specialized);
             if &compact != output {
                 task.output = Some(compact);
                 changed = true;
@@ -5979,6 +6044,23 @@ mod tests {
             json!(["document.docx"])
         );
         assert_eq!(retained_task_output("ui.evaluate", &output), output);
+    }
+
+    #[test]
+    fn persisted_task_output_omits_oversized_payloads() {
+        let output = json!({"content": "x".repeat(MAX_PERSISTED_TASK_OUTPUT_BYTES)});
+        let compact = bounded_task_output(&output);
+        assert_eq!(compact["_workbenchOutputOmitted"], true);
+        assert!(
+            compact["originalBytes"].as_u64().unwrap() > MAX_PERSISTED_TASK_OUTPUT_BYTES as u64
+        );
+        assert!(
+            compact["outputDigest"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert!(compact.get("content").is_none());
     }
 
     #[test]

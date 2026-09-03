@@ -130,6 +130,13 @@ and the additional `--apply` flag. Override the counts with
 `DISTRIBUTED_WORKBENCH_KEEP_DEPLOYMENTS` and
 `DISTRIBUTED_WORKBENCH_KEEP_BACKUPS`.
 
+The Controller separately bounds persistent task history. Terminal tasks are
+retained for seven days, up to 5,000 records or 128 MiB, and task outputs larger
+than 256 KiB are persisted as digest-bearing summaries. Live callers still
+receive the complete result. Tune the defaults with
+`WORKBENCH_TASK_RETENTION_MS`, `WORKBENCH_TASK_MAX_COUNT`, and
+`WORKBENCH_TASK_MAX_BYTES`; active tasks are never removed by retention.
+
 ## Linux user deployment
 
 Build and install a node-local Controller and Executor as systemd user units:

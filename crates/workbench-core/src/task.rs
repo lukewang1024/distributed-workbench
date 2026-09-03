@@ -219,6 +219,63 @@ impl TaskTable {
         removed
     }
 
+    pub fn prune_retention(
+        &mut self,
+        now: u64,
+        retention_ms: u64,
+        max_count: usize,
+        max_bytes: usize,
+    ) -> Vec<Task> {
+        let cutoff = now.saturating_sub(retention_ms);
+        let mut remove_ids: std::collections::BTreeSet<String> = self
+            .tasks
+            .values()
+            .filter(|task| task.state.terminal() && task.updated_at < cutoff)
+            .map(|task| task.id.clone())
+            .collect();
+        let mut retained_count = self.tasks.len().saturating_sub(remove_ids.len());
+        let mut retained_bytes = self
+            .tasks
+            .values()
+            .filter(|task| !remove_ids.contains(&task.id))
+            .map(|task| serde_json::to_vec(task).map_or(0, |encoded| encoded.len()))
+            .sum::<usize>();
+        let mut terminal = self
+            .tasks
+            .values()
+            .filter(|task| task.state.terminal() && !remove_ids.contains(&task.id))
+            .map(|task| {
+                (
+                    task.updated_at,
+                    task.id.clone(),
+                    serde_json::to_vec(task).map_or(0, |encoded| encoded.len()),
+                )
+            })
+            .collect::<Vec<_>>();
+        terminal.sort_by_key(|(updated_at, id, _)| (*updated_at, id.clone()));
+        for (_, id, bytes) in terminal {
+            if retained_count <= max_count && retained_bytes <= max_bytes {
+                break;
+            }
+            remove_ids.insert(id);
+            retained_count = retained_count.saturating_sub(1);
+            retained_bytes = retained_bytes.saturating_sub(bytes);
+        }
+        let mut removed = Vec::with_capacity(remove_ids.len());
+        for id in remove_ids {
+            if let Some(task) = self.tasks.remove(&id) {
+                self.idempotency.remove(&scoped_idempotency_key(
+                    &task.workspace_session_id,
+                    &task.executor_id,
+                    &task.capability,
+                    &task.idempotency_key,
+                ));
+                removed.push(task);
+            }
+        }
+        removed
+    }
+
     pub fn recover_orphans(&mut self) -> Vec<Task> {
         let mut recovered = Vec::new();
         for task in self
@@ -386,5 +443,44 @@ mod tests {
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].state, TaskState::OutcomeUnknown);
         assert!(recovered[0].error.as_ref().unwrap().retryable);
+    }
+
+    #[test]
+    fn retention_keeps_active_tasks_and_evicts_oldest_terminal_tasks() {
+        let mut table = TaskTable::default();
+        let (first, _) = table.submit("s", "e", "filesystem.read", Value::Null, "first");
+        table
+            .transition(&first.id, TaskState::Running, None, None)
+            .unwrap();
+        table
+            .transition(
+                &first.id,
+                TaskState::Succeeded,
+                Some(json!({"value": "old"})),
+                None,
+            )
+            .unwrap();
+        let (second, _) = table.submit("s", "e", "filesystem.read", Value::Null, "second");
+        table
+            .transition(&second.id, TaskState::Running, None, None)
+            .unwrap();
+        table
+            .transition(
+                &second.id,
+                TaskState::Succeeded,
+                Some(json!({"value": "new"})),
+                None,
+            )
+            .unwrap();
+        let (running, _) = table.submit("s", "e", "command.run", Value::Null, "running");
+
+        let removed = table.prune_retention(now_ms().saturating_add(1), u64::MAX, 2, usize::MAX);
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].id == first.id || removed[0].id == second.id);
+        assert_eq!(
+            table.get(&first.id).is_some() as u8 + table.get(&second.id).is_some() as u8,
+            1
+        );
+        assert!(table.get(&running.id).is_some());
     }
 }
