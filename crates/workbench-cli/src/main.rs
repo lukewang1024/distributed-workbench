@@ -249,6 +249,7 @@ struct FabricConnection {
 enum FabricPlatform {
     Macos,
     Linux,
+    Termux,
     Windows,
 }
 
@@ -1739,6 +1740,8 @@ fn load_fabric_manifest(path: &Path) -> Result<FabricManifest> {
             (node.platform, node.architecture),
             (FabricPlatform::Macos, FabricArchitecture::Aarch64)
                 | (FabricPlatform::Linux, FabricArchitecture::X86_64)
+                | (FabricPlatform::Termux, FabricArchitecture::Aarch64)
+                | (FabricPlatform::Termux, FabricArchitecture::X86_64)
                 | (FabricPlatform::Windows, FabricArchitecture::X86_64)
         ) {
             bail!(
@@ -1769,15 +1772,24 @@ fn plan_fabric_manifest(path: &Path) -> Result<()> {
         .collect();
     let mut links = Vec::new();
     for node in &remote_nodes {
+        let (dialer, peer) = if matches!(node.platform, FabricPlatform::Termux) {
+            (node.id.as_str(), manifest.initiator_node.as_str())
+        } else {
+            (manifest.initiator_node.as_str(), node.id.as_str())
+        };
         links.push(serde_json::json!({
-            "dialer": manifest.initiator_node,
-            "peer": node.id,
+            "dialer": dialer,
+            "peer": peer,
             "sshAlias": node.connection.as_ref().map(|connection| &connection.ssh_alias),
         }));
     }
     for (index, left) in remote_nodes.iter().enumerate() {
         for right in remote_nodes.iter().skip(index + 1) {
-            let (dialer, peer) = if !matches!(left.platform, FabricPlatform::Windows)
+            let (dialer, peer) = if matches!(left.platform, FabricPlatform::Termux) {
+                (*left, *right)
+            } else if matches!(right.platform, FabricPlatform::Termux) {
+                (*right, *left)
+            } else if !matches!(left.platform, FabricPlatform::Windows)
                 && matches!(right.platform, FabricPlatform::Windows)
             {
                 (*left, *right)
@@ -2046,6 +2058,30 @@ topology: {mode: full-mesh}
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn fabric_manifest_accepts_termux_as_an_android_node() {
+        let manifest: FabricManifest = serde_yaml::from_str(
+            r#"
+apiVersion: distributed-workbench.dev/v1
+kind: Fabric
+initiatorNode: phone
+nodes:
+  - id: phone
+    platform: termux
+    architecture: aarch64
+    allowRoots: ["${user.home}/Workspace"]
+  - id: devbox
+    platform: linux
+    architecture: x86_64
+    connection: {sshAlias: devbox}
+    allowRoots: ["/srv/workspace"]
+topology: {mode: full-mesh}
+"#,
+        )
+        .unwrap();
+        assert!(matches!(manifest.nodes[0].platform, FabricPlatform::Termux));
     }
 
     #[test]

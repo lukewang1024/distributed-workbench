@@ -229,10 +229,22 @@ Windows Service must have a machine-level OpenSSH configuration and key that
 can reach that peer. Laptop-to-Windows links need only the normal laptop SSH
 identity because the laptop remains the physical dialer.
 
+## Termux / Android deployment
+
+Termux nodes use Android-native release binaries and `termux-services`. The
+phone initiates the persistent SSH transport, which is suitable for mobile
+networks and still makes both sides' Controller and Executor available:
+
+```sh
+pkg install termux-services openssh
+scripts/install-from-release.sh latest
+scripts/connect-termux-peer.sh cndevbox redmi-k60-termux
+```
+
 ## Prebuilt releases
 
-Tagged releases publish checksum-protected archives for Linux x86_64, Apple
-Silicon macOS, and Windows x86_64 on the [GitHub Releases page](https://github.com/lukewang1024/distributed-workbench/releases).
+Tagged releases publish checksum-protected archives for Linux x86_64, Android
+aarch64/x86_64, Apple Silicon macOS, and Windows x86_64 on the [GitHub Releases page](https://github.com/lukewang1024/distributed-workbench/releases).
 Install the latest compatible release from a checkout with:
 
 ```sh

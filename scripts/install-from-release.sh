@@ -6,9 +6,15 @@ if [ "$#" -gt 0 ]; then
   shift
 fi
 repository=${DISTRIBUTED_WORKBENCH_REPOSITORY:-lukewang1024/distributed-workbench}
-case $(uname -s):$(uname -m) in
-  Linux:x86_64) target=x86_64-unknown-linux-musl ;;
-  Darwin:arm64) target=aarch64-apple-darwin ;;
+termux_marker=${TERMUX_VERSION:-}
+if [ "${PREFIX:-}" = /data/data/com.termux/files/usr ]; then
+  termux_marker=termux
+fi
+case $termux_marker:$(uname -s):$(uname -m) in
+  ?*:Linux:aarch64|?*:Linux:arm64) target=aarch64-linux-android ;;
+  ?*:Linux:x86_64) target=x86_64-linux-android ;;
+  :Linux:x86_64) target=x86_64-unknown-linux-musl ;;
+  :Darwin:arm64) target=aarch64-apple-darwin ;;
   *) echo "install-from-release: unsupported platform: $(uname -s) $(uname -m)" >&2; exit 2 ;;
 esac
 
@@ -27,7 +33,11 @@ curl -fsSL "$base/$archive" -o "$temporary/$archive"
 curl -fsSL "$base/SHA256SUMS" -o "$temporary/SHA256SUMS"
 expected=$(awk -v name="$archive" '$2 == name {print $1}' "$temporary/SHA256SUMS")
 test -n "$expected" || { echo "install-from-release: checksum missing" >&2; exit 1; }
-actual=$(shasum -a 256 "$temporary/$archive" | awk '{print $1}')
+if command -v sha256sum >/dev/null 2>&1; then
+  actual=$(sha256sum "$temporary/$archive" | awk '{print $1}')
+else
+  actual=$(shasum -a 256 "$temporary/$archive" | awk '{print $1}')
+fi
 test "$actual" = "$expected" || { echo "install-from-release: checksum mismatch" >&2; exit 1; }
 tar -C "$temporary" -xzf "$temporary/$archive"
 root=$temporary/distributed-workbench-$version-$target
@@ -42,5 +52,9 @@ case $target in
     ;;
   *-apple-darwin)
     (cd "$root" && scripts/install-macos-app.sh bin/workbench-macos-agent)
+    ;;
+  *-linux-android)
+    executor_id=${DISTRIBUTED_WORKBENCH_EXECUTOR_ID:-$(hostname -s)-termux}
+    (cd "$root" && scripts/install-termux-user.sh "$root/bin/workbench" "$executor_id" "$@")
     ;;
 esac

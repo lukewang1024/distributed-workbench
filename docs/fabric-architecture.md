@@ -57,12 +57,18 @@ and service supervision vary:
 | --- | --- | --- | --- |
 | macOS | Unix socket | launchd | native OpenSSH client/server |
 | Linux | Unix socket | systemd user service | native OpenSSH |
+| Termux | Unix socket | termux-services / runit | native OpenSSH client |
 | Windows | Named Pipe | Windows Service | native OpenSSH Server |
 
 The Rust local-socket abstraction maps the same endpoint API to Unix sockets or
 Windows Named Pipes. A Windows dial target uses `peer connect --remote-platform windows`
 so the SSH command invokes the native executable through PowerShell. The
 Windows node itself does not require WSL or MSYS2.
+
+Termux is a first-class Android node. Since phones are commonly behind NAT and
+move between networks, a Termux node is always the dialer for a link involving
+it. Its reconnecting outbound SSH process still exposes both Controller and
+Executor roles in both directions.
 
 WSL2 may run a separate Linux node when Linux behavior is itself required, but
 it should have its own node identity and lifecycle. WSL1 is compatibility-only:
@@ -72,8 +78,8 @@ daemon, IPC, or process ownership boundary.
 
 ## Lifecycle and health
 
-macOS peers run as launchd agents, Linux peers as systemd user services, and
-Windows roles as Windows Services. The peer runtime owns reconnect with bounded
+macOS peers run as launchd agents, Linux peers as systemd user services,
+Termux peers under runit, and Windows roles as Windows Services. The peer runtime owns reconnect with bounded
 exponential backoff and SSH keepalives. Its status records a stable connection
 ID and a generation that increases after reconnect.
 

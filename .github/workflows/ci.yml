@@ -36,3 +36,33 @@ jobs:
             $errors += $fileErrors
           }
           if ($errors.Count) { $errors | Format-List; exit 1 }
+
+  android:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-linux-android
+            linker: aarch64-linux-android24-clang
+          - target: x86_64-linux-android
+            linker: x86_64-linux-android24-clang
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      - name: Configure Android toolchain
+        shell: bash
+        run: |
+          toolchain="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          linker="$toolchain/${{ matrix.linker }}"
+          test -x "$linker"
+          cargo_key=$(printf '%s' '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')
+          cc_key=$(printf '%s' '${{ matrix.target }}' | tr '-' '_')
+          echo "CARGO_TARGET_${cargo_key}_LINKER=$linker" >> "$GITHUB_ENV"
+          echo "CC_${cc_key}=$linker" >> "$GITHUB_ENV"
+          echo "AR_${cc_key}=$toolchain/llvm-ar" >> "$GITHUB_ENV"
+      - run: cargo build --locked --target '${{ matrix.target }}' --bin workbench

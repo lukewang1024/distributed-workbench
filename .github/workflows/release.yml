@@ -27,6 +27,12 @@ jobs:
             target: aarch64-apple-darwin
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
+          - runner: ubuntu-latest
+            target: aarch64-linux-android
+            android_linker: aarch64-linux-android24-clang
+          - runner: ubuntu-latest
+            target: x86_64-linux-android
+            android_linker: x86_64-linux-android24-clang
     steps:
       - uses: actions/checkout@v7
         with:
@@ -40,6 +46,17 @@ jobs:
       - name: Install musl C toolchain
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Configure Android linker
+        if: endsWith(matrix.target, '-linux-android')
+        shell: bash
+        run: |
+          linker="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.android_linker }}"
+          test -x "$linker"
+          key=$(printf '%s' '${{ matrix.target }}' | tr '[:lower:]-' '[:upper:]_')
+          echo "CARGO_TARGET_${key}_LINKER=$linker" >> "$GITHUB_ENV"
+          cc_key=$(printf '%s' '${{ matrix.target }}' | tr '-' '_')
+          echo "CC_${cc_key}=$linker" >> "$GITHUB_ENV"
+          echo "AR_${cc_key}=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar" >> "$GITHUB_ENV"
       - name: Resolve version
         id: version
         shell: bash
@@ -54,7 +71,13 @@ jobs:
             exit 2
           }
       - name: Build release binaries
-        run: cargo build --release --locked --target '${{ matrix.target }}' --bins
+        shell: bash
+        run: |
+          if [[ '${{ matrix.target }}' == *-linux-android ]]; then
+            cargo build --release --locked --target '${{ matrix.target }}' --bin workbench
+          else
+            cargo build --release --locked --target '${{ matrix.target }}' --bins
+          fi
       - name: Package release archive
         shell: bash
         run: >-

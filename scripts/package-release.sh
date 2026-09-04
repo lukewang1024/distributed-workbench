@@ -28,7 +28,7 @@ case $target in
     ;;
 esac
 cp README.md LICENSE "$staging/"
-cp scripts/install-from-release.sh scripts/install-from-release.ps1 scripts/install-linux-user.sh scripts/install-macos-app.sh scripts/install-windows.ps1 scripts/install-windows-peer.ps1 scripts/bootstrap-fabric.sh scripts/repair-fabric.sh scripts/preflight-fabric.sh scripts/plan-release-fabric.sh scripts/install-agent-skills.sh scripts/prune-state.sh "$staging/scripts/"
+cp scripts/install-from-release.sh scripts/install-from-release.ps1 scripts/install-linux-user.sh scripts/install-termux-user.sh scripts/connect-termux-peer.sh scripts/install-macos-app.sh scripts/install-windows.ps1 scripts/install-windows-peer.ps1 scripts/bootstrap-fabric.sh scripts/repair-fabric.sh scripts/preflight-fabric.sh scripts/plan-release-fabric.sh scripts/install-agent-skills.sh scripts/prune-state.sh "$staging/scripts/"
 cp packaging/* "$staging/packaging/"
 cp -R skills/workbench-fabric "$staging/skills/"
 case $target in
