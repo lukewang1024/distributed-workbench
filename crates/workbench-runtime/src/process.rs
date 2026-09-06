@@ -18,6 +18,13 @@ use workbench_protocol::RpcError;
 pub struct ProcessRecord {
     pub id: String,
     pub pid: u32,
+    /// OS process birth identity; old records deliberately remain unverified.
+    #[serde(default)]
+    pub birth_identity: Option<String>,
+    #[serde(default)]
+    pub identity_verified: bool,
+    #[serde(default)]
+    pub observed_at: Option<u64>,
     pub cwd: PathBuf,
     pub argv: Vec<String>,
     #[serde(default)]
@@ -109,16 +116,16 @@ impl ProcessTable {
         if argv.is_empty() {
             return Err(RpcError::new("INVALID_PARAMS", "argv must not be empty"));
         }
-        if self
-            .records
-            .lock()
-            .expect("process lock")
-            .get(&id)
-            .is_some_and(|record| record.state == ProcessState::Running)
+        if let Ok(record) = self.get(&id)
+            && record.state == ProcessState::Running
         {
             return Err(RpcError::new(
-                "PROCESS_ALREADY_RUNNING",
-                format!("process {id} is already running"),
+                if record.identity_verified {
+                    "PROCESS_ALREADY_RUNNING"
+                } else {
+                    "PROCESS_IDENTITY_UNKNOWN"
+                },
+                format!("process {id} requires reconciliation before replacement"),
             ));
         }
         if let Some(parent) = log_path.parent() {
@@ -160,6 +167,9 @@ impl ProcessTable {
         let record = ProcessRecord {
             id: id.clone(),
             pid: child.id(),
+            birth_identity: process_birth_identity(child.id()),
+            identity_verified: false,
+            observed_at: None,
             cwd,
             argv,
             env,
@@ -177,7 +187,7 @@ impl ProcessTable {
                 attempts: 0,
             },
             phase: "STARTING".to_owned(),
-            last_successful_probe_at: Some(now),
+            last_successful_probe_at: None,
             last_log_progress: Some(log_start_offset),
             readiness_spec: readiness,
             readiness_deadline_at,
@@ -243,7 +253,14 @@ impl ProcessTable {
         let record = records
             .get_mut(id)
             .ok_or_else(|| RpcError::new("PROCESS_NOT_FOUND", format!("unknown process: {id}")))?;
+        refresh(record);
         if record.state == ProcessState::Running {
+            if !record.identity_verified {
+                return Err(RpcError::new(
+                    "PROCESS_IDENTITY_UNKNOWN",
+                    "cannot signal an unverified recorded PID",
+                ));
+            }
             stop_process(record.pid)?;
             record.state = ProcessState::Stopped;
             record.updated_at = now_ms();
@@ -334,15 +351,32 @@ impl ProcessTable {
     }
 }
 
+pub const OBSERVATION_TTL_MS: u64 = 5_000;
+
 fn refresh(record: &mut ProcessRecord) {
+    record.observed_at = Some(now_ms());
+    record.identity_verified = false;
     if record.state != ProcessState::Running {
         return;
     }
-    if !process_is_alive(record.pid) {
+    let current_identity = process_birth_identity(record.pid);
+    let identity_mismatch = matches!((&record.birth_identity, &current_identity), (Some(expected), Some(actual)) if expected != actual);
+    if !process_is_alive(record.pid) || identity_mismatch {
         record.state = ProcessState::Failed;
         record.phase = "FAILED".to_owned();
         record.updated_at = now_ms();
         return;
+    }
+    record.identity_verified = matches!((&record.birth_identity, &current_identity), (Some(expected), Some(actual)) if expected == actual);
+    if !record.identity_verified {
+        return;
+    }
+    // Tunnel readiness is live evidence, unlike a one-time build log marker.
+    if record.metadata.get("kind").and_then(Value::as_str) == Some("tunnel")
+        && record.readiness_spec.is_some()
+        && record.readiness.state != ReadinessState::Pending
+    {
+        record.readiness.state = ReadinessState::Pending;
     }
     if let Ok(length) = fs::metadata(&record.log_path).map(|value| value.len())
         && length > record.last_log_progress.unwrap_or(record.log_start_offset)
@@ -427,8 +461,64 @@ pub(crate) fn stop_process(pid: u32) -> Result<(), RpcError> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn process_birth_identity(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm may contain spaces and parentheses. Field 22 follows the final ')'.
+    let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    if matches!(*fields.first()?, "Z" | "X") {
+        return None;
+    }
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    Some(format!("{}:{}", boot.trim(), fields.get(19)?))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_birth_identity(pid: u32) -> Option<String> {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart=", "-o", "stat="])
+        .env("LC_ALL", "C")
+        .output()
+        .ok()?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    let mut fields: Vec<_> = text.split_whitespace().collect();
+    let state = fields.pop()?;
+    if !output.status.success() || state.starts_with('Z') || fields.is_empty() {
+        return None;
+    }
+    Some(fields.join(" "))
+}
+
+#[cfg(windows)]
+fn process_birth_identity(pid: u32) -> Option<String> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FILETIME},
+        System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        let mut birth: FILETIME = std::mem::zeroed();
+        let mut exit: FILETIME = std::mem::zeroed();
+        let mut kernel: FILETIME = std::mem::zeroed();
+        let mut user: FILETIME = std::mem::zeroed();
+        let ok = GetProcessTimes(handle, &mut birth, &mut exit, &mut kernel, &mut user);
+        CloseHandle(handle);
+        (ok != 0).then(|| format!("{}:{}", birth.dwHighDateTime, birth.dwLowDateTime))
+    }
+}
+
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat"))
+        && let Some((_, fields)) = stat.rsplit_once(')')
+        && matches!(fields.split_whitespace().next(), Some("Z" | "X"))
+    {
+        return false;
+    }
     let result = unsafe { libc::kill(pid as i32, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
@@ -522,6 +612,77 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_pid_identity_is_revalidated_and_never_signals_a_reused_pid() {
+        let root = tempfile::tempdir().unwrap();
+        let table = ProcessTable::default();
+        let record = table
+            .start(
+                "identity-test".into(),
+                root.path().into(),
+                vec!["sleep".into(), "30".into()],
+                Default::default(),
+                root.path().join("log"),
+                None,
+                false,
+                json!({"kind": "tunnel"}),
+            )
+            .unwrap();
+        assert!(table.get(&record.id).unwrap().identity_verified);
+        {
+            let mut records = table.records.lock().unwrap();
+            let stored = records.get_mut(&record.id).unwrap();
+            stored.birth_identity = None;
+            stored.observed_at = Some(0);
+        }
+        assert_eq!(
+            table.stop(&record.id).unwrap_err().code,
+            "PROCESS_IDENTITY_UNKNOWN"
+        );
+        assert!(super::process_is_alive(record.pid));
+        assert!(!table.get(&record.id).unwrap().identity_verified);
+        {
+            let mut records = table.records.lock().unwrap();
+            records.get_mut(&record.id).unwrap().birth_identity = Some("previous-process".into());
+        }
+        let stale = table.stop(&record.id).unwrap();
+        assert_eq!(stale.state, super::ProcessState::Failed);
+        assert!(super::process_is_alive(record.pid));
+        super::stop_process(record.pid).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tunnel_readiness_is_reprobed_after_a_previous_success() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("ready");
+        fs::write(&marker, "ready").unwrap();
+        let table = ProcessTable::default();
+        table
+            .start(
+                "live-probe".into(),
+                root.path().into(),
+                vec!["sleep".into(), "30".into()],
+                Default::default(),
+                root.path().join("log"),
+                Some(json!({"type": "file", "path": marker, "timeoutMs": 0})),
+                false,
+                json!({"kind": "tunnel"}),
+            )
+            .unwrap();
+        assert_eq!(
+            table.get("live-probe").unwrap().readiness.state,
+            ReadinessState::Ready
+        );
+        fs::remove_file(marker).unwrap();
+        assert_eq!(
+            table.get("live-probe").unwrap().readiness.state,
+            ReadinessState::Failed
+        );
+        table.stop("live-probe").unwrap();
+    }
 
     #[test]
     fn all_readiness_requires_every_probe() {

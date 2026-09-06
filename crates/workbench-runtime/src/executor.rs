@@ -1682,11 +1682,24 @@ impl ExecutorRuntime {
         if let Ok(existing) = self.processes.get(&process_id)
             && existing.state == crate::process::ProcessState::Running
         {
+            if !existing.identity_verified {
+                let mut error = RpcError::new(
+                    "PROCESS_IDENTITY_UNKNOWN",
+                    "recorded tunnel PID cannot be verified; port occupancy is not established",
+                );
+                error.details = tunnel_view(&existing, false);
+                return Err(error);
+            }
             if !tunnel_definition_matches(&existing.metadata, &metadata) {
-                return Err(RpcError::new(
+                let mut error = RpcError::new(
                     "TUNNEL_CONFLICT",
-                    format!("tunnel {tunnel_id} is running with a different definition"),
-                ));
+                    format!(
+                        "tunnel {tunnel_id} has a verified live process with a different definition; this is not a port occupancy error"
+                    ),
+                );
+                error.details = tunnel_view(&existing, false);
+                error.details["requestedBinding"] = tunnel_bind_observation(&metadata);
+                return Err(error);
             }
             return Ok(tunnel_view(&existing, true));
         }
@@ -1737,7 +1750,7 @@ impl ExecutorRuntime {
             true,
             metadata,
         )?;
-        Ok(tunnel_view(&record, false))
+        Ok(tunnel_view(&self.processes.get(&record.id)?, false))
     }
 
     fn tunnel_get(&self, params: &Value) -> Result<Value, RpcError> {
@@ -3228,33 +3241,34 @@ fn tunnel_definition_matches(left: &Value, right: &Value) -> bool {
 }
 
 fn tunnel_view(record: &crate::process::ProcessRecord, reused: bool) -> Value {
-    let probe_recovered = record.state == crate::process::ProcessState::Running
-        && record.readiness.state == crate::process::ReadinessState::Failed
-        && tunnel_source_is_reachable(&record.metadata);
-    let observed_state = match (
-        record.state.clone(),
-        record.readiness.state.clone(),
-        probe_recovered,
-    ) {
-        (crate::process::ProcessState::Running, crate::process::ReadinessState::Ready, _) => {
-            "ready"
-        }
-        (crate::process::ProcessState::Running, crate::process::ReadinessState::Pending, _) => {
-            "starting"
-        }
-        (crate::process::ProcessState::Running, crate::process::ReadinessState::Failed, true) => {
-            "ready"
-        }
-        (crate::process::ProcessState::Running, crate::process::ReadinessState::Failed, false) => {
-            "degraded"
-        }
-        (
-            crate::process::ProcessState::Running,
-            crate::process::ReadinessState::NotConfigured,
-            _,
-        ) => "running",
-        (crate::process::ProcessState::Failed, _, _) => "failed",
-        (crate::process::ProcessState::Stopped, _, _) => "stopped",
+    let checked_at = now_ms();
+    let fresh_identity = record.identity_verified
+        && record.observed_at.is_some_and(|at| {
+            at <= checked_at && checked_at - at < crate::process::OBSERVATION_TTL_MS
+        });
+    let reachable = tunnel_source_is_reachable(&record.metadata);
+    let binding = tunnel_bind_observation(&record.metadata);
+    let listener_owned = if fresh_identity {
+        tunnel_listener_owned(record)
+    } else {
+        None
+    };
+    let observed_state = if record.state == crate::process::ProcessState::Stopped {
+        "stopped"
+    } else if record.state == crate::process::ProcessState::Failed {
+        "failed"
+    } else if !fresh_identity {
+        "unknown"
+    } else if record.metadata["direction"] == "remote-forward" {
+        "running"
+    } else if reachable && listener_owned == Some(true) {
+        "ready"
+    } else if reachable && listener_owned.is_none() {
+        "unknown"
+    } else if record.readiness.state == crate::process::ReadinessState::Pending {
+        "starting"
+    } else {
+        "degraded"
     };
     json!({
         "id": record.metadata.get("tunnelId"),
@@ -3271,9 +3285,167 @@ fn tunnel_view(record: &crate::process::ProcessRecord, reused: bool) -> Value {
         "startedAt": record.started_at,
         "updatedAt": record.updated_at,
         "lastProbeAt": record.last_successful_probe_at,
-        "warning": probe_recovered.then_some("readiness probe previously failed; source port is currently reachable"),
+        "observation": {
+            "checkedAt": checked_at,
+            "expiresAt": checked_at.saturating_add(crate::process::OBSERVATION_TTL_MS),
+            "ttlMs": crate::process::OBSERVATION_TTL_MS,
+            "identityVerified": fresh_identity,
+            "sourceReachable": reachable,
+            "listenerOwned": listener_owned,
+            "binding": binding,
+        },
+        "warning": (!fresh_identity && record.state == crate::process::ProcessState::Running)
+            .then_some("recorded process identity is unverified or expired; historical readiness is not current evidence"),
         "reused": reused
     })
+}
+
+/// Listener ownership is separate from both PID liveness and TCP reachability.
+fn tunnel_listener_owned(record: &crate::process::ProcessRecord) -> Option<bool> {
+    if record.metadata["direction"] != "local-forward" {
+        return None;
+    }
+    let host = record.metadata["source"]["host"].as_str()?;
+    let port = u16::try_from(record.metadata["source"]["port"].as_u64()?).ok()?;
+    let addresses: Vec<_> = (host, port).to_socket_addrs().ok()?.collect();
+    listener_owned(record.pid, &addresses)
+}
+
+#[cfg(target_os = "linux")]
+fn listener_owned(pid: u32, addresses: &[std::net::SocketAddr]) -> Option<bool> {
+    let fds = fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    let mut sockets = std::collections::BTreeSet::new();
+    for fd in fds {
+        let path = match fs::read_link(fd.ok()?.path()) {
+            Ok(path) => path,
+            // Other threads may close unrelated descriptors during enumeration.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
+        };
+        if let Some(inode) = path
+            .to_str()?
+            .strip_prefix("socket:[")
+            .and_then(|s| s.strip_suffix(']'))
+        {
+            sockets.insert(inode.to_owned());
+        }
+    }
+    for family in ["tcp", "tcp6"] {
+        let table = match fs::read_to_string(format!("/proc/{pid}/net/{family}")) {
+            Ok(table) => table,
+            Err(error) if family == "tcp6" && error.kind() == std::io::ErrorKind::NotFound => {
+                continue;
+            }
+            Err(_) => return None,
+        };
+        for line in table.lines().skip(1) {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 10 || fields[3] != "0A" || !sockets.contains(fields[9]) {
+                continue;
+            }
+            let (ip, port) = fields[1].split_once(':')?;
+            let port = u16::from_str_radix(port, 16).ok()?;
+            let bytes = (0..ip.len())
+                .step_by(8)
+                .map(|i| {
+                    u32::from_str_radix(&ip[i..i + 8], 16)
+                        .ok()
+                        .map(u32::to_ne_bytes)
+                })
+                .collect::<Option<Vec<_>>>()?
+                .concat();
+            let ip = match bytes.len() {
+                4 => {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::from(<[u8; 4]>::try_from(bytes).ok()?))
+                }
+                16 => std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                    <[u8; 16]>::try_from(bytes).ok()?,
+                )),
+                _ => return None,
+            };
+            if addresses.iter().any(|a| {
+                a.port() == port
+                    && (a.ip() == ip || (ip.is_unspecified() && a.is_ipv4() == ip.is_ipv4()))
+            }) {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn listener_owned(pid: u32, addresses: &[std::net::SocketAddr]) -> Option<bool> {
+    let output = Command::new("/usr/sbin/lsof")
+        .args([
+            "-nP",
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-Fn",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(
+        text.lines()
+            .filter_map(|line| line.strip_prefix('n'))
+            .any(|endpoint| {
+                addresses
+                    .iter()
+                    .any(|a| endpoint == a.to_string() || endpoint == format!("*:{}", a.port()))
+            }),
+    )
+}
+
+#[cfg(windows)]
+fn listener_owned(pid: u32, addresses: &[std::net::SocketAddr]) -> Option<bool> {
+    let output = Command::new("netstat")
+        .args(["-ano", "-p", "tcp"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(text.lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields.len() == 5
+            && fields[3] == "LISTENING"
+            && fields[4] == pid.to_string()
+            && addresses.iter().any(|a| {
+                fields[1] == a.to_string()
+                    || fields[1] == format!("0.0.0.0:{}", a.port())
+                    || fields[1] == format!("[::]:{}", a.port())
+            })
+    }))
+}
+
+// A bind probe establishes availability only at this instant. SSH's
+// ExitOnForwardFailure remains authoritative when the forward is actually started.
+fn tunnel_bind_observation(metadata: &Value) -> Value {
+    if metadata["direction"] != "local-forward" {
+        return json!({"state": "unknown", "reason": "bind endpoint is remote"});
+    }
+    let Some(host) = metadata["source"]["host"].as_str() else {
+        return json!({"state": "unknown"});
+    };
+    let Some(port) = metadata["source"]["port"]
+        .as_u64()
+        .and_then(|p| u16::try_from(p).ok())
+    else {
+        return json!({"state": "unknown"});
+    };
+    match std::net::TcpListener::bind((host, port)) {
+        Ok(_) => json!({"state": "available"}),
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => json!({"state": "in-use"}),
+        Err(error) => json!({"state": "unknown", "reason": error.to_string()}),
+    }
 }
 
 fn tunnel_source_is_reachable(metadata: &Value) -> bool {
@@ -3631,6 +3803,79 @@ fn io_error(code: &str, path: &Path, error: std::io::Error) -> RpcError {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[cfg(unix)]
+    #[test]
+    fn tunnel_definition_conflict_reports_a_fresh_available_port() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![root.path().into()]).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        runtime.processes.start("tunnel-conflict".into(), root.path().into(),
+            vec!["sleep".into(), "30".into()], Default::default(), root.path().join("log"),
+            None, false, json!({"kind": "tunnel", "direction": "local-forward", "source": {"host": "127.0.0.1", "port": port}})).unwrap();
+        let error = runtime
+            .tunnel_ensure(
+                &json!({"tunnelId": "conflict", "direction": "local-forward",
+            "sshHost": "example", "bindHost": "127.0.0.1", "bindPort": port,
+            "targetHost": "127.0.0.1", "targetPort": port}),
+            )
+            .unwrap_err();
+        runtime.processes.stop("tunnel-conflict").unwrap();
+        assert_eq!(error.code, "TUNNEL_CONFLICT");
+        assert_eq!(error.details["requestedBinding"]["state"], "available");
+        assert_eq!(
+            error.details["observation"]["binding"]["state"],
+            "available"
+        );
+        assert_ne!(error.details["observedState"], "ready");
+    }
+
+    fn tunnel_record(port: u16) -> crate::process::ProcessRecord {
+        serde_json::from_value(json!({
+            "id": "tunnel-test", "pid": std::process::id(), "cwd": "/tmp", "argv": [],
+            "logPath": "/tmp/unused", "state": "running", "readiness": {"state": "ready", "attempts": 1},
+            "startedAt": 0, "updatedAt": 0, "identityVerified": true, "observedAt": now_ms(),
+            "metadata": {"kind": "tunnel", "direction": "local-forward", "source": {"host": "127.0.0.1", "port": port}}
+        })).unwrap()
+    }
+
+    #[test]
+    fn tunnel_query_replaces_cached_ready_with_current_listener_evidence() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let record = tunnel_record(listener.local_addr().unwrap().port());
+        let live = tunnel_view(&record, false);
+        assert_eq!(live["observedState"], "ready");
+        assert_eq!(live["observation"]["binding"]["state"], "in-use");
+        assert_eq!(live["observation"]["listenerOwned"], true);
+        drop(listener);
+        let closed = tunnel_view(&record, false);
+        assert_eq!(closed["observedState"], "degraded");
+        assert_eq!(closed["observation"]["binding"]["state"], "available");
+    }
+
+    #[test]
+    fn tunnel_expired_identity_cannot_report_ready_even_with_a_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut record = tunnel_record(listener.local_addr().unwrap().port());
+        record.observed_at = Some(now_ms() - crate::process::OBSERVATION_TTL_MS);
+        let view = tunnel_view(&record, false);
+        assert_eq!(view["observedState"], "unknown");
+        assert_eq!(view["observation"]["identityVerified"], false);
+        assert_eq!(view["observation"]["sourceReachable"], true);
+        assert_eq!(view["observation"]["ttlMs"], 5_000);
+        record.observed_at = None;
+        assert_eq!(tunnel_view(&record, false)["observedState"], "unknown");
+    }
+
+    #[test]
+    fn tunnel_does_not_attribute_another_process_listener_to_the_record() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut record = tunnel_record(listener.local_addr().unwrap().port());
+        record.pid = u32::MAX;
+        assert_ne!(tunnel_view(&record, false)["observedState"], "ready");
+    }
 
     #[test]
     fn tunnel_capabilities_are_typed_and_do_not_expose_command_arguments() {
