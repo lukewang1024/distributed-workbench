@@ -4826,11 +4826,6 @@ fn wait_for_tunnel_readiness(
             json!({"processId": process_id, "timeoutMs": timeout_ms}),
         ),
     );
-    if waited.as_ref().is_ok_and(|response| response.ok) {
-        let mut ready = result;
-        ready["observedState"] = json!("ready");
-        return Ok(ready);
-    }
     let current = call_executor(
         endpoint,
         &traced_request("tunnel.get", json!({"tunnelId": tunnel_id})),
@@ -5256,7 +5251,7 @@ mod tests {
     }
 
     #[test]
-    fn tunnel_wait_returns_after_successful_readiness_without_a_second_query() {
+    fn tunnel_wait_rechecks_live_observation_after_successful_readiness() {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("tunnel-ready.sock");
         let server_socket = socket.clone();
@@ -5267,6 +5262,8 @@ mod tests {
                         request.request_id,
                         json!({"id": "tunnel-signal", "readiness": {"state": "ready"}}),
                     ),
+                    "tunnel.get" => Response::success(request.request_id,
+                        json!({"state": "running", "observedState": "ready", "observation": {"checkedAt": 42}})),
                     other => panic!("unexpected action: {other}"),
                 })
                 .unwrap()
@@ -5287,6 +5284,7 @@ mod tests {
         .unwrap();
         assert_eq!(ready["observedState"], "ready");
         assert_eq!(ready["state"], "running");
+        assert_eq!(ready["observation"]["checkedAt"], 42);
     }
 
     #[test]
