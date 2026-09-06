@@ -270,7 +270,10 @@ impl ExecutorRuntime {
     }
 
     pub fn handle(&self, request: Request) -> Response {
-        if !matches!(request.action.as_str(), "tunnel.ensure" | "tunnel.stop") {
+        if !matches!(
+            request.action.as_str(),
+            "tunnel.ensure" | "tunnel.stop" | "tunnel.get" | "tunnel.list"
+        ) {
             self.reconcile_tunnels();
         }
         let started = std::time::Instant::now();
@@ -2798,6 +2801,8 @@ fn capability_authority(name: &str) -> CapabilityAuthority {
         | "artifact.relay.archive.remove"
         | "artifact.relay.manifest"
         | "artifact.relay.read"
+        | "tunnel.get"
+        | "tunnel.list"
         | "process.get"
         | "process.list"
         | "process.events"
@@ -3830,6 +3835,21 @@ mod tests {
             "available"
         );
         assert_ne!(error.details["observedState"], "ready");
+    }
+
+    #[test]
+    fn tunnel_reads_need_no_workspace_authority_on_a_persistent_executor() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::open(
+            "local",
+            vec![root.path().into()],
+            root.path().join("fences.json"),
+        )
+        .unwrap();
+        let response = runtime.handle(Request::new("tunnel.list", json!({})));
+        assert!(response.ok, "{:?}", response.error);
+        let response = runtime.handle(Request::new("tunnel.get", json!({"tunnelId": "absent"})));
+        assert_eq!(response.error.unwrap().code, "PROCESS_NOT_FOUND");
     }
 
     fn tunnel_record(port: u16) -> crate::process::ProcessRecord {
