@@ -153,7 +153,7 @@ impl ProcessTable {
             .stderr(Stdio::from(stderr));
         #[cfg(unix)]
         command.process_group(0);
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|error| RpcError::new("PROCESS_START_FAILED", error.to_string()))?;
         let now = now_ms();
@@ -194,7 +194,12 @@ impl ProcessTable {
             started_at: now,
             updated_at: now,
         };
-        drop(child);
+        // Dropping Child does not reap an exited process on Unix. Retain the
+        // wait handle independently of the durable record so failed tunnels
+        // cannot accumulate zombies in a long-running Executor.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
         let mut records = self.records.lock().expect("process lock");
         records.insert(id, record.clone());
         self.persist(&records)?;
@@ -519,6 +524,20 @@ fn process_is_alive(pid: u32) -> bool {
     {
         return false;
     }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if let Ok(output) = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "stat="])
+        .env("LC_ALL", "C")
+        .output()
+        && output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .trim_start()
+            .starts_with(['Z', 'X'])
+    {
+        // kill(pid, 0) succeeds for zombies on macOS too. Their missing birth
+        // identity means exited, not an unverifiable live process.
+        return false;
+    }
     let result = unsafe { libc::kill(pid as i32, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
@@ -612,6 +631,98 @@ mod tests {
     use std::fs;
     #[cfg(unix)]
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_managed_children_are_reaped_without_process_queries() {
+        let root = tempfile::tempdir().unwrap();
+        let table = ProcessTable::default();
+        let record = table
+            .start(
+                "reap-test".into(),
+                root.path().into(),
+                vec!["sh".into(), "-c".into(), "exit 0".into()],
+                Default::default(),
+                root.path().join("log"),
+                None,
+                true,
+                json!({"kind": "tunnel"}),
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        // Observe PID removal directly: process_is_alive deliberately hides
+        // zombies and would not prove the Executor actually reaped its child.
+        loop {
+            if unsafe { libc::kill(record.pid as i32, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "exited child was not reaped"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            table.get(&record.id).unwrap().state,
+            super::ProcessState::Failed
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_zombie_is_failed_and_restartable_without_signaling_it() {
+        let root = tempfile::tempdir().unwrap();
+        let state_path = root.path().join("processes.json");
+        let table = ProcessTable::open(state_path.clone()).unwrap();
+        let record = table
+            .start(
+                "zombie-test".into(),
+                root.path().into(),
+                vec!["sleep".into(), "30".into()],
+                Default::default(),
+                root.path().join("log"),
+                None,
+                true,
+                json!({"kind": "tunnel"}),
+            )
+            .unwrap();
+        table.stop(&record.id).unwrap();
+        // Simulate an unreaped child left by an older Executor. Keep Child
+        // outside ProcessTable so the new background waiter cannot reap it.
+        let mut zombie = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while super::process_birth_identity(zombie.id()).is_some() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(unsafe { libc::kill(zombie.id() as i32, 0) }, 0);
+        for identity in [record.birth_identity.clone(), None] {
+            let mut records = table.records.lock().unwrap();
+            let stored = records.get_mut(&record.id).unwrap();
+            stored.pid = zombie.id();
+            stored.birth_identity = identity;
+            stored.state = super::ProcessState::Running;
+            table.persist(&records).unwrap();
+            drop(records);
+            let reopened = ProcessTable::open(state_path.clone()).unwrap();
+            assert_eq!(
+                reopened.get(&record.id).unwrap().state,
+                super::ProcessState::Failed
+            );
+            let replacement = reopened.restart(&record.id).unwrap();
+            assert_ne!(replacement.pid, zombie.id());
+            assert!(reopened.get(&record.id).unwrap().identity_verified);
+            reopened.stop(&record.id).unwrap();
+            // Reconciliation did not signal or reap the historical PID.
+            assert_eq!(unsafe { libc::kill(zombie.id() as i32, 0) }, 0);
+        }
+        zombie.wait().unwrap();
+    }
 
     #[cfg(unix)]
     #[test]
