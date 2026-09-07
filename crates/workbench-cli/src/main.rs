@@ -151,6 +151,9 @@ enum ExecutorCommand {
         id: String,
         #[arg(long = "allow-root", required = true)]
         allow_roots: Vec<PathBuf>,
+        /// Installed application directories; does not grant filesystem or shell access.
+        #[arg(long = "application-root")]
+        application_roots: Vec<PathBuf>,
         #[arg(long = "grantable-read-root")]
         grantable_read_roots: Vec<PathBuf>,
         #[arg(long)]
@@ -433,6 +436,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 ExecutorCommand::Serve {
                     id,
                     allow_roots,
+                    application_roots,
                     grantable_read_roots,
                     state,
                 },
@@ -444,6 +448,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                     grantable_read_roots,
                     state.unwrap_or_else(default_executor_state),
                 )
+                .and_then(|runtime| runtime.with_application_roots(application_roots))
                 .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?,
             );
             let handler = Arc::clone(&executor);
@@ -1980,6 +1985,43 @@ fn default_executor_state() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executor_accepts_separate_repeatable_application_roots() {
+        let cli = Cli::try_parse_from([
+            "workbench",
+            "executor",
+            "serve",
+            "--id",
+            "windows",
+            "--allow-root",
+            "C:/Users",
+            "--application-root",
+            "C:/Program Files/Microsoft Office",
+            "--application-root",
+            "C:/Program Files (x86)/Kingsoft",
+        ])
+        .unwrap();
+        let Command::Executor {
+            command:
+                ExecutorCommand::Serve {
+                    allow_roots,
+                    application_roots,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected executor serve");
+        };
+        assert_eq!(allow_roots, vec![PathBuf::from("C:/Users")]);
+        assert_eq!(
+            application_roots,
+            vec![
+                PathBuf::from("C:/Program Files/Microsoft Office"),
+                PathBuf::from("C:/Program Files (x86)/Kingsoft")
+            ]
+        );
+    }
 
     #[test]
     fn fabric_manifest_is_domain_neutral_and_strict() {

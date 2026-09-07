@@ -209,6 +209,44 @@ for installation, upgrade, topology reconciliation, and transport diagnosis.
 Product-specific skills remain above this layer and call only their local
 Controller; they must not reproduce fabric bootstrap or SSH behavior.
 
+## Installed application control
+
+Executor `serve --application-root <absolute-directory>` adds a dedicated application
+control grant (repeatable). Use the actual Office and WPS installation directories,
+including custom locations, rather than adding `Program Files` to `--allow-root`.
+Roots must exist and are canonicalized. Only `.exe` files on Windows and `.app`
+directories on macOS qualify outside managed roots; resolved symlink/junction targets
+must remain inside a granted application directory. Application launch, inspection,
+desktop capture and input share this policy. Driver and active-session checks remain
+in force. These grants do not authorize filesystem writes or shell working directories.
+Executor status exposes `applicationRoots` for auditing.
+
+Windows service configuration accepts an explicit array, for example (adjust to the
+installed directories):
+
+```powershell
+.\scripts\install-windows.ps1 -Binary .\workbench.exe -ApplicationRoot @(
+  'C:\Program Files\Microsoft Office',
+  'C:\Program Files (x86)\Kingsoft'
+)
+```
+
+The managed fabric workflow forwards repeatable `--windows-application-root` options
+to the Windows installer, for example:
+
+```sh
+scripts/bootstrap-fabric.sh --version 0.6.44 \
+  --windows-application-root 'C:\Program Files\Microsoft Office' \
+  --windows-application-root 'C:\Program Files (x86)\Kingsoft' \
+  devbox-a windows:windows-devbox
+```
+
+Only include directories confirmed to exist on the selected Windows nodes. Omitting the parameter
+on upgrades preserves existing application grants; supplying it replaces the list,
+and `-ApplicationRoot @()` revokes the dedicated grants. Reconfigure/restart the
+Executor before attempting native application acceptance. Source tests alone do not
+prove that Word/WPS desktop control works on the deployed node.
+
 ## Windows native deployment
 
 Windows nodes run the same Rust Controller, Executor, and peer protocol natively.

@@ -1,7 +1,8 @@
 param(
   [string]$Version = "latest",
   [string]$NodeId = $env:COMPUTERNAME,
-  [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\distributed-workbench")
+  [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\distributed-workbench"),
+  [string[]]$ApplicationRoot = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,7 +28,11 @@ try {
   if ($actual -ne $expected) { throw "checksum mismatch" }
   Expand-Archive -Path (Join-Path $temporary $archive) -DestinationPath $temporary
   $root = Join-Path $temporary "distributed-workbench-$Version-$target"
-  & (Join-Path $root "scripts\install-windows.ps1") -Binary (Join-Path $root "bin\workbench.exe") -NodeId $NodeId -AllowRoot $AllowRoot
+  $applicationParameters = @{}
+  if ($PSBoundParameters.ContainsKey("ApplicationRoot")) {
+    $applicationParameters.ApplicationRoot = $ApplicationRoot
+  }
+  & (Join-Path $root "scripts\install-windows.ps1") -Binary (Join-Path $root "bin\workbench.exe") -NodeId $NodeId -AllowRoot $AllowRoot @applicationParameters
 } finally {
   Remove-Item -Recurse -Force $temporary -ErrorAction SilentlyContinue
 }

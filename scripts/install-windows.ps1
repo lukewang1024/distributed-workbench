@@ -2,7 +2,8 @@ param(
   [Parameter(Mandatory = $true)][string]$Binary,
   [string]$NodeId = $env:COMPUTERNAME,
   [ValidatePattern('^[0-9A-Za-z._-]+$')][string]$Namespace = "stable",
-  [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\distributed-workbench")
+  [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\distributed-workbench"),
+  [string[]]$ApplicationRoot = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,6 +57,24 @@ if ($existingExecutor -and $existingExecutor.PathName) {
   }
 }
 
+# Explicit application grants are independent of filesystem roots. Omitted
+# parameters preserve existing policy on upgrade; an explicit empty array revokes it.
+$effectiveApplicationRoots = @($ApplicationRoot)
+if (-not $PSBoundParameters.ContainsKey("ApplicationRoot") -and $existingExecutor) {
+  foreach ($match in [regex]::Matches($existingExecutor.PathName, '(?i)--application-root\s+"([^"]+)"')) {
+    $effectiveApplicationRoots += $match.Groups[1].Value
+  }
+}
+$effectiveApplicationRoots = @($effectiveApplicationRoots | Select-Object -Unique)
+foreach ($root in $effectiveApplicationRoots) {
+  if (-not [System.IO.Path]::IsPathRooted($root) -or -not (Test-Path -LiteralPath $root -PathType Container)) {
+    throw "application-root must be an existing absolute directory: $root"
+  }
+  if ([System.IO.Path]::GetFullPath($root).TrimEnd('\') -eq [System.IO.Path]::GetPathRoot($root).TrimEnd('\')) {
+    throw "application-root cannot be a drive root: $root"
+  }
+}
+
 foreach ($serviceName in @($controllerService, $executorService)) {
   if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     Stop-Service -Name $serviceName -Force -ErrorAction SilentlyContinue
@@ -101,6 +120,9 @@ $executorParts = @(
 Add-AllowRoot $stateRoot
 foreach ($root in $effectiveAllowRoots) {
   $executorParts += @("--allow-root", (Quote-Arg $root))
+}
+foreach ($root in $effectiveApplicationRoots) {
+  $executorParts += @("--application-root", (Quote-Arg $root))
 }
 $executorArgs = $executorParts -join " "
 
