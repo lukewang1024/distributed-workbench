@@ -971,7 +971,7 @@ try {
             "-Command".to_owned(),
             script,
         ],
-        application,
+        parent,
     )?;
     let deadline = Instant::now() + Duration::from_secs(20);
     while !metadata_path.is_file() && Instant::now() < deadline {
