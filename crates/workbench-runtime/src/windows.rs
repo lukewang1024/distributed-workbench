@@ -826,7 +826,7 @@ $result=[pscustomobject]@{
             "-Command".to_owned(),
             script,
         ],
-        application,
+        parent,
     )?;
     let deadline = Instant::now() + Duration::from_secs(15);
     while !metadata_path.is_file() && Instant::now() < deadline {
