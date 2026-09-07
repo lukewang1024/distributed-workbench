@@ -405,6 +405,19 @@ pub fn open_file(
     )
 }
 
+// Canonical paths retain verbatim prefixes for authorization, but Office/WPS
+// interpret those prefixes as invalid document names. Convert only at the
+// process boundary, after all path checks have succeeded.
+fn native_process_argument(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
 fn spawn_in_active_session(
     executable: &Path,
     args: &[String],
@@ -476,6 +489,7 @@ fn spawn_in_active_session(
 
     let mut command_line = std::iter::once(executable.to_string_lossy().into_owned())
         .chain(args.iter().cloned())
+        .map(|value| native_process_argument(&value))
         .map(|value| format!("\"{}\"", value.replace('"', "\\\"")))
         .collect::<Vec<_>>()
         .join(" ")
@@ -483,8 +497,7 @@ fn spawn_in_active_session(
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
     let mut desktop = "winsta0\\default\0".encode_utf16().collect::<Vec<_>>();
-    let cwd = cwd
-        .to_string_lossy()
+    let cwd = native_process_argument(&cwd.to_string_lossy())
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<_>>();
@@ -1255,6 +1268,25 @@ fn find_directory(root: &Path, name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_process_arguments_preserve_paths_without_verbatim_prefixes() {
+        assert_eq!(
+            native_process_argument(r"\\?\C:\Program Files\Microsoft Office\WINWORD.EXE"),
+            r"C:\Program Files\Microsoft Office\WINWORD.EXE"
+        );
+        assert_eq!(
+            native_process_argument(r"\\?\UNC\server\share\test.docx"),
+            r"\\server\share\test.docx"
+        );
+        for argument in [
+            r"C:\Users\User\test.docx",
+            "/a",
+            r"Write-Output '\\?\C:\test'",
+        ] {
+            assert_eq!(native_process_argument(argument), argument);
+        }
+    }
 
     #[test]
     fn native_receipts_use_unique_temporary_paths() {
