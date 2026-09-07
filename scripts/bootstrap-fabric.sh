@@ -3,7 +3,7 @@ set -eu
 
 usage() {
   printf '%s\n' \
-    'usage: scripts/bootstrap-fabric.sh [--version VERSION] [--local-id ID] [--windows-allow-root PATH]... [--skip-release-install] [--verify-only] HOST|windows:HOST ...' \
+    'usage: scripts/bootstrap-fabric.sh [--version VERSION] [--local-id ID] [--windows-allow-root PATH]... [--windows-application-root PATH]... [--skip-release-install] [--verify-only] HOST|windows:HOST ...' \
     '' \
     'Install or verify distributed-workbench on selected SSH hosts, then register' \
     'their executors with the laptop Controller. Prefix native Windows nodes' \
@@ -16,6 +16,7 @@ local_id_explicit=false
 verify_only=false
 skip_release_install=false
 windows_allow_roots=
+windows_application_roots=
 while [ "$#" -gt 0 ]; do
   case $1 in
     --version)
@@ -42,6 +43,18 @@ while [ "$#" -gt 0 ]; do
       case $2 in *"'"*|*"
 "*) printf 'bootstrap-fabric: invalid Windows allow-root: %s\n' "$2" >&2; exit 2 ;; esac
       windows_allow_roots="$windows_allow_roots
+$2"
+      shift 2
+      ;;
+    --windows-application-root)
+      test "$#" -ge 2 || { usage >&2; exit 2; }
+      case $2 in
+        [A-Za-z]:[\\/]*) ;;
+        *) printf 'bootstrap-fabric: Windows application-root must be absolute: %s\n' "$2" >&2; exit 2 ;;
+      esac
+      case $2 in *"'"*|*'"'*|*'`'*|*'$'*|*"
+"*) printf 'bootstrap-fabric: invalid Windows application-root: %s\n' "$2" >&2; exit 2 ;; esac
+      windows_application_roots="$windows_application_roots
 $2"
       shift 2
       ;;
@@ -168,7 +181,11 @@ if [ "$installed_version" != "$version" ]; then
   fi
   printf 'bootstrap-fabric: laptop: installing %s\n' "$version"
   DISTRIBUTED_WORKBENCH_NODE_ID=$local_id "$installer" "$version" >/dev/null
-  workbench=$app_binary
+  if [ "$local_service_manager" = launchd ]; then
+    workbench=$app_binary
+  else
+    workbench=$HOME/.local/bin/workbench
+  fi
 fi
 
 local_status=$("$workbench" --socket "$controller_socket" status)
@@ -557,9 +574,18 @@ for host in "$@"; do
         test -n "$allow_root" || continue
         allow_literal="$allow_literal,'$allow_root'"
       done
+      application_literal=
+      for application_root in $windows_application_roots; do
+        test -n "$application_root" || continue
+        application_literal="${application_literal:+$application_literal,}'$application_root'"
+      done
+      application_argument=
+      if [ -n "$application_literal" ]; then
+        application_argument=" -ApplicationRoot @($application_literal)"
+      fi
       IFS=$old_ifs
       ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
-      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& './install-distributed-workbench.ps1' -Version '$version' -NodeId '$host' -AllowRoot @($allow_literal); Remove-Item './install-distributed-workbench.ps1' -Force -ErrorAction SilentlyContinue\"" \
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& './install-distributed-workbench.ps1' -Version '$version' -NodeId '$host' -AllowRoot @($allow_literal)$application_argument; Remove-Item './install-distributed-workbench.ps1' -Force -ErrorAction SilentlyContinue\"" \
         >/dev/null
     else
       install_linux_release "$host" "$host" "$executor_id"

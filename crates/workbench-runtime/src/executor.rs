@@ -29,6 +29,7 @@ use crate::telemetry::{event_fields, request_event};
 pub struct ExecutorRuntime {
     id: String,
     allowed_roots: Vec<PathBuf>,
+    application_roots: Vec<PathBuf>,
     grantable_read_roots: Vec<PathBuf>,
     processes: ProcessTable,
     fences: Option<Mutex<ExecutorFences>>,
@@ -214,6 +215,7 @@ impl ExecutorRuntime {
         Ok(Self {
             id: id.into(),
             allowed_roots: roots,
+            application_roots: Vec::new(),
             grantable_read_roots: grantable,
             processes: ProcessTable::default(),
             fences: None,
@@ -237,6 +239,32 @@ impl ExecutorRuntime {
         state_path: PathBuf,
     ) -> Result<Self, RpcError> {
         Self::open_with_grantable(id, allowed_roots, Vec::new(), state_path)
+    }
+
+    /// Application control grants are separate from filesystem and command grants.
+    pub fn with_application_roots(mut self, roots: Vec<PathBuf>) -> Result<Self, RpcError> {
+        for root in roots {
+            if !root.is_absolute() {
+                return Err(RpcError::new(
+                    "INVALID_APPLICATION_ROOT",
+                    "application root must be absolute",
+                ));
+            }
+            let checked = root.canonicalize().map_err(|error| {
+                RpcError::new(
+                    "INVALID_APPLICATION_ROOT",
+                    format!("{}: {error}", root.display()),
+                )
+            })?;
+            if !checked.is_dir() || checked.parent().is_none() {
+                return Err(RpcError::new(
+                    "INVALID_APPLICATION_ROOT",
+                    "application root must be an existing non-root directory",
+                ));
+            }
+            self.application_roots.push(checked);
+        }
+        Ok(self)
     }
 
     pub fn open_with_grantable(
@@ -488,6 +516,7 @@ impl ExecutorRuntime {
                 "status": "ready",
                 "protocolFeatures": ["capability-authority-v2", "driver-draining-v1", "read-grant-v1", "acceptance-handoff-v1"],
                 "allowedRoots": self.allowed_roots,
+                "applicationRoots": self.application_roots,
                 "grantableReadRoots": self.grantable_read_roots,
                 "capabilities": capability_catalog(),
                 "execution": {
@@ -1924,7 +1953,7 @@ impl ExecutorRuntime {
             return Err(RpcError::new(
                 "PATH_OUTSIDE_APPLICATION_ROOTS",
                 format!(
-                    "{} is outside managed roots and /Applications",
+                    "{} is outside managed roots, configured application roots, and platform application locations",
                     checked.display()
                 ),
             ));
@@ -1946,6 +1975,19 @@ impl ExecutorRuntime {
 
     fn allowed_application_path(&self, path: &Path) -> bool {
         self.allowed_roots.iter().any(|root| path.starts_with(root))
+            || (self
+                .application_roots
+                .iter()
+                .any(|root| path.starts_with(root))
+                && ((cfg!(windows)
+                    && path.is_file()
+                    && path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")))
+                    || (cfg!(target_os = "macos")
+                        && path.is_dir()
+                        && path.extension().and_then(|value| value.to_str()) == Some("app"))))
             || (cfg!(target_os = "macos")
                 && path.parent() == Some(Path::new("/Applications"))
                 && path.extension().and_then(|value| value.to_str()) == Some("app"))
@@ -3979,6 +4021,131 @@ mod tests {
         fs::create_dir(&application).unwrap();
         assert!(runtime.allowed_application_path(&application.canonicalize().unwrap()));
         assert!(!runtime.allowed_application_path(Path::new("/tmp/Unmanaged.app")));
+    }
+
+    #[test]
+    fn application_grants_do_not_grant_filesystem_or_command_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = directory.path().join("managed");
+        let office = directory.path().join("Microsoft Office");
+        fs::create_dir(&managed).unwrap();
+        fs::create_dir(&office).unwrap();
+        let executable = office.join("WINWORD.EXE");
+        fs::write(&executable, "fixture").unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![managed])
+            .unwrap()
+            .with_application_roots(vec![office.clone()])
+            .unwrap();
+        let params = json!({"path": executable});
+        assert_eq!(
+            runtime.path(&params, "path", true).unwrap_err().code,
+            "PATH_OUTSIDE_ALLOWED_ROOTS"
+        );
+        assert_eq!(
+            runtime
+                .path(&json!({"cwd": office}), "cwd", true)
+                .unwrap_err()
+                .code,
+            "PATH_OUTSIDE_ALLOWED_ROOTS"
+        );
+        assert!(!runtime.allowed_application_path(&directory.path().join("Other.exe")));
+        #[cfg(windows)]
+        {
+            assert!(runtime.application_path(&params, "path").is_ok());
+            let document = office.join("sample.docx");
+            fs::write(&document, "fixture").unwrap();
+            assert_eq!(
+                runtime
+                    .application_path(&json!({"path": document}), "path")
+                    .unwrap_err()
+                    .code,
+                "PATH_OUTSIDE_APPLICATION_ROOTS"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn application_grants_support_word_and_wps_installations() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = directory.path().join("managed");
+        let office = directory.path().join("Microsoft Office");
+        let wps = directory.path().join("Kingsoft");
+        for root in [&managed, &office, &wps] {
+            fs::create_dir(root).unwrap();
+        }
+        let runtime = ExecutorRuntime::new("local", vec![managed])
+            .unwrap()
+            .with_application_roots(vec![office.clone(), wps.clone()])
+            .unwrap();
+        for executable in [
+            office.join("root/Office16/WINWORD.EXE"),
+            wps.join("WPS Office/12.1/office6/wps.exe"),
+        ] {
+            fs::create_dir_all(executable.parent().unwrap()).unwrap();
+            fs::write(&executable, "fixture").unwrap();
+            assert!(
+                runtime
+                    .application_path(&json!({"path": executable}), "path")
+                    .is_ok()
+            );
+        }
+        let sibling = directory.path().join("Kingsoft-other/wps.exe");
+        fs::create_dir(sibling.parent().unwrap()).unwrap();
+        fs::write(&sibling, "fixture").unwrap();
+        let fake_executable = wps.join("folder.exe");
+        fs::create_dir(&fake_executable).unwrap();
+        for path in [sibling, fake_executable] {
+            assert_eq!(
+                runtime
+                    .application_path(&json!({"path": path}), "path")
+                    .unwrap_err()
+                    .code,
+                "PATH_OUTSIDE_APPLICATION_ROOTS"
+            );
+        }
+    }
+
+    #[test]
+    fn application_grants_reject_invalid_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        fs::write(&file, "fixture").unwrap();
+        for root in [
+            PathBuf::from("relative"),
+            directory.path().join("missing"),
+            file,
+        ] {
+            let runtime =
+                ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
+            assert!(
+                matches!(runtime.with_application_roots(vec![root]), Err(error) if error.code == "INVALID_APPLICATION_ROOT")
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn application_grants_reject_symlink_escape() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = directory.path().join("managed");
+        let applications = directory.path().join("applications");
+        let outside = directory.path().join("Outside.app");
+        for path in [&managed, &applications, &outside] {
+            fs::create_dir(path).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, applications.join("Escape.app")).unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![managed])
+            .unwrap()
+            .with_application_roots(vec![applications.clone()])
+            .unwrap();
+        assert_eq!(
+            runtime
+                .application_path(&json!({"path": applications.join("Escape.app")}), "path")
+                .unwrap_err()
+                .code,
+            "PATH_OUTSIDE_APPLICATION_ROOTS"
+        );
     }
 
     #[cfg(target_os = "macos")]
