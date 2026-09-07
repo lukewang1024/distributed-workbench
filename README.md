@@ -235,7 +235,7 @@ The managed fabric workflow forwards repeatable `--windows-application-root` opt
 to the Windows installer, for example:
 
 ```sh
-scripts/bootstrap-fabric.sh --version 0.6.44 \
+scripts/bootstrap-fabric.sh --version 0.6.45 \
   --windows-application-root 'C:\Program Files\Microsoft Office' \
   --windows-application-root 'C:\Program Files (x86)\Kingsoft' \
   devbox-a windows:windows-devbox
