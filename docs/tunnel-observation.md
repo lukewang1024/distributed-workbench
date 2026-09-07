@@ -30,3 +30,18 @@ probe cannot reserve the port against a concurrent binder.
 
 Controller readiness waits finish with a fresh `tunnel.get`; a successful
 historical readiness result must not be turned into a fabricated ready view.
+
+Exited processes, including unreaped Unix zombies, are failed records even
+when `kill(pid, 0)` still succeeds. Both Linux and macOS check the OS process
+state before treating a PID as live. Managed children are waited for in the
+background so their exit does not accumulate zombies in a long-running
+Executor. Existing zombie records are reconciled on load or observation;
+desired-running tunnels can then use the normal restart path. No PID signaling,
+record deletion, alternate tunnel ID, or weaker identity check is needed.
+
+For `PROCESS_IDENTITY_UNKNOWN`, inspect both the recorded birth identity and
+the OS state on the owning Executor. A live process with absent/unreadable
+identity still requires investigation and must not be signaled. An exited
+process must not remain permanently running/unknown merely because its PID
+has not yet been reaped. Keep process identity, port binding, and application
+HTTP health as separate evidence.
