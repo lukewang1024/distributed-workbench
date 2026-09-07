@@ -152,7 +152,13 @@ pub fn launch(
     let working_directory = options
         .user_data_dir
         .or_else(|| options.file.and_then(Path::parent))
-        .unwrap_or(&runtime_application);
+        .unwrap_or_else(|| {
+            if runtime_application.is_file() {
+                runtime_application.parent().unwrap_or(&runtime_application)
+            } else {
+                &runtime_application
+            }
+        });
     let pid = spawn_in_active_session(&executable, &launch_args, working_directory)?;
     if options.chromium_local_state_patch.is_some() && options.chromium_local_state_settle_ms > 0 {
         thread::sleep(Duration::from_millis(
@@ -591,6 +597,13 @@ pub fn cdp_evaluate(
     }
 }
 
+// Native installed applications can live in read-only Program Files directories.
+// The interactive helper creates the receipt in the system temp directory; the
+// service reads and removes it. Never place receipts beside the executable.
+fn native_metadata_path(kind: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(".workbench-{kind}-{}.json", uuid::Uuid::new_v4()))
+}
+
 pub fn native_inspect(
     application: &Path,
     expected_window_title: Option<&str>,
@@ -601,11 +614,7 @@ pub fn native_inspect(
             "application executable is missing",
         )
     })?;
-    let output_path = application.join(format!(
-        ".workbench-native-inspect-{}-{}.json",
-        std::process::id(),
-        now_ms()
-    ));
+    let output_path = native_metadata_path("inspect");
     let quote = |path: &Path| path.to_string_lossy().replace('\'', "''");
     // MainWindowHandle is unreliable for Chromium multi-process applications:
     // the document HWND can belong to another same-executable process and its
@@ -614,9 +623,14 @@ pub fn native_inspect(
     // the exact executable's PIDs and retain bounded descendant names.
     let script = r#"
 Add-Type -AssemblyName UIAutomationClient
-$target=[IO.Path]::GetFullPath('@TARGET@')
+function Normalize-WorkbenchPath([string]$value) {
+  $full=[IO.Path]::GetFullPath($value)
+  if($full.StartsWith('\\?\')) { $full=$full.Substring(4) }
+  $full.TrimEnd('\')
+}
+$target=Normalize-WorkbenchPath '@TARGET@'
 $expected='@EXPECTED@'
-$processes=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -eq $target) })
+$processes=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and ((Normalize-WorkbenchPath $_.ExecutablePath) -eq $target) })
 $roots=[Windows.Automation.AutomationElement]::RootElement.FindAll([Windows.Automation.TreeScope]::Children,[Windows.Automation.Condition]::TrueCondition)
 $items=@()
 foreach($process in $processes) {
@@ -663,7 +677,7 @@ $json=@{accessibilityTrusted=$true;processes=$items} | ConvertTo-Json -Depth 8 -
             "-Command".to_owned(),
             script,
         ],
-        application,
+        &std::env::temp_dir(),
     )?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while !output_path.is_file() && Instant::now() < deadline {
@@ -859,12 +873,9 @@ pub fn input_window(
         .enumerate()
         .map(|(index, action)| normalize_input_action(index, action))
         .collect::<Result<Vec<_>, _>>()?;
-    let parent = application.parent().unwrap_or(application);
-    let metadata_path = parent.join(format!(
-        ".workbench-window-input-{}-{}.json",
-        std::process::id(),
-        now_ms()
-    ));
+    let temporary = std::env::temp_dir();
+    let parent = temporary.as_path();
+    let metadata_path = native_metadata_path("input");
     let payload = BASE64.encode(
         serde_json::to_vec(&normalized)
             .map_err(|error| RpcError::new("WINDOW_INPUT_FAILED", error.to_string()))?,
@@ -1244,6 +1255,15 @@ fn find_directory(root: &Path, name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_receipts_use_unique_temporary_paths() {
+        let first = native_metadata_path("input");
+        let second = native_metadata_path("input");
+        assert_eq!(first.parent(), Some(std::env::temp_dir().as_path()));
+        assert_ne!(first, second);
+        assert!(!first.exists());
+    }
 
     #[test]
     fn electron_package_identity_and_associations_are_normalized() {
