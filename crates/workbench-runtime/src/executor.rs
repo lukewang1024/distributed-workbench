@@ -2912,7 +2912,12 @@ fn capability_authority(name: &str) -> CapabilityAuthority {
         | "ui.inspect"
         | "ui.evaluate"
         | "ui.capture"
-        | "ui.native-inspect" => CapabilityAuthority::None,
+        | "ui.native-inspect"
+        | "clipboard.status"
+        | "clipboard.read" => CapabilityAuthority::None,
+        "clipboard.write" => CapabilityAuthority::ResourceLease {
+            resource: "clipboard:${executorId}".to_owned(),
+        },
         "application.activate"
         | "application.launch"
         | "application.open-file"
@@ -4329,6 +4334,37 @@ mod tests {
             CapabilityAuthority::ResourceLease { .. }
         ));
         assert_eq!(descriptor.effect, Effect::Mutating);
+    }
+
+    #[test]
+    fn clipboard_authority_is_independent_of_workspace_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::open(
+            "clipboard-test",
+            vec![dir.path().to_path_buf()],
+            dir.path().join("fences.json"),
+        )
+        .unwrap();
+        for action in ["clipboard.status", "clipboard.read"] {
+            assert!(runtime.enforce_authority(action, &json!({})).is_ok());
+        }
+        assert_eq!(
+            runtime
+                .enforce_authority("clipboard.write", &json!({}))
+                .unwrap_err()
+                .code,
+            "EXECUTOR_AUTHORITY_REQUIRED"
+        );
+        assert!(
+            runtime
+                .enforce_authority(
+                    "clipboard.write",
+                    &json!({"_authority":[{
+                        "controllerId":"sender","resource":"clipboard:clipboard-test","fence":1
+                    }]})
+                )
+                .is_ok()
+        );
     }
 
     #[test]

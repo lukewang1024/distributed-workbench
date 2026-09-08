@@ -203,15 +203,35 @@ fn push_image(socket: &Path, requested: &str) -> Result<Value> {
         .map_err(|e| anyhow!("{}: {}", e.code, e.message))?;
     let targets = discover(socket)?;
     let target = resolve(&targets, requested)?;
-    transfer(target, image, |id, params| {
-        executor_call(
+    let id = target
+        .executor_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("EXECUTOR_UNAVAILABLE"))?;
+    let resource = format!("clipboard:{id}");
+    let owner = format!("clipboard-{}", uuid::Uuid::new_v4());
+    let lease = rpc(
+        socket,
+        "lease.acquire",
+        json!({"resource":resource,"owner":owner,"ttlMs":15000}),
+        Duration::from_secs(3),
+    )?;
+    let result = transfer(target, image, |id, params| {
+        rpc(
             socket,
-            id,
-            "clipboard.write",
-            params,
+            "executor.call",
+            json!({"executorId":id,"action":"clipboard.write","params":params,
+            "leaseResource":resource,"owner":owner,"token":lease["token"]}),
             Duration::from_secs(12),
         )
-    })
+    });
+    // Releasing a lease never retries the image write. If release fails it expires.
+    let _ = rpc(
+        socket,
+        "lease.release",
+        json!({"resource":resource,"owner":owner,"token":lease["token"]}),
+        Duration::from_secs(3),
+    );
+    result
 }
 fn transfer(
     target: &Target,
