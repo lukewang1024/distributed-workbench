@@ -150,6 +150,13 @@ test -f "$remote_peer_template" || { printf 'bootstrap-fabric: missing %s\n' "$r
 release_cache=$(mktemp -d "${TMPDIR:-/tmp}/distributed-workbench-fabric.XXXXXX")
 trap 'rm -rf "$release_cache"' EXIT HUP INT TERM
 
+# Empty means no display changes. Only numeric private X11 displays are accepted.
+clipboard_display=${DISTRIBUTED_WORKBENCH_CLIPBOARD_DISPLAY:-}
+if [ -n "$clipboard_display" ]; then
+  case $clipboard_display in :*) ;; *) echo 'invalid clipboard display' >&2; exit 2;; esac
+  case ${clipboard_display#:} in ''|*[!0-9]*) echo 'invalid clipboard display' >&2; exit 2;; esac
+fi
+
 install_linux_release() {
   install_host=$1
   install_node_id=$2
@@ -169,7 +176,7 @@ install_linux_release() {
   remote_archive=/tmp/$archive.$$
   scp -q "$release_cache/$archive" "$install_host:$remote_archive"
   ssh -o BatchMode=yes -o ClearAllForwardings=yes "$install_host" \
-    "set -eu; temporary=\$(mktemp -d /tmp/distributed-workbench-install.XXXXXX); trap 'rm -rf \"\$temporary\" \"$remote_archive\"' EXIT HUP INT TERM; tar -C \"\$temporary\" -xzf \"$remote_archive\"; root=\"\$temporary/distributed-workbench-$version-$target\"; cd \"\$root\"; DISTRIBUTED_WORKBENCH_CONTROLLER_ID='$install_node_id' scripts/install-linux-user.sh bin/workbench '$install_executor_id' \"\$HOME/Code\" \"\$HOME/Workspace\" \"\${XDG_STATE_HOME:-\$HOME/.local/state}\"" \
+    "set -eu; temporary=\$(mktemp -d /tmp/distributed-workbench-install.XXXXXX); trap 'rm -rf \"\$temporary\" \"$remote_archive\"' EXIT HUP INT TERM; tar -C \"\$temporary\" -xzf \"$remote_archive\"; root=\"\$temporary/distributed-workbench-$version-$target\"; cd \"\$root\"; DISTRIBUTED_WORKBENCH_CLIPBOARD_DISPLAY='$clipboard_display' DISTRIBUTED_WORKBENCH_CONTROLLER_ID='$install_node_id' scripts/install-linux-user.sh bin/workbench '$install_executor_id' \"\$HOME/Code\" \"\$HOME/Workspace\" \"\${XDG_STATE_HOME:-\$HOME/.local/state}\"" \
     >/dev/null
 }
 

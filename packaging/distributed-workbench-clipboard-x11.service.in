@@ -1,0 +1,12 @@
+[Unit]
+Description=Distributed Workbench private clipboard display
+Before=@EXECUTOR_SERVICE@
+
+[Service]
+Type=simple
+ExecStart=@XVFB@ @DISPLAY@ -screen 0 1x1x24 -nolisten tcp -noreset -auth @XAUTHORITY@
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=default.target

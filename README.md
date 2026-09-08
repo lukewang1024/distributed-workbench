@@ -29,7 +29,7 @@ flowchart LR
         Local
         Remote
         Provider
-        Capabilities[Typed capabilities<br/>filesystem, process, artifact,<br/>application and UI]
+        Capabilities[Typed capabilities<br/>filesystem, process, artifact,<br/>clipboard, application and UI]
         Local --> Capabilities
         Remote --> Capabilities
         Provider --> Capabilities
@@ -91,6 +91,73 @@ workbench observe unblock <blocker-id>
 Agent starts receive `WORKBENCH_*` correlation variables so hooks can associate
 run events with the correct session, node, role, and agent. Raw prompts, command
 arguments, environment values, and log bodies are not dashboard fields.
+
+## Manual image clipboard transfer
+
+```sh
+workbench clipboard targets --json
+workbench clipboard push --target cndevbox --image-only --json
+```
+
+`targets` discovers the currently connected peer nodes from the local Controller,
+associates each peer with its Executor, and probes its native clipboard readiness.
+It excludes the local node and product adapters. Connected nodes without image
+clipboard support remain visible with `ready: false` and a reason. No target
+names, platform suffixes, SSH sessions, or tmux sessions are hard-coded.
+Discovery probes metadata/backend availability only; it never reads clipboard data.
+
+`push` reads the **invoking desktop's current image** and writes it once through
+its Controller's existing peer route. It accepts either the discovered node ID
+or its exact Executor ID. It rejects text/empty clipboards without changing the
+remote clipboard. There is no watcher, auto-sync, offline queue, implicit target
+fallback, or automatic retry. The JSON result contains dimensions and target,
+never pixels; errors have `ok: false`, a code/message, and a nonzero exit status.
+The remote Executor must confirm the applied image digest before success is
+reported. A lost acknowledgement reports an unknown outcome, not a retry.
+Writes expire after ten seconds if they have not reached the native backend.
+Decoded pixels are bounded to 16 MiB; copying image **data** is supported, copying
+an image file as a Finder file reference is not yet supported.
+
+On headless Linux, enable an authenticated Xvfb clipboard display when reconciling
+an explicitly selected release through the normal fabric bootstrap:
+
+```sh
+DISTRIBUTED_WORKBENCH_CLIPBOARD_DISPLAY=:98 \
+  scripts/bootstrap-fabric.sh --version VERSION --local-id LAPTOP_ID HOST ...
+```
+
+The Linux installer checks Xvfb/xauth, installs an owner-only Xauthority file and
+supervised display, and gives the Executor `DISPLAY`/`XAUTHORITY`. It preserves a
+configured display on subsequent installs. Nodes must run the same release;
+this feature branch is not installed just because its CLI was built locally.
+Native Windows clipboard access requires an interactive desktop session; service
+session availability is probed and failures are surfaced instead of hidden.
+
+Launch or resume Codex on that Linux node with the managed environment:
+
+```sh
+workbench clipboard exec -- codex resume
+```
+
+This reads `$XDG_CONFIG_HOME/distributed-workbench/clipboard-env` as data and
+executes the program directly. It works in an ordinary SSH terminal with no tmux.
+An already running Codex must be resumed in the new environment once; changing
+a parent shell's DISPLAY cannot change an existing process. Ctrl-V then uses
+Codex's normal image paste path. The Executor keeps the X11 selection alive
+between reads. Private display contents are separate from NoMachine/XFCE.
+
+The Hammerspoon integration in dotfiles adds a menu with dynamic targets, remembered
+selection, manual refresh and result toasts. `Ctrl+Option+C` copies from the
+foreground app, waits for a fresh image, then pushes to the selected target.
+It excludes both Hyper modifier combinations; an unchanged clipboard or text copy
+is rejected. The menu can also push an already copied image directly. Metadata refreshes
+every 30 seconds; a push snapshots the local image immediately, then revalidates
+the target before sending.
+
+Validation: `cargo test -p workbench-cli -p workbench-runtime clipboard` and, on
+Linux with Xvfb/xauth/xclip, `python3 scripts/test-clipboard-x11.py`. The latter
+creates and tears down its own display and checks native image ownership,
+Codex-compatible reads, PNG conversion, expired writes, and text rejection.
 
 ### Managed tunnels
 

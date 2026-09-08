@@ -36,6 +36,7 @@ pub struct ExecutorRuntime {
     execution: ExecutionCapacity,
     relay_root: PathBuf,
     observations: Option<ObservabilityStore>,
+    clipboard: crate::clipboard::ClipboardService,
 }
 
 #[derive(Debug)]
@@ -160,7 +161,9 @@ fn execution_class(action: &str, params: &Value) -> ExecutionClass {
         | "application.inspect"
         | "ui.inspect"
         | "ui.evaluate"
-        | "ui.native-inspect" => ExecutionClass::ReadOnly,
+        | "ui.native-inspect"
+        | "clipboard.read"
+        | "clipboard.status" => ExecutionClass::ReadOnly,
         "command.run" if params.get("mode").and_then(Value::as_str) == Some("readonly") => {
             ExecutionClass::Probe
         }
@@ -222,6 +225,7 @@ impl ExecutorRuntime {
             execution: ExecutionCapacity::from_environment(),
             relay_root,
             observations: None,
+            clipboard: crate::clipboard::ClipboardService::default(),
         })
     }
 
@@ -532,6 +536,24 @@ impl ExecutorRuntime {
                 },
             })),
             "capability.list" => Ok(serde_json::to_value(capability_catalog()).unwrap()),
+            "clipboard.status" => self.clipboard.status(),
+            "clipboard.read" => self.clipboard.read(
+                params
+                    .get("maxBytes")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(crate::clipboard::DEFAULT_MAX_BYTES)
+                    .min(crate::clipboard::DEFAULT_MAX_BYTES),
+            ),
+            "clipboard.write" => self.clipboard.write(
+                &params,
+                params
+                    .get("maxBytes")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(crate::clipboard::DEFAULT_MAX_BYTES)
+                    .min(crate::clipboard::DEFAULT_MAX_BYTES),
+            ),
             "read-grant.resolve" => {
                 let raw = PathBuf::from(required_str(&params, "requestedRoot")?);
                 let resolved = raw
@@ -2090,6 +2112,9 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("filesystem.restore", Effect::Mutating),
         ("filesystem.mkdir", Effect::Mutating),
         ("command.run", Effect::Mutating),
+        ("clipboard.status", Effect::ReadOnly),
+        ("clipboard.read", Effect::ReadOnly),
+        ("clipboard.write", Effect::Mutating),
         ("artifact.build", Effect::Mutating),
         ("artifact.describe", Effect::ReadOnly),
         ("artifact.relay.archive.create", Effect::ReadOnly),
@@ -2156,6 +2181,38 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
 
 fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
     let (required, properties, locks, key_fields, timeout_ms, rollback, evidence) = match name {
+        "clipboard.status" => (
+            vec!["clipboard"],
+            json!({}),
+            Vec::new(),
+            Vec::new(),
+            5_000,
+            RollbackStrategy::None,
+            vec!["clipboard-status"],
+        ),
+        "clipboard.read" => (
+            vec!["clipboard"],
+            json!({"maxBytes": {"type": "integer", "minimum": 1, "maximum": 16777216}}),
+            Vec::new(),
+            vec!["maxBytes"],
+            5_000,
+            RollbackStrategy::None,
+            vec!["clipboard-digest"],
+        ),
+        "clipboard.write" => (
+            vec!["clipboard"],
+            json!({
+                "semanticDigest": {"type": "string"},
+                "content": {"type": "object"},
+                "expiresAtMs": {"type": "integer", "minimum": 1},
+                "maxBytes": {"type": "integer", "minimum": 1, "maximum": 16777216}
+            }),
+            Vec::new(),
+            vec!["semanticDigest"],
+            5_000,
+            RollbackStrategy::None,
+            vec!["clipboard-digest"],
+        ),
         "filesystem.resolve" | "filesystem.stat" | "filesystem.list" => (
             vec!["filesystem"],
             json!({"path": {"type": "string"}}),

@@ -32,6 +32,22 @@ executor_socket=$state_root/executor.sock
 controller_state=$state_root/controller.json
 backup_root=$state_root/backups/$(date -u +%Y%m%dT%H%M%SZ)
 
+clipboard_config=$config_home/distributed-workbench$suffix
+clipboard_display=${DISTRIBUTED_WORKBENCH_CLIPBOARD_DISPLAY:-}
+if [ -z "$clipboard_display" ] && [ -f "$clipboard_config/clipboard-env" ]; then
+  clipboard_display=$(sed -n 's/^DISPLAY=//p' "$clipboard_config/clipboard-env")
+fi
+clipboard_after=
+clipboard_env=
+clipboard_service=
+if [ -n "$clipboard_display" ]; then
+  case $clipboard_display in :*) ;; *) echo "invalid clipboard display" >&2; exit 2;; esac
+  case ${clipboard_display#:} in ''|*[!0-9]*) echo "invalid clipboard display" >&2; exit 2;; esac
+  xvfb=$(command -v Xvfb 2>/dev/null || true)
+  [ -n "$xvfb" ] || { echo "install-linux-user: Xvfb is required for the private clipboard display" >&2; exit 2; }
+  command -v xauth >/dev/null 2>&1 || { echo "install-linux-user: xauth is required for the private clipboard display" >&2; exit 2; }
+fi
+
 mkdir -p "$(dirname "$installed_binary")" "$unit_root" "$state_root"
 if [ -f "$controller_state" ] || [ -f "$state_root/executor-fences.json" ] || [ -f "$installed_binary" ]; then
   mkdir -p "$backup_root"
@@ -61,6 +77,30 @@ controller_service=distributed-workbench$suffix-controller.service
 executor_service=distributed-workbench$suffix-executor.service
 controller_unit=$unit_root/$controller_service
 executor_unit=$unit_root/$executor_service
+if [ -n "$clipboard_display" ]; then
+  clipboard_auth=$state_root/clipboard-Xauthority
+  # Keep a stable cookie across upgrades, so existing clients can reconnect.
+  if [ ! -s "$clipboard_auth" ] || [ -z "$(xauth -f "$clipboard_auth" list "$clipboard_display")" ]; then
+    (umask 077; touch "$clipboard_auth")
+    clipboard_cookie=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')
+    xauth -f "$clipboard_auth" add "$clipboard_display" MIT-MAGIC-COOKIE-1 "$clipboard_cookie"
+  fi
+  chmod 600 "$clipboard_auth"
+  mkdir -p "$clipboard_config"
+  (umask 077; printf 'DISPLAY=%s\nXAUTHORITY=%s\n' "$clipboard_display" "$clipboard_auth" > "$clipboard_config/clipboard-env")
+  clipboard_service=distributed-workbench$suffix-clipboard-x11.service
+  clipboard_after="Requires=$clipboard_service
+After=$clipboard_service"
+  clipboard_env="Environment=DISPLAY=$clipboard_display
+Environment=XAUTHORITY=$clipboard_auth"
+  clipboard_tmp=$unit_root/$clipboard_service.$$.tmp
+  sed -e "s|@XVFB@|$xvfb|g" \
+    -e "s|@DISPLAY@|$clipboard_display|g" \
+    -e "s|@XAUTHORITY@|$clipboard_auth|g" \
+    -e "s|@EXECUTOR_SERVICE@|$executor_service|g" \
+    packaging/distributed-workbench-clipboard-x11.service.in >"$clipboard_tmp"
+  mv "$clipboard_tmp" "$unit_root/$clipboard_service"
+fi
 
 controller_tmp=$controller_unit.$$.tmp
 sed \
@@ -77,14 +117,24 @@ sed \
   -e "s|@SOCKET@|$executor_socket|g" \
   -e "s|@EXECUTOR_ID@|$executor_id|g" \
   -e "s|@ALLOW_ROOTS@|$allow_args|g" \
-  packaging/distributed-workbench-executor.service.in >"$executor_tmp"
+  packaging/distributed-workbench-executor.service.in |
+  DWB_CLIPBOARD_AFTER="$clipboard_after" DWB_CLIPBOARD_ENV="$clipboard_env" awk '
+    $0 == "@CLIPBOARD_AFTER@" { print ENVIRON["DWB_CLIPBOARD_AFTER"]; next }
+    $0 == "@CLIPBOARD_ENV@" { print ENVIRON["DWB_CLIPBOARD_ENV"]; next }
+    { print }
+  ' >"$executor_tmp"
 mv "$executor_tmp" "$executor_unit"
 
 systemctl --user daemon-reload
+[ -z "$clipboard_service" ] || systemctl --user enable --now "$clipboard_service"
 systemctl --user enable --now "$controller_service"
 systemctl --user enable --now "$executor_service"
 systemctl --user restart "$controller_service"
 systemctl --user restart "$executor_service"
+if [ -n "$clipboard_display" ] && command -v tmux >/dev/null 2>&1; then
+  tmux set-environment -g DISPLAY "$clipboard_display" 2>/dev/null || true
+  tmux set-environment -g XAUTHORITY "$clipboard_auth" 2>/dev/null || true
+fi
 systemctl --user list-unit-files "distributed-workbench$suffix-peer-*.service" --no-legend 2>/dev/null |
   while IFS=' ' read -r peer_unit _; do
     case $peer_unit in

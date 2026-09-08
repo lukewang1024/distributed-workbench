@@ -1,3 +1,5 @@
+#[path = "clipboard_cli.rs"]
+mod clipboard_cli;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,10 @@ enum Command {
     Observe {
         #[command(subcommand)]
         command: ObserveCommand,
+    },
+    Clipboard {
+        #[command(subcommand)]
+        command: ClipboardCommand,
     },
     Logs {
         #[arg(long)]
@@ -131,6 +137,30 @@ enum ObserveCommand {
         blocker_id: String,
         #[arg(long)]
         run_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ClipboardCommand {
+    /// Launch a program against the managed Linux image clipboard (no tmux required).
+    Exec {
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// List connected peer nodes and their image clipboard readiness.
+    Targets {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Send the current local image once. Never watches or forwards text.
+    Push {
+        #[arg(long)]
+        target: String,
+        /// Images are always required; accepted for explicit callers.
+        #[arg(long)]
+        image_only: bool,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -388,6 +418,16 @@ fn run_cli(cli: Cli) -> Result<()> {
                     None,
                     run_id,
                 ),
+            }
+        }
+        Command::Clipboard { command } => {
+            let socket = cli.socket.unwrap_or_else(default_controller_socket);
+            match command {
+                ClipboardCommand::Exec { command } => clipboard_cli::exec(&command),
+                ClipboardCommand::Targets { json } => clipboard_cli::targets(&socket, json),
+                ClipboardCommand::Push { target, json, .. } => {
+                    clipboard_cli::push(&socket, &target, json)
+                }
             }
         }
         Command::Logs {
