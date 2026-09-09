@@ -1350,7 +1350,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "workbench-cli"
-version = "0.6.48"
+version = "0.6.49"
 dependencies = [
  "anyhow",
  "clap",
@@ -1366,7 +1366,7 @@ dependencies = [
 
 [[package]]
 name = "workbench-core"
-version = "0.6.48"
+version = "0.6.49"
 dependencies = [
  "hex",
  "rusqlite",
@@ -1382,7 +1382,7 @@ dependencies = [
 
 [[package]]
 name = "workbench-protocol"
-version = "0.6.48"
+version = "0.6.49"
 dependencies = [
  "serde",
  "serde_json",
@@ -1391,7 +1391,7 @@ dependencies = [
 
 [[package]]
 name = "workbench-runtime"
-version = "0.6.48"
+version = "0.6.49"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1418,7 +1418,7 @@ dependencies = [
 
 [[package]]
 name = "workbench-schema"
-version = "0.6.48"
+version = "0.6.49"
 dependencies = [
  "serde",
  "serde_json",

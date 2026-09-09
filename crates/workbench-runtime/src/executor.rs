@@ -3722,8 +3722,30 @@ fn bounded_output(bytes: &[u8]) -> String {
 }
 
 fn digest_file(path: &Path) -> Result<String, RpcError> {
-    let bytes = fs::read(path).map_err(|error| io_error("FS_READ_FAILED", path, error))?;
-    Ok(sha256_bytes(&bytes))
+    let mut digest = Sha256::new();
+    let _ = hash_file_into(path, &mut digest, "FS_READ_FAILED")?;
+    Ok(format!("sha256:{}", hex::encode(digest.finalize())))
+}
+
+fn hash_file_into(
+    path: &Path,
+    digest: &mut Sha256,
+    error_code: &'static str,
+) -> Result<u64, RpcError> {
+    let mut file = fs::File::open(path).map_err(|error| io_error(error_code, path, error))?;
+    let mut buffer = [0_u8; 1024 * 1024];
+    let mut size = 0_u64;
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| io_error(error_code, path, error))?;
+        if count == 0 {
+            break;
+        }
+        size = size.saturating_add(count as u64);
+        digest.update(&buffer[..count]);
+    }
+    Ok(size)
 }
 
 fn digest_tree(root: &Path) -> Result<(String, u64, u64), RpcError> {
@@ -3768,10 +3790,7 @@ fn digest_tree(root: &Path) -> Result<(String, u64, u64), RpcError> {
                 .map_err(|error| io_error("ARTIFACT_READ_FAILED", &path, error))?;
             digest.update(target.as_os_str().as_encoded_bytes());
         } else {
-            let bytes =
-                fs::read(&path).map_err(|error| io_error("ARTIFACT_READ_FAILED", &path, error))?;
-            size = size.saturating_add(bytes.len() as u64);
-            digest.update(&bytes);
+            size = size.saturating_add(hash_file_into(&path, &mut digest, "ARTIFACT_READ_FAILED")?);
         }
         digest.update([0]);
     }
@@ -4821,6 +4840,40 @@ mod tests {
             json!({"token": token}),
         ));
         assert!(removed.ok, "{removed:?}");
+    }
+
+    #[test]
+    fn artifact_describe_streams_large_files_in_directory_digest() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
+        let source = directory.path().join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(
+            source.join("nested/large.bin"),
+            vec![42_u8; 2 * 1024 * 1024 + 17],
+        )
+        .unwrap();
+        fs::write(source.join("small.txt"), b"small").unwrap();
+        let mut expected = Sha256::new();
+        expected.update(b"nested/large.bin");
+        expected.update([0]);
+        expected.update(vec![42_u8; 2 * 1024 * 1024 + 17]);
+        expected.update([0]);
+        expected.update(b"small.txt");
+        expected.update([0]);
+        expected.update(b"small");
+        expected.update([0]);
+
+        let described = runtime.handle(Request::new("artifact.describe", json!({"path": source})));
+        assert!(described.ok, "{described:?}");
+        let result = described.result.unwrap();
+        assert_eq!(result["kind"], "directory");
+        assert_eq!(result["files"], 2);
+        assert_eq!(result["size"], 2 * 1024 * 1024 + 17 + 5);
+        assert_eq!(
+            result["digest"],
+            format!("sha256:{}", hex::encode(expected.finalize()))
+        );
     }
 
     #[test]
