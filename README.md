@@ -114,7 +114,14 @@ fallback, or automatic retry. The JSON result contains dimensions and target,
 never pixels; errors have `ok: false`, a code/message, and a nonzero exit status.
 The remote Executor must confirm the applied image digest before success is
 reported. A lost acknowledgement reports an unknown outcome, not a retry.
-Writes expire after ten seconds if they have not reached the native backend.
+Explicit sends probe only the selected target, allowing fifteen seconds per
+readiness call while other transfers share the peer connection. Background menu
+probes retain a three-second budget. A preflight timeout reports
+`TARGET_CHECK_TIMEOUT` and means the image was not sent.
+Writes expire after thirty seconds if they have not reached the native backend.
+The CLI waits up to thirty-five seconds for the write acknowledgement and never
+retries the write. `WORKBENCH_CLIPBOARD_PROGRESS=1` emits stage metadata as JSON
+lines on stderr; the final result remains on stdout.
 Decoded pixels are bounded to 16 MiB; copying image **data** is supported, copying
 an image file as a Finder file reference is not yet supported.
 

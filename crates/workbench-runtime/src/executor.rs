@@ -989,6 +989,81 @@ impl ExecutorRuntime {
                     "digest": digest, "size": size, "files": files, "kind": kind
                 }))
             }
+            "artifact.relay.local-copy" => {
+                let source = self.path(&params, "source", true)?;
+                let destination = self.path(&params, "destination", false)?;
+                let staging = self.path(&params, "staging", false)?;
+                if source == destination || destination.starts_with(&source) {
+                    return Err(RpcError::new(
+                        "INVALID_ARTIFACT_PATH",
+                        "local artifact destination must be outside the source",
+                    ));
+                }
+                let source_metadata = fs::symlink_metadata(&source)
+                    .map_err(|error| io_error("ARTIFACT_READ_FAILED", &source, error))?;
+                let kind = if source_metadata.is_file() {
+                    "file"
+                } else if source_metadata.is_dir() {
+                    "directory"
+                } else {
+                    return Err(RpcError::new(
+                        "INVALID_ARTIFACT",
+                        "local artifact copy supports only regular files and directories",
+                    ));
+                };
+                let (source_digest, source_size, source_files) = if kind == "file" {
+                    (digest_file(&source)?, source_metadata.len(), 1)
+                } else {
+                    digest_tree(&source)?
+                };
+                if staging.exists() {
+                    if staging.is_dir() {
+                        fs::remove_dir_all(&staging)
+                    } else {
+                        fs::remove_file(&staging)
+                    }
+                    .map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", &staging, error))?;
+                }
+                if kind == "file" {
+                    if let Some(parent) = staging.parent() {
+                        fs::create_dir_all(parent)
+                            .map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", parent, error))?;
+                    }
+                    fs::copy(&source, &staging)
+                        .map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", &source, error))?;
+                } else {
+                    copy_relay_tree(&source, &staging)?;
+                }
+                let (copied_digest, copied_size, copied_files) = if kind == "file" {
+                    (
+                        digest_file(&staging)?,
+                        fs::metadata(&staging)
+                            .map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", &staging, error))?
+                            .len(),
+                        1,
+                    )
+                } else {
+                    digest_tree(&staging)?
+                };
+                if source_digest != copied_digest
+                    || source_size != copied_size
+                    || source_files != copied_files
+                {
+                    let _ = if staging.is_dir() {
+                        fs::remove_dir_all(&staging)
+                    } else {
+                        fs::remove_file(&staging)
+                    };
+                    return Err(RpcError::new(
+                        "ARTIFACT_DIGEST_MISMATCH",
+                        "source changed during local copy",
+                    ));
+                }
+                commit_relay_staging(&destination, &staging)?;
+                Ok(
+                    json!({"destination": destination, "digest": copied_digest, "size": copied_size, "files": copied_files, "kind": kind, "transport": "local"}),
+                )
+            }
             "artifact.relay.archive.read" => {
                 let token = required_str(&params, "token")?;
                 let archive_path = relay_archive_path(&self.relay_root, token)?;
@@ -2123,6 +2198,7 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("artifact.relay.archive.prepare", Effect::Mutating),
         ("artifact.relay.archive.write", Effect::Mutating),
         ("artifact.relay.archive.commit", Effect::Mutating),
+        ("artifact.relay.local-copy", Effect::Mutating),
         ("artifact.relay.manifest", Effect::ReadOnly),
         ("artifact.relay.read", Effect::ReadOnly),
         ("artifact.relay.prepare", Effect::Mutating),
@@ -2364,6 +2440,15 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             600_000,
             RollbackStrategy::None,
             vec!["artifact-relay-source"],
+        ),
+        "artifact.relay.local-copy" => (
+            vec!["filesystem-copy"],
+            json!({"source": {"type": "string"}, "destination": {"type": "string"}, "staging": {"type": "string"}}),
+            vec!["artifact-relay:${destination}"],
+            vec!["source", "destination", "staging"],
+            3_600_000,
+            RollbackStrategy::None,
+            vec!["artifact-relay-local-copy"],
         ),
         "artifact.relay.archive.prepare"
         | "artifact.relay.archive.write"
@@ -2937,6 +3022,9 @@ fn capability_authority(name: &str) -> CapabilityAuthority {
         | "artifact.relay.prepare"
         | "artifact.relay.write"
         | "artifact.relay.commit" => CapabilityAuthority::ResourceLease {
+            resource: "artifact-relay:${destination}".to_owned(),
+        },
+        "artifact.relay.local-copy" => CapabilityAuthority::ResourceLease {
             resource: "artifact-relay:${destination}".to_owned(),
         },
         _ => CapabilityAuthority::WorkspaceDriver,
@@ -3828,6 +3916,37 @@ fn commit_relay_staging(destination: &Path, staging: &Path) -> Result<(), RpcErr
             fs::remove_file(&backup)
         };
         remove.map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", &backup, error))?;
+    }
+    Ok(())
+}
+
+fn copy_relay_tree(source: &Path, staging: &Path) -> Result<(), RpcError> {
+    fs::create_dir_all(staging)
+        .map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", staging, error))?;
+    let mut children = fs::read_dir(source)
+        .map_err(|error| io_error("ARTIFACT_READ_FAILED", source, error))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| io_error("ARTIFACT_READ_FAILED", source, error))?;
+    children.sort_by_key(|entry| entry.file_name());
+    for entry in children {
+        let source_child = entry.path();
+        let destination_child = staging.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_child)
+            .map_err(|error| io_error("ARTIFACT_READ_FAILED", &source_child, error))?;
+        if metadata.is_dir() {
+            copy_relay_tree(&source_child, &destination_child)?;
+        } else if metadata.is_file() {
+            fs::copy(&source_child, &destination_child)
+                .map_err(|error| io_error("ARTIFACT_TRANSFER_FAILED", &source_child, error))?;
+        } else {
+            return Err(RpcError::new(
+                "INVALID_ARTIFACT",
+                format!(
+                    "local copy does not support symlinks or special files: {}",
+                    source_child.display()
+                ),
+            ));
+        }
     }
     Ok(())
 }

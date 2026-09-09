@@ -3533,6 +3533,15 @@ impl Controller {
             "manifesting",
             json!({"sourceExecutorId": source_executor, "destinationExecutorId": destination_executor, "sourcePath": source_path, "destinationPath": destination_path}),
         );
+        if source_executor == destination_executor {
+            return self.relay_local_artifact(
+                source_executor,
+                source_path,
+                destination_path,
+                mode,
+                transfer_started,
+            );
+        }
         let archive_started = Instant::now();
         match self.call_registered_executor(
             source_executor,
@@ -3679,6 +3688,68 @@ impl Controller {
                 "destination": {"executorId": destination_executor, "path": destination_path},
                 "mode": mode,
                 "digest": committed["digest"], "size": committed["size"], "files": committed["files"]
+            }))
+        })();
+        let _ = self
+            .leases
+            .lock()
+            .expect("lease lock")
+            .release(&resource, &owner, &lease.token);
+        self.persist()?;
+        result
+    }
+
+    fn relay_local_artifact(
+        &self,
+        executor_id: &str,
+        source_path: &str,
+        destination_path: &str,
+        mode: &str,
+        transfer_started: Instant,
+    ) -> Result<Value, RpcError> {
+        let resource = format!("artifact-relay:{destination_path}");
+        let owner = format!("controller:{}", self.id);
+        let lease = self
+            .leases
+            .lock()
+            .expect("lease lock")
+            .acquire(
+                LeaseKind::Resource,
+                resource.clone(),
+                owner.clone(),
+                3_600_000,
+            )
+            .map_err(map_lease_error)?;
+        self.persist()?;
+        let staging = format!(
+            "{destination_path}.workbench-local-{}",
+            Uuid::new_v4().simple()
+        );
+        let authority =
+            json!([{"controllerId": self.id, "resource": resource, "fence": lease.fence}]);
+        let result = (|| {
+            transfer_event(
+                "local-started",
+                json!({"executorId": executor_id, "sourcePath": source_path, "destinationPath": destination_path}),
+            );
+            let copied = self.call_registered_executor(
+                executor_id,
+                "artifact.relay.local-copy",
+                json!({"source": source_path, "destination": destination_path, "staging": staging, "_authority": authority}),
+            )?;
+            transfer_event(
+                "committed",
+                json!({"transport": "local", "digest": copied.get("digest")}),
+            );
+            Ok(json!({
+                "source": {"executorId": executor_id, "path": source_path},
+                "destination": {"executorId": executor_id, "path": destination_path},
+                "mode": mode,
+                "transport": "local",
+                "digest": copied["digest"], "size": copied["size"], "files": copied["files"],
+                "transfer": {"rawBytes": copied["size"], "transferredBytes": copied["size"], "chunks": 0, "retryCount": 0,
+                    "relayDurationMs": 0, "commitDurationMs": transfer_started.elapsed().as_millis(),
+                    "totalDurationMs": transfer_started.elapsed().as_millis()}
             }))
         })();
         let _ = self
@@ -5424,6 +5495,61 @@ mod tests {
                 .unwrap()
                 .len(),
             2 * 1024 * 1024 + 17
+        );
+    }
+
+    #[test]
+    fn controller_uses_executor_local_copy_when_source_and_destination_match() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let destination = directory.path().join("destination");
+        std::fs::create_dir_all(source.join("nested")).unwrap();
+        std::fs::write(source.join("nested/payload.txt"), b"local copy").unwrap();
+        let runtime = Arc::new(
+            crate::ExecutorRuntime::open(
+                "same-machine",
+                vec![directory.path().to_path_buf()],
+                directory.path().join("fences.json"),
+            )
+            .unwrap(),
+        );
+        let socket = directory.path().join("executor.sock");
+        let server_socket = socket.clone();
+        let server_runtime = runtime.clone();
+        std::thread::spawn(move || {
+            RpcServer::new(server_socket)
+                .serve(move |request| server_runtime.handle(request))
+                .unwrap()
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let controller =
+            Controller::open(JsonStore::new(directory.path().join("controller.json"))).unwrap();
+        assert!(controller
+            .handle(Request::new(
+                "executor.register",
+                json!({"executorId":"same-machine","endpoint":{"transport":"local","socket":socket}}),
+            ))
+            .ok);
+        let response = controller.handle(Request::new(
+            "artifact.transfer",
+            json!({
+                "source": {"executorId":"same-machine","path":source},
+                "destination": {"executorId":"same-machine","path":destination},
+                "mode":"mirror"
+            }),
+        ));
+        assert!(response.ok, "{:?}", response.error);
+        let result = response.result.unwrap();
+        assert_eq!(result["transport"], "local");
+        assert_eq!(result["transfer"]["chunks"], 0);
+        assert_eq!(
+            std::fs::read(destination.join("nested/payload.txt")).unwrap(),
+            b"local copy"
         );
     }
 

@@ -11,6 +11,17 @@ use workbench_runtime::{
     clipboard::{ClipboardService, DEFAULT_MAX_BYTES},
 };
 
+// Opt-in line-delimited metadata for desktop progress UI. Never emit pixels or
+// estimate transfer percentages: this protocol acknowledges the whole image.
+fn progress(stage: &str, bytes: Option<u64>) {
+    if std::env::var("WORKBENCH_CLIPBOARD_PROGRESS").as_deref() == Ok("1") {
+        eprintln!(
+            "{}",
+            json!({"event":"clipboard.progress","stage":stage,"bytes":bytes})
+        );
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Target {
@@ -113,17 +124,22 @@ fn candidates(snapshot: &Value) -> Vec<Target> {
     targets
 }
 fn discover(socket: &Path) -> Result<Vec<Target>> {
-    let snapshot = rpc(socket, "status", json!({}), Duration::from_secs(3))?;
-    let targets = candidates(&snapshot);
+    discover_for(socket, None, Duration::from_secs(3))
+}
+fn discover_for(socket: &Path, requested: Option<&str>, timeout: Duration) -> Result<Vec<Target>> {
+    let snapshot = rpc(socket, "status", json!({}), timeout)?;
+    let targets = candidates(&snapshot).into_iter().filter(|target| {
+        requested.is_none_or(|id| target.node_id == id || target.executor_id.as_deref() == Some(id))
+    });
     // Probe only metadata/backend readiness, never clipboard contents.
-    let handles: Vec<_> = targets.into_iter().map(|mut target| {
+    let handles: Vec<_> = targets.map(|mut target| {
         let socket=socket.to_owned();
         std::thread::spawn(move || {
             if let Some(id)=target.executor_id.as_deref() {
-                let probe=executor_call(&socket,id,"capability.list",json!({}),Duration::from_secs(3)).and_then(|caps| {
+                let probe=executor_call(&socket,id,"capability.list",json!({}),timeout).and_then(|caps| {
                     let has = |name| caps.as_array().is_some_and(|v| v.iter().any(|c| c["name"]==name));
                     if !has("clipboard.status") || !has("clipboard.write") { bail!("CLIPBOARD_UNSUPPORTED: install image clipboard support on this node"); }
-                    executor_call(&socket,id,"clipboard.status",json!({}),Duration::from_secs(3))
+                    executor_call(&socket,id,"clipboard.status",json!({}),timeout)
                 });
                 match probe {
                     Ok(status) if status["ready"]==true => { target.ready=true; target.reason=None;
@@ -193,7 +209,15 @@ pub fn targets(socket: &Path, as_json: bool) -> Result<()> {
 pub fn push(socket: &Path, requested: &str, as_json: bool) -> Result<()> {
     report(push_image(socket, requested), as_json)
 }
+fn preflight_error(error: anyhow::Error) -> anyhow::Error {
+    if error.to_string().contains("RPC_TIMEOUT") {
+        anyhow!("TARGET_CHECK_TIMEOUT: target check timed out; image was not sent")
+    } else {
+        error
+    }
+}
 fn push_image(socket: &Path, requested: &str) -> Result<Value> {
+    progress("reading", None);
     // Snapshot at invocation, before network probes: another copy while discovery
     // is in flight must not change which image the user asked to send.
     // Local native read occurs on the invoking thread (NSPasteboard on macOS).
@@ -201,29 +225,39 @@ fn push_image(socket: &Path, requested: &str) -> Result<Value> {
     let image = ClipboardService::default()
         .read(DEFAULT_MAX_BYTES)
         .map_err(|e| anyhow!("{}: {}", e.code, e.message))?;
-    let targets = discover(socket)?;
-    let target = resolve(&targets, requested)?;
+    let bytes = image["size"].as_u64();
+    progress("checking", bytes);
+    // Explicit sends tolerate shared-connection traffic and probe only the
+    // selected destination. Menu refreshes retain their short read-only budget.
+    let targets =
+        discover_for(socket, Some(requested), Duration::from_secs(15)).map_err(preflight_error)?;
+    let target = resolve(&targets, requested).map_err(preflight_error)?;
     let id = target
         .executor_id
         .as_deref()
         .ok_or_else(|| anyhow!("EXECUTOR_UNAVAILABLE"))?;
     let resource = format!("clipboard:{id}");
     let owner = format!("clipboard-{}", uuid::Uuid::new_v4());
+    progress("preparing", bytes);
     let lease = rpc(
         socket,
         "lease.acquire",
-        json!({"resource":resource,"owner":owner,"ttlMs":15000}),
+        json!({"resource":resource,"owner":owner,"ttlMs":45000}),
         Duration::from_secs(3),
     )?;
     let result = transfer(target, image, |id, params| {
+        progress("transferring", bytes);
         rpc(
             socket,
             "executor.call",
             json!({"executorId":id,"action":"clipboard.write","params":params,
             "leaseResource":resource,"owner":owner,"token":lease["token"]}),
-            Duration::from_secs(12),
+            Duration::from_secs(35),
         )
     });
+    if result.is_ok() {
+        progress("confirmed", bytes);
+    }
     // Releasing a lease never retries the image write. If release fails it expires.
     let _ = rpc(
         socket,
@@ -241,7 +275,7 @@ fn transfer(
     if image["content"]["kind"] != "image" {
         bail!("NO_IMAGE: clipboard contains no image");
     }
-    let expires = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64 + 10_000;
+    let expires = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64 + 30_000;
     let response = send(
         target
             .executor_id
