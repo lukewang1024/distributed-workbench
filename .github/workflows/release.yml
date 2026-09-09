@@ -45,7 +45,11 @@ jobs:
           key: ${{ matrix.target }}
       - name: Install musl C toolchain
         if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+        shell: bash
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
       - name: Configure Android linker
         if: endsWith(matrix.target, '-linux-android')
         shell: bash
