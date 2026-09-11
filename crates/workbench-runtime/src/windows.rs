@@ -927,7 +927,20 @@ public static class WorkbenchInput {
   static INPUT K(ushort vk,ushort scan,uint flags) { return new INPUT { type=Keyboard,U=new InputUnion { ki=new KEYBDINPUT { wVk=vk,wScan=scan,dwFlags=flags } } }; }
   static INPUT M(uint flags) { return new INPUT { type=Mouse,U=new InputUnion { mi=new MOUSEINPUT { dwFlags=flags } } }; }
   static void Send(INPUT[] values) { if(SendInput((uint)values.Length,values,Marshal.SizeOf(typeof(INPUT)))!=values.Length) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"SendInput failed"); }
-  public static void Focus(IntPtr window) { uint ignored;uint foreground=GetWindowThreadProcessId(GetForegroundWindow(),out ignored);uint current=GetCurrentThreadId();bool attached=foreground!=0&&foreground!=current&&AttachThreadInput(current,foreground,true);try{ShowWindowAsync(window,9);BringWindowToTop(window);if(!SetForegroundWindow(window))throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"SetForegroundWindow failed");}finally{if(attached)AttachThreadInput(current,foreground,false);} }
+  public static void Focus(IntPtr window) {
+    if(GetForegroundWindow()==window)return;
+    uint ignored;uint foreground=GetWindowThreadProcessId(GetForegroundWindow(),out ignored);uint target=GetWindowThreadProcessId(window,out ignored);uint current=GetCurrentThreadId();
+    bool attachedForeground=foreground!=0&&foreground!=current&&AttachThreadInput(current,foreground,true);
+    bool attachedTarget=target!=0&&target!=current&&target!=foreground&&AttachThreadInput(current,target,true);
+    try{
+      ShowWindowAsync(window,9);BringWindowToTop(window);SetForegroundWindow(window);
+      if(GetForegroundWindow()!=window){Thread.Sleep(100);BringWindowToTop(window);SetForegroundWindow(window);}
+      if(GetForegroundWindow()!=window)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"SetForegroundWindow failed");
+    }finally{
+      if(attachedTarget)AttachThreadInput(current,target,false);
+      if(attachedForeground)AttachThreadInput(current,foreground,false);
+    }
+  }
   public static void Text(string value) { foreach(char ch in value) Send(new[]{K(0,ch,Unicode),K(0,ch,Unicode|KeyUp)}); }
   public static void Click(string button,int count) { uint down=2,up=4; if(button=="right"){down=8;up=16;} if(button=="middle"){down=32;up=64;} for(int i=0;i<count;i++){Send(new[]{M(down),M(up)});Thread.Sleep(80);} }
   static ushort Modifier(string value) { switch(value){case "ALT":return 18;case "CTRL":return 17;case "SHIFT":return 16;case "WIN":return 91;default:throw new ArgumentException("unsupported modifier: "+value);} }
@@ -1353,5 +1366,13 @@ mod tests {
         assert!(
             normalize_input_action(0, &json!({"type": "paste", "text": "x", "key": "V"})).is_err()
         );
+    }
+
+    #[test]
+    fn input_focus_verifies_foreground_and_attaches_target_thread() {
+        let source = include_str!("windows.rs");
+        assert!(source.contains("if(GetForegroundWindow()==window)return"));
+        assert!(source.contains("AttachThreadInput(current,target,true)"));
+        assert!(source.contains("if(GetForegroundWindow()!=window)throw"));
     }
 }

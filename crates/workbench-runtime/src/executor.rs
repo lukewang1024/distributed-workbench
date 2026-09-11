@@ -768,6 +768,25 @@ impl ExecutorRuntime {
                     .get("content")
                     .and_then(Value::as_str)
                     .ok_or_else(|| RpcError::new("INVALID_PARAMS", "content is required"))?;
+                let encoding = params
+                    .get("encoding")
+                    .and_then(Value::as_str)
+                    .unwrap_or("utf-8");
+                let bytes = match encoding {
+                    "utf-8" => content.as_bytes().to_vec(),
+                    "base64" => BASE64.decode(content).map_err(|error| {
+                        RpcError::new(
+                            "INVALID_PARAMS",
+                            format!("content is not valid base64: {error}"),
+                        )
+                    })?,
+                    value => {
+                        return Err(RpcError::new(
+                            "INVALID_PARAMS",
+                            format!("unsupported filesystem.write encoding: {value}"),
+                        ));
+                    }
+                };
                 if let Some(expected) = params.get("expectedDigest").and_then(Value::as_str) {
                     let actual = if path.exists() {
                         Some(digest_file(&path)?)
@@ -790,7 +809,7 @@ impl ExecutorRuntime {
                 }
                 let temporary =
                     path.with_extension(format!("workbench.{}.tmp", std::process::id()));
-                fs::write(&temporary, content)
+                fs::write(&temporary, bytes)
                     .map_err(|error| io_error("FS_WRITE_FAILED", &temporary, error))?;
                 atomic_replace(&temporary, &path)
                     .map_err(|error| io_error("FS_WRITE_FAILED", &path, error))?;
@@ -2329,10 +2348,11 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             json!({
                 "path": {"type": "string"},
                 "content": {"type": "string"},
+                "encoding": {"type": "string", "enum": ["utf-8", "base64"]},
                 "expectedDigest": {"type": "string"}
             }),
             vec!["filesystem:${path}"],
-            vec!["path", "content", "expectedDigest"],
+            vec!["path", "content", "encoding", "expectedDigest"],
             30_000,
             RollbackStrategy::None,
             vec!["file-digest"],
@@ -2920,7 +2940,8 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                                 )
                                 | ("filesystem.read", "offset" | "limit")
                         )
-                        || (name == "filesystem.write" && key.as_str() == "expectedDigest"))
+                        || (name == "filesystem.write"
+                            && matches!(key.as_str(), "encoding" | "expectedDigest")))
                 })
                 .cloned()
                 .collect()
@@ -4667,6 +4688,31 @@ mod tests {
         assert!(!conflict.ok);
     }
 
+    #[test]
+    fn filesystem_write_decodes_explicit_base64_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ExecutorRuntime::new("local", vec![directory.path().to_path_buf()]).unwrap();
+        let path = directory.path().join("fixture.docx");
+        let payload = [0_u8, 0xff, b'P', b'K', 3, 4];
+        let written = runtime.handle(Request::new(
+            "filesystem.write",
+            json!({
+                "path": path,
+                "content": BASE64.encode(payload),
+                "encoding": "base64"
+            }),
+        ));
+        assert!(written.ok, "{written:?}");
+        assert_eq!(fs::read(&path).unwrap(), payload);
+
+        let invalid = runtime.handle(Request::new(
+            "filesystem.write",
+            json!({"path": path, "content": "%%%", "encoding": "base64"}),
+        ));
+        assert_eq!(invalid.error.unwrap().code, "INVALID_PARAMS");
+        assert_eq!(fs::read(path).unwrap(), payload);
+    }
+
     #[cfg(unix)]
     #[test]
     fn workspace_read_grant_is_persistent_read_only_and_symlink_safe() {
@@ -5044,6 +5090,10 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .contains(&json!("expectedDigest"))
+        );
+        assert_eq!(
+            write.input_schema["properties"]["encoding"]["enum"],
+            json!(["utf-8", "base64"])
         );
         let read = capability_catalog()
             .into_iter()
