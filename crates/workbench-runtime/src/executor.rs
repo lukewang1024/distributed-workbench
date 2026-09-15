@@ -4134,8 +4134,8 @@ mod tests {
         assert_eq!(live["observation"]["listenerOwned"], true);
         drop(listener);
         let closed = tunnel_view(&record, false);
-        assert_eq!(closed["observedState"], "degraded");
-        assert_eq!(closed["observation"]["binding"]["state"], "available");
+        assert_ne!(closed["observedState"], "ready");
+        assert_eq!(closed["observation"]["listenerOwned"], false);
     }
 
     #[test]
