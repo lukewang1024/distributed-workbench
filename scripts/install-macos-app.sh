@@ -28,6 +28,13 @@ log_path=$state_root/macos-agent.log
 controller_log=$state_root/controller.log
 node_id=${DISTRIBUTED_WORKBENCH_NODE_ID:-$(hostname -s)}
 backup_root=$state_root/backups/$(date -u +%Y%m%dT%H%M%SZ)
+allow_roots=${DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS:-}
+
+if [ -z "$allow_roots" ]; then
+  allow_roots="$HOME/Code
+$HOME/Workspace
+$state_home"
+fi
 
 if [ ! -x "$source_binary" ]; then
   echo "install-macos-app: executable not found: $source_binary" >&2
@@ -40,6 +47,33 @@ fi
 app_version=$($source_binary --version | awk 'NR == 1 { print $2 }')
 
 mkdir -p "$contents/MacOS" "$(dirname "$controller_executable")" "$bin_home" "$launch_agents" "$state_root"
+allow_roots_file=$state_root/.allow-roots.$$.xml
+trap 'rm -f "$allow_roots_file" "$launch_plist.$$.tmp" "$launch_plist.$$.tmp.2"' EXIT HUP INT TERM
+
+xml_escape() {
+  printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
+}
+
+: >"$allow_roots_file"
+old_ifs=$IFS
+IFS='
+'
+set -f
+for root in $allow_roots; do
+  case $root in
+    /*) ;;
+    *) echo "install-macos-app: allow-root must be absolute: $root" >&2; exit 2 ;;
+  esac
+  case $root in
+    *"
+"*) echo "install-macos-app: allow-root cannot contain a newline" >&2; exit 2 ;;
+  esac
+  escaped_root=$(xml_escape "$root")
+  printf '    <string>--allow-root</string>\n    <string>%s</string>\n' "$escaped_root" >>"$allow_roots_file"
+done
+set +f
+IFS=$old_ifs
+
 if [ -f "$controller_state" ] || [ -f "$state_root/executor-fences.json" ]; then
   mkdir -p "$backup_root"
   for state_file in "$controller_state" "$state_root/executor-fences.json"; do
@@ -133,6 +167,15 @@ sed \
   -e "s|@DOWNLOADS_ROOT@|$(escape_sed "$HOME/Downloads")|g" \
   -e "s|@LOG_PATH@|$(escape_sed "$log_path")|g" \
   "$template" >"$launch_plist.$$.tmp"
+awk -v roots_file="$allow_roots_file" '
+  $0 == "    @ALLOW_ROOTS@" {
+    while ((getline line < roots_file) > 0) print line
+    close(roots_file)
+    next
+  }
+  { print }
+' "$launch_plist.$$.tmp" >"$launch_plist.$$.tmp.2"
+mv "$launch_plist.$$.tmp.2" "$launch_plist.$$.tmp"
 plutil -lint "$launch_plist.$$.tmp" >/dev/null
 mv "$launch_plist.$$.tmp" "$launch_plist"
 

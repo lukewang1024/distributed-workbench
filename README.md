@@ -259,6 +259,12 @@ logical directions. For a version already installed from a local build, use
 `--version VERSION --skip-release-install`; service setup, registration, and
 topology verification still run.
 
+The initiator's POSIX Executor roots can be declared with repeatable
+`--local-allow-root PATH` options. The installer renders them into the native
+macOS LaunchAgent or Linux user service, and `--verify-only` checks that the
+running Executor exposes the same roots. Composition layers should pass these
+options from their Fabric manifest rather than editing generated service files.
+
 If a Controller is unresponsive, repair the native supervisors before delegating
 back to normal bootstrap verification:
 

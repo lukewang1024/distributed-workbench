@@ -3,7 +3,7 @@ set -eu
 
 usage() {
   printf '%s\n' \
-    'usage: scripts/bootstrap-fabric.sh [--version VERSION] [--local-id ID] [--windows-allow-root PATH]... [--windows-application-root PATH]... [--skip-release-install] [--verify-only] HOST|windows:HOST ...' \
+    'usage: scripts/bootstrap-fabric.sh [--version VERSION] [--local-id ID] [--local-allow-root PATH]... [--windows-allow-root PATH]... [--windows-application-root PATH]... [--skip-release-install] [--verify-only] HOST|windows:HOST ...' \
     '' \
     'Install or verify distributed-workbench on selected SSH hosts, then register' \
     'their executors with the laptop Controller. Prefix native Windows nodes' \
@@ -15,6 +15,7 @@ local_id=$(hostname -s)
 local_id_explicit=false
 verify_only=false
 skip_release_install=false
+local_allow_roots=
 windows_allow_roots=
 windows_application_roots=
 while [ "$#" -gt 0 ]; do
@@ -28,6 +29,18 @@ while [ "$#" -gt 0 ]; do
       test "$#" -ge 2 || { usage >&2; exit 2; }
       local_id=$2
       local_id_explicit=true
+      shift 2
+      ;;
+    --local-allow-root)
+      test "$#" -ge 2 || { usage >&2; exit 2; }
+      case $2 in
+        /*) ;;
+        *) printf 'bootstrap-fabric: local allow-root must be absolute: %s\n' "$2" >&2; exit 2 ;;
+      esac
+      case $2 in *"'"*|*"
+"*) printf 'bootstrap-fabric: invalid local allow-root: %s\n' "$2" >&2; exit 2 ;; esac
+      local_allow_roots="$local_allow_roots
+$2"
       shift 2
       ;;
     --verify-only)
@@ -147,6 +160,12 @@ test -x "$workbench" || { printf 'bootstrap-fabric: executable not found: %s\n' 
 test -f "$peer_template" || { printf 'bootstrap-fabric: missing %s\n' "$peer_template" >&2; exit 2; }
 test -f "$remote_peer_template" || { printf 'bootstrap-fabric: missing %s\n' "$remote_peer_template" >&2; exit 2; }
 
+if [ -z "$local_allow_roots" ]; then
+  local_allow_roots="$HOME/Code
+$HOME/Workspace
+$state_home"
+fi
+
 release_cache=$(mktemp -d "${TMPDIR:-/tmp}/distributed-workbench-fabric.XXXXXX")
 trap 'rm -rf "$release_cache"' EXIT HUP INT TERM
 
@@ -187,7 +206,9 @@ if [ "$installed_version" != "$version" ]; then
     exit 1
   fi
   printf 'bootstrap-fabric: laptop: installing %s\n' "$version"
-  DISTRIBUTED_WORKBENCH_NODE_ID=$local_id "$installer" "$version" >/dev/null
+  DISTRIBUTED_WORKBENCH_NODE_ID=$local_id \
+    DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS=$local_allow_roots \
+    "$installer" "$version" >/dev/null
   if [ "$local_service_manager" = launchd ]; then
     workbench=$app_binary
   else
@@ -197,6 +218,18 @@ fi
 
 local_status=$("$workbench" --socket "$controller_socket" status)
 local_executor_status=$("$workbench" --socket "$executor_socket" status)
+old_ifs=$IFS
+IFS='
+'
+set -f
+for root in $local_allow_roots; do
+  printf '%s\n' "$local_executor_status" | grep -F '"'$root'"' >/dev/null || {
+    printf 'bootstrap-fabric: local Executor is missing allow-root: %s\n' "$root" >&2
+    exit 1
+  }
+done
+set +f
+IFS=$old_ifs
 local_executor_id=$(printf '%s\n' "$local_executor_status" |
   sed -n 's/.*"executorId":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
 test -n "$local_executor_id" || {
