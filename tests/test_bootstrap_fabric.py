@@ -113,6 +113,16 @@ class BootstrapFabricContractTest(unittest.TestCase):
         self.assertIn('$controllerService = "DistributedWorkbench" + $serviceNamespace + "Controller"', windows)
         self.assertIn('if ($Namespace -eq "stable") { "" }', windows)
 
+    def test_macos_installer_renders_configured_allow_roots(self) -> None:
+        macos = (ROOT / "scripts/install-macos-app.sh").read_text()
+        template = (ROOT / "packaging/dev.distributed-workbench.macos-agent.plist.in").read_text()
+        fabric = (ROOT / "scripts/bootstrap-fabric.sh").read_text()
+
+        self.assertIn("DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS", macos)
+        self.assertIn("    @ALLOW_ROOTS@", template)
+        self.assertIn("--local-allow-root", fabric)
+        self.assertIn("DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS=$local_allow_roots", fabric)
+
     def test_prune_state_accepts_only_valid_managed_namespaces(self) -> None:
         script = ROOT / "scripts" / "prune-state.sh"
         with tempfile.TemporaryDirectory() as temporary:
