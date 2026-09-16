@@ -214,6 +214,20 @@ if [ "$installed_version" != "$version" ]; then
   else
     workbench=$HOME/.local/bin/workbench
   fi
+elif [ "$verify_only" = false ] && [ "$skip_release_install" = false ]; then
+  # The binary version alone does not prove that native service definitions
+  # contain the requested identities, roots, or other launch arguments.
+  # Re-run the idempotent installer so same-version configuration drift is
+  # reconciled before the status checks below.
+  printf 'bootstrap-fabric: laptop: reconciling %s service configuration\n' "$version"
+  DISTRIBUTED_WORKBENCH_NODE_ID=$local_id \
+    DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS=$local_allow_roots \
+    "$installer" "$version" >/dev/null
+  if [ "$local_service_manager" = launchd ]; then
+    workbench=$app_binary
+  else
+    workbench=$HOME/.local/bin/workbench
+  fi
 fi
 
 local_status=$("$workbench" --socket "$controller_socket" status)

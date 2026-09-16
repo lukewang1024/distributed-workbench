@@ -917,6 +917,9 @@ public static class WorkbenchInput {
   [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr window,StringBuilder text,int count);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr window);
+  [DllImport("user32.dll")] public static extern IntPtr SetActiveWindow(IntPtr window);
+  [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr window);
+  [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr window,bool altTab);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr window,int command);
   [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr window,IntPtr insertAfter,int x,int y,int width,int height,uint flags);
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
@@ -940,7 +943,7 @@ public static class WorkbenchInput {
       ShowWindowAsync(window,9);
       SetWindowPos(window,new IntPtr(-1),0,0,0,0,0x0001|0x0002|0x0010);
       SetWindowPos(window,new IntPtr(-2),0,0,0,0,0x0001|0x0002|0x0010);
-      for(int attempt=0;attempt<3&&GetForegroundWindow()!=window;attempt++){BringWindowToTop(window);SetForegroundWindow(window);Thread.Sleep(100);}
+      for(int attempt=0;attempt<3&&GetForegroundWindow()!=window;attempt++){BringWindowToTop(window);SetActiveWindow(window);SetFocus(window);SetForegroundWindow(window);SwitchToThisWindow(window,true);Thread.Sleep(100);}
       if(GetForegroundWindow()!=window)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"SetForegroundWindow failed");
     }finally{
       if(attachedTarget)AttachThreadInput(current,target,false);

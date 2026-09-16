@@ -123,6 +123,13 @@ class BootstrapFabricContractTest(unittest.TestCase):
         self.assertIn("--local-allow-root", fabric)
         self.assertIn("DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS=$local_allow_roots", fabric)
 
+    def test_same_version_install_reconciles_local_service_configuration(self) -> None:
+        script = (ROOT / "scripts/bootstrap-fabric.sh").read_text()
+
+        self.assertIn("reconciling %s service configuration", script)
+        self.assertIn('elif [ "$verify_only" = false ] && [ "$skip_release_install" = false ]', script)
+        self.assertEqual(script.count('DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS=$local_allow_roots'), 2)
+
     def test_prune_state_accepts_only_valid_managed_namespaces(self) -> None:
         script = ROOT / "scripts" / "prune-state.sh"
         with tempfile.TemporaryDirectory() as temporary:
