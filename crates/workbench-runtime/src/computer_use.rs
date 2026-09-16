@@ -48,6 +48,23 @@ fn read_frame(reader: &mut BufReader<TcpStream>) -> Result<Value, RpcError> {
     serde_json::from_slice(&bytes).map_err(failed)
 }
 impl ComputerUseService {
+    pub(crate) fn close_existing(&self, state_root: &Path) -> Result<(), RpcError> {
+        let session = self
+            .0
+            .lock()
+            .map_err(failed)?
+            .as_ref()
+            .map(|h| h.session.clone());
+        if let Some(session) = session {
+            self.call(
+                state_root,
+                &json!({"sessionId":session,"tool":"close"}),
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn call(
         &self,
         state_root: &Path,

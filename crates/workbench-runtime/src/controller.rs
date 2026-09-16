@@ -327,6 +327,27 @@ impl Controller {
         if let Some(routed) = self.route_session_action(action, &params)? {
             return Ok(routed);
         }
+        if action.starts_with("desktop.") {
+            let id = required_str(&params, "executorId")?;
+            let executor = self
+                .state
+                .lock()
+                .expect("state lock")
+                .executors
+                .iter()
+                .find(|e| e.metadata.id == id)
+                .cloned()
+                .ok_or_else(|| RpcError::new("EXECUTOR_NOT_FOUND", id))?;
+            let response = call_executor(&executor.endpoint, &traced_request(action, params))
+                .map_err(|e| RpcError::new("EXECUTOR_UNAVAILABLE", e.to_string()))?;
+            return if response.ok {
+                Ok(response.result.unwrap_or(Value::Null))
+            } else {
+                Err(response
+                    .error
+                    .unwrap_or_else(|| RpcError::new("EXECUTOR_FAILED", "desktop request failed")))
+            };
+        }
         match action {
             "ping" => Ok(json!({
                 "controller": {"id": self.id, "status": "ready", "protocolFeatures": protocol_features()},
@@ -2000,7 +2021,8 @@ impl Controller {
                     );
                 }
                 let required_authority = match &contract.authority {
-                    workbench_schema::CapabilityAuthority::None => None,
+                    workbench_schema::CapabilityAuthority::None
+                    | workbench_schema::CapabilityAuthority::DesktopSession => None,
                     workbench_schema::CapabilityAuthority::WorkspaceDriver => {
                         // `LeaseTable::validate` returns a reference into the table. Keep the
                         // mutex guard in an explicit scope so it is released before task

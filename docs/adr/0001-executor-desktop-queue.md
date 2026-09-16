@@ -1,0 +1,3 @@
+# The target Executor owns the desktop queue
+
+Each interactive desktop has one durable FIFO on its Executor; Controllers submit and query through their existing routes. Keeping admission, draining and tool execution at one authority prevents independent Controller leases from granting overlapping ownership and avoids a second distributed handoff protocol between a Controller scheduler and Executor. A disconnected origin does not block expiry, but an Executor crash with outstanding ownership quarantines the desktop until explicit recovery; we prefer this availability cost over executing against uncertain native state.

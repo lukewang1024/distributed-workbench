@@ -7,7 +7,7 @@ is vendored, translated or maintained here. Upstream MIT notices ship in the
 npm package. An official Node 24.14.0 runtime is pinned by SHA-256.
 
 The adapter owns only transport, lifecycle, schema validation and the Executor
-lease. Screenshots, accessibility trees, input, stale observations, UI refs,
+desktop queue. Screenshots, accessibility trees, input, stale observations, UI refs,
 verification and platform fallbacks belong to the plugin. No model/API key or
 Pi login is needed. Only the configured extension is loaded; workbench sessions
 use an isolated Pi state directory, never the user's personal Pi configuration.
@@ -43,7 +43,8 @@ All commands address the local Controller, which routes to the chosen Executor.
 
 ```sh
 workbench computer-use tools --executor <executor-id>
-workbench computer-use open --executor <executor-id> --owner <unique-session>
+workbench computer-use open --executor <executor-id> --owner <unique-session> --request-key <stable-request-key>
+workbench computer-use status --executor <executor-id> --owner <unique-session> --token <returned-token>
 workbench computer-use call --executor <executor-id> --owner <unique-session> --token <returned-token> find_roots '{}'
 workbench computer-use call --executor <executor-id> --owner <unique-session> --token <returned-token> observe_ui '{"root":"@r1","mode":"fused"}'
 workbench computer-use call --executor <executor-id> --owner <unique-session> --token <returned-token> act_ui '{"stateId":"<observed-state>","actions":[{"action":"press","ref":"@e3"}]}'
@@ -51,23 +52,46 @@ workbench computer-use close --executor <executor-id> --owner <unique-session> -
 ```
 
 Use the `tools` response as the authoritative original schemas. Long JSON can be
-passed on stdin with `-`. A session holds one exclusive `computer-use:<executor>`
-lease (15 minutes by default); renew before expiry. Do not mix this session with
-legacy `ui.input` / `ui.automate` clients on the same desktop. Release workspace
-and runtime ownership before acquiring desktop control.
+passed on stdin with `-`. `open` submits to the **target Executor's durable FIFO**.
+Keep its token and poll `status` until `state=active` before calling tools. A lost
+submit response can be recovered by repeating the same owner/request-key; use a
+new key for a new session. `queue` lists sessions without exposing tokens. `cancel`
+removes queued work or drains active work; `close` finishes the whole session.
+An active session expires after 15 minutes by default; renew before expiry.
+Queued time does not consume its TTL. TTL must be 1 second to 1 hour.
 
-All plugin tool calls, including observations, require this lease because native
-helper initialization may affect the desktop. Schema listing does not. A new
-session destroys old observation state. The executor serializes requests and
-never retries an uncertain input delivery. After a disconnect, re-observe before
-acting; do not replay a click or submit operation. `close` ends the host and
-native helper children. Parent disconnect or 15 minutes of inactivity also ends
-the host. macOS's upstream LaunchServices helper may remain available for reuse.
+All Controllers, including CloudIDE submitters, route to the same target queue.
+The queue owns an entire acceptance session, not individual clicks. Activation,
+observations, actions, screenshots and cleanup belong inside that session. Every
+new session gets a unique identity and increasing epoch, invalidating prior refs.
+Different Executor desktops run independently. One Executor per interactive
+desktop is required; multiple Executor services on the same desktop are unsupported.
 
-The original tool result includes text, structured details, and image content
-blocks (`type=image`, base64 `data`, `mimeType`). Preserve screenshots directly;
-do not render a synthetic replacement. A successful transport is not proof of
-UI success: inspect the plugin's reported action outcome and successor state.
+Legacy `application.*`, `ui.*`, and `clipboard.write` calls share the execution
+gate. During a session they must carry `_desktop: {owner, token}` in their Executor
+input, **in addition to** their existing runtime/acceptance authority. Without a
+session these compatibility calls are individually serialized; callers needing a
+multi-step guarantee must submit a session first. Schema discovery is also gated
+because initializing upstream helpers can affect the desktop; discover before
+submitting, or pass session credentials using `executor.call`.
+
+Expiry runs in the Executor even if submitters disconnect. A successor starts only
+after in-flight work returns and the upstream host acknowledges cleanup. Calls
+validated before waiting on the execution gate are revalidated inside it. Tool
+transport failures and Executor restart with an outstanding session quarantine the
+desktop. No GUI action is automatically replayed. After an operator has stopped old
+native helpers and reset/checked the desktop, use the local Controller:
+
+```sh
+workbench call desktop.recover '{"executorId":"<executor-id>","confirmDesktopReset":true}'
+```
+
+The queue is stored beside Executor state in `desktop-queue.json`; deleting it
+loses fencing history and is not a recovery procedure. Completed sessions retain
+submission deduplication; the queue rejects submissions at 10,000 retained entries
+rather than silently discarding that history. Scheduling is within the trusted
+fabric boundary and does not exclude a human using the keyboard or an unrelated
+OS automation process.
 
 ## Platform requirements
 
@@ -90,6 +114,7 @@ npm test --prefix computer-use
 cargo test -p workbench-runtime computer_use --lib
 cargo build -p workbench-cli --bin workbench
 python3 scripts/test-computer-use.py
+python3 scripts/test-desktop-queue.py
 ```
 
 The smoke test uses isolated temporary Controller/Executor instances and the real

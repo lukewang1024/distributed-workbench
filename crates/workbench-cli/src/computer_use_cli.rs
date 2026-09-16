@@ -13,7 +13,30 @@ pub enum ComputerUseCommand {
         #[arg(long)]
         executor: String,
     },
-    /// Acquire exclusive desktop control for a bounded session.
+    /// List the target desktop FIFO (credentials are redacted).
+    Queue {
+        #[arg(long)]
+        executor: String,
+    },
+    /// Query a submitted session; only state=active permits tool calls.
+    Status {
+        #[arg(long)]
+        executor: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        token: String,
+    },
+    /// Cancel a queued session or drain an active one.
+    Cancel {
+        #[arg(long)]
+        executor: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long)]
+        token: String,
+    },
+    /// Submit to the target desktop's durable FIFO; retain the returned token.
     Open {
         #[arg(long)]
         executor: String,
@@ -21,6 +44,9 @@ pub enum ComputerUseCommand {
         owner: String,
         #[arg(long, default_value_t = 900000)]
         ttl_ms: u64,
+        /// Stable per-submission key for safe retries after a lost response.
+        #[arg(long)]
+        request_key: Option<String>,
     },
     Renew {
         #[arg(long)]
@@ -79,12 +105,32 @@ fn invoke(
         socket,
         "executor.call",
         json!({"executorId":executor,"action":"computer-use.call",
-        "params":{"sessionId":owner,"tool":tool,"arguments":arguments},
-        "leaseResource":format!("computer-use:{executor}"),"owner":owner,"token":token}),
+        "params":{"_desktop":{"owner":owner,"token":token},"tool":tool,"arguments":arguments}}),
     )
 }
 pub fn run(socket: &Path, command: ComputerUseCommand) -> Result<()> {
     let result = match command {
+        ComputerUseCommand::Queue { executor } => {
+            rpc(socket, "desktop.list", json!({"executorId":executor}))
+        }
+        ComputerUseCommand::Status {
+            executor,
+            owner,
+            token,
+        } => rpc(
+            socket,
+            "desktop.get",
+            json!({"executorId":executor,"owner":owner,"token":token}),
+        ),
+        ComputerUseCommand::Cancel {
+            executor,
+            owner,
+            token,
+        } => rpc(
+            socket,
+            "desktop.cancel",
+            json!({"executorId":executor,"owner":owner,"token":token}),
+        ),
         ComputerUseCommand::Tools { executor } => rpc(
             socket,
             "executor.call",
@@ -94,10 +140,11 @@ pub fn run(socket: &Path, command: ComputerUseCommand) -> Result<()> {
             executor,
             owner,
             ttl_ms,
+            request_key,
         } => rpc(
             socket,
-            "lease.acquire",
-            json!({"resource":format!("computer-use:{executor}"),"owner":owner,"ttlMs":ttl_ms}),
+            "desktop.submit",
+            json!({"executorId":executor,"requestKey":request_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),"owner":owner,"ttlMs":ttl_ms}),
         ),
         ComputerUseCommand::Renew {
             executor,
@@ -106,8 +153,8 @@ pub fn run(socket: &Path, command: ComputerUseCommand) -> Result<()> {
             ttl_ms,
         } => rpc(
             socket,
-            "lease.renew",
-            json!({"resource":format!("computer-use:{executor}"),"owner":owner,"token":token,"ttlMs":ttl_ms}),
+            "desktop.renew",
+            json!({"executorId":executor,"owner":owner,"token":token,"ttlMs":ttl_ms}),
         ),
         ComputerUseCommand::Call {
             executor,
@@ -127,15 +174,11 @@ pub fn run(socket: &Path, command: ComputerUseCommand) -> Result<()> {
             executor,
             owner,
             token,
-        } => {
-            let closed = invoke(socket, &executor, &owner, &token, "close", json!({}));
-            let released = rpc(
-                socket,
-                "lease.release",
-                json!({"resource":format!("computer-use:{executor}"),"owner":owner,"token":token}),
-            );
-            closed.and(released)
-        }
+        } => rpc(
+            socket,
+            "desktop.finish",
+            json!({"executorId":executor,"owner":owner,"token":token}),
+        ),
     }?;
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(())

@@ -5,6 +5,7 @@ pub mod clipboard;
 pub mod clipboard;
 mod computer_use;
 mod controller;
+mod desktop;
 mod executor;
 mod generation;
 #[cfg(target_os = "macos")]

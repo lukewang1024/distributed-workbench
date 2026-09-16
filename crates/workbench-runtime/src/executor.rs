@@ -38,6 +38,8 @@ pub struct ExecutorRuntime {
     observations: Option<ObservabilityStore>,
     clipboard: crate::clipboard::ClipboardService,
     computer_use: crate::computer_use::ComputerUseService,
+    desktop: Mutex<crate::desktop::DesktopQueue>,
+    desktop_execution: Mutex<()>,
 }
 
 #[derive(Debug)]
@@ -229,6 +231,8 @@ impl ExecutorRuntime {
             observations: None,
             clipboard: crate::clipboard::ClipboardService::default(),
             computer_use: crate::computer_use::ComputerUseService::default(),
+            desktop: Mutex::new(crate::desktop::DesktopQueue::default()),
+            desktop_execution: Mutex::new(()),
         })
     }
 
@@ -300,6 +304,9 @@ impl ExecutorRuntime {
             ObservabilityStore::open(state_path.with_file_name("observability.db"))
                 .map_err(|error| RpcError::new("OBSERVABILITY_STORE_FAILED", error.to_string()))?,
         );
+        runtime.desktop = Mutex::new(crate::desktop::DesktopQueue::open(
+            state_path.with_file_name("desktop-queue.json"),
+        )?);
         runtime.fences = Some(Mutex::new(fences));
         Ok(runtime)
     }
@@ -333,9 +340,7 @@ impl ExecutorRuntime {
             .execution
             .try_acquire(execution_class(&request.action, &request.params));
         let result = match permit {
-            Ok(_permit) => self
-                .enforce_authority(&request.action, &request.params)
-                .and_then(|()| self.dispatch(&request.action, request.params)),
+            Ok(_permit) => self.desktop_dispatch(&request.action, request.params),
             Err(error) => Err(error),
         };
         let response = match result {
@@ -407,6 +412,91 @@ impl ExecutorRuntime {
         response
     }
 
+    /// Reap expired desktop sessions even when every submitter disconnects.
+    pub fn start_desktop_reaper(self: &std::sync::Arc<Self>) {
+        let weak = std::sync::Arc::downgrade(self);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let Some(runtime) = weak.upgrade() else { break };
+                if let Err(error) = runtime.reconcile_desktop() {
+                    event_fields(
+                        "error",
+                        "desktop.reconcile.failed",
+                        json!({"errorCode":error.code}),
+                    );
+                }
+            }
+        });
+    }
+
+    fn reconcile_desktop(&self) -> Result<(), RpcError> {
+        let Ok(_gate) = self.desktop_execution.try_lock() else {
+            return Ok(());
+        };
+        let mut queue = self.desktop.lock().expect("desktop queue");
+        if queue.needs_cleanup() {
+            let result = self
+                .computer_use
+                .close_existing(&self.relay_root.with_file_name("computer-use"));
+            queue.cleanup_done(result.is_ok())?;
+            result?;
+        }
+        queue.promote()
+    }
+
+    fn desktop_dispatch(&self, action: &str, mut params: Value) -> Result<Value, RpcError> {
+        if action.starts_with("desktop.") {
+            self.reconcile_desktop()?;
+            let result = self
+                .desktop
+                .lock()
+                .expect("desktop queue")
+                .command(action, &params)?;
+            self.reconcile_desktop()?;
+            if matches!(action, "desktop.finish" | "desktop.cancel") {
+                return self
+                    .desktop
+                    .lock()
+                    .expect("desktop queue")
+                    .command("desktop.get", &params);
+            }
+            return Ok(result);
+        }
+        if !crate::desktop::protected(action) {
+            return self
+                .enforce_authority(action, &params)
+                .and_then(|()| self.dispatch(action, params));
+        }
+        self.reconcile_desktop()?;
+        let _gate = self.desktop_execution.lock().expect("desktop execution");
+        // Validate inside the execution gate; a request waiting on an old grant
+        // cannot execute after ownership has changed.
+        self.desktop
+            .lock()
+            .expect("desktop queue")
+            .begin(action, &mut params)?;
+        let result = if action == "computer-use.call" {
+            self.dispatch(action, params)
+        } else {
+            self.enforce_authority(action, &params)
+                .and_then(|()| self.dispatch(action, params))
+        };
+        let uncertain = result.as_ref().is_err_and(|e| {
+            let message = e.message.to_ascii_lowercase();
+            e.code == "COMPUTER_USE_UNAVAILABLE"
+                || e.code.contains("TIMEOUT")
+                || (e.code == "COMPUTER_USE_TOOL_FAILED"
+                    && (message.contains("timeout")
+                        || message.contains("timed out")
+                        || message.contains("abort")))
+        });
+        self.desktop.lock().expect("desktop queue").end(uncertain)?;
+        drop(_gate);
+        self.reconcile_desktop()?;
+        result
+    }
+
     fn enforce_authority(&self, action: &str, params: &Value) -> Result<(), RpcError> {
         let Some(fences) = &self.fences else {
             return Ok(());
@@ -444,7 +534,7 @@ impl ExecutorRuntime {
             ));
         }
         let mut expected_resources: Vec<String> = match &contract.authority {
-            CapabilityAuthority::None => Vec::new(),
+            CapabilityAuthority::None | CapabilityAuthority::DesktopSession => Vec::new(),
             CapabilityAuthority::WorkspaceDriver => vec![format!(
                 "workspace:{}",
                 required_str(params, "_workspaceSessionId")?
@@ -521,7 +611,7 @@ impl ExecutorRuntime {
             "ping" | "status" => Ok(json!({
                 "executorId": self.id,
                 "status": "ready",
-                "protocolFeatures": ["capability-authority-v2", "driver-draining-v1", "read-grant-v1", "acceptance-handoff-v1"],
+                "protocolFeatures": ["capability-authority-v2", "driver-draining-v1", "read-grant-v1", "acceptance-handoff-v1", "desktop-queue-v1"],
                 "allowedRoots": self.allowed_roots,
                 "applicationRoots": self.application_roots,
                 "grantableReadRoots": self.grantable_read_roots,
@@ -2291,7 +2381,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
             if name == "computer-use.tools" {
                 json!({})
             } else {
-                json!({"sessionId": {"type":"string", "minLength":1, "maxLength":256}, "tool":{"type":"string"}, "arguments":{"type":"object"}})
+                json!({"_desktop": {"type":"object", "properties":{"owner":{"type":"string"},"token":{"type":"string"}}, "required":["owner","token"]}, "tool":{"type":"string"}, "arguments":{"type":"object"}})
             },
             Vec::new(),
             Vec::new(),
@@ -3045,9 +3135,7 @@ fn capability_authority(name: &str) -> CapabilityAuthority {
         | "clipboard.status"
         | "clipboard.read" => CapabilityAuthority::None,
         "computer-use.tools" => CapabilityAuthority::None,
-        "computer-use.call" => CapabilityAuthority::ResourceLease {
-            resource: "computer-use:${executorId}".to_owned(),
-        },
+        "computer-use.call" => CapabilityAuthority::DesktopSession,
         "clipboard.write" => CapabilityAuthority::ResourceLease {
             resource: "clipboard:${executorId}".to_owned(),
         },
@@ -5197,18 +5285,13 @@ mod computer_use_contract_tests {
     #[test]
     fn desktop_calls_require_one_machine_lease_and_never_retry() {
         let call = contract("computer-use.call", Effect::Mutating);
-        assert_eq!(
-            call.authority,
-            CapabilityAuthority::ResourceLease {
-                resource: "computer-use:${executorId}".into(),
-            }
-        );
+        assert_eq!(call.authority, CapabilityAuthority::DesktopSession);
         assert_eq!(call.retry.max_attempts, 1);
         assert!(
             call.input_schema["required"]
                 .as_array()
                 .unwrap()
-                .contains(&json!("sessionId"))
+                .contains(&json!("_desktop"))
         );
         let discovery = contract("computer-use.tools", Effect::ReadOnly);
         assert_eq!(discovery.authority, CapabilityAuthority::None);

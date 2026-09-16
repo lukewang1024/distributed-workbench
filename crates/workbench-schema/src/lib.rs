@@ -296,6 +296,8 @@ pub enum CapabilityAuthority {
     #[default]
     None,
     WorkspaceDriver,
+    /// Validated by the target Executor durable desktop queue.
+    DesktopSession,
     ResourceLease {
         resource: String,
     },

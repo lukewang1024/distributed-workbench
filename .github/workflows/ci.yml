@@ -25,6 +25,9 @@ jobs:
           node-version: '24.14.0'
       - run: npm ci --ignore-scripts --prefix computer-use
       - run: npm test --prefix computer-use
+      - run: cargo build -p workbench-cli --bin workbench
+      - if: runner.os != 'Windows'
+        run: python3 scripts/test-desktop-queue.py
       - run: cargo fmt --check
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings

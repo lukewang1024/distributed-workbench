@@ -501,6 +501,7 @@ fn run_cli(cli: Cli) -> Result<()> {
                 .and_then(|runtime| runtime.with_application_roots(application_roots))
                 .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?,
             );
+            executor.start_desktop_reaper();
             let handler = Arc::clone(&executor);
             RpcServer::new(cli.socket.unwrap_or_else(default_executor_socket))
                 .serve(move |request| handler.handle(request))

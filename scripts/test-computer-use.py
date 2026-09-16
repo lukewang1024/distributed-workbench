@@ -25,16 +25,16 @@ with tempfile.TemporaryDirectory(prefix='cu-rpc-') as directory:
         assert len(discovery['result']['tools']) == 11
         request = {'executorId':'executor','action':'computer-use.call','params':{'sessionId':'test','tool':'search_ui','arguments':{'stateId':'expired','text':'test'}}}
         denied = rpc('executor.call', request)
-        assert not denied['ok'] and denied['error']['code'] == 'EXECUTOR_AUTHORITY_REQUIRED', denied
-        lease = rpc('lease.acquire', {'resource':'computer-use:executor','owner':'test','ttlMs':300000})['result']
-        assert not rpc('lease.acquire', {'resource':'computer-use:executor','owner':'other','ttlMs':300000})['ok']
-        request.update(leaseResource='computer-use:executor',owner='test',token=lease['token'])
+        assert not denied['ok'] and denied['error']['code'] == 'DESKTOP_SESSION_REQUIRED', denied
+        lease = rpc('desktop.submit', {'executorId':'executor','owner':'test','requestKey':'test','ttlMs':300000})['result']
+        assert rpc('desktop.submit', {'executorId':'executor','owner':'other','requestKey':'other','ttlMs':300000})['result']['state'] == 'queued'
+        request['params']['_desktop'] = {'owner':'test','token':lease['token']}
         stale = rpc('executor.call', request)
         assert not stale['ok'] and 'unavailable or was evicted' in stale['error']['message'], stale
         request['params']['tool'] = 'close'
         request['params']['arguments'] = {}
         assert rpc('executor.call', request)['ok']
-        assert rpc('lease.release', {'resource':'computer-use:executor','owner':'test','token':lease['token']})['ok']
+        assert rpc('desktop.finish', {'executorId':'executor','owner':'test','token':lease['token']})['ok']
         assert not rpc('executor.call', request)['ok']
         print('PASS: original plugin discovery, fenced calls, contention, stale refs, close, stale token rejection')
     finally:
