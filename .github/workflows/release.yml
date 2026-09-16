@@ -100,6 +100,10 @@ jobs:
           '${{ matrix.target }}'
           'target/${{ matrix.target }}/release'
           dist
+      - name: Validate Windows PowerShell 5.1 long-path installation
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./scripts/test-windows-release.ps1 -Archive (Get-ChildItem dist/*.zip).FullName
       - uses: actions/upload-artifact@v7
         with:
           name: distributed-workbench-${{ matrix.target }}

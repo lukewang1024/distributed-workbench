@@ -26,7 +26,10 @@ try {
   $expected = ($sumLine -split '\s+')[0].ToLowerInvariant()
   $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $temporary $archive)).Hash.ToLowerInvariant()
   if ($actual -ne $expected) { throw "checksum mismatch" }
-  Expand-Archive -Path (Join-Path $temporary $archive) -DestinationPath $temporary
+  # Windows PowerShell 5.1 Expand-Archive cannot extract npm paths beyond MAX_PATH.
+  # The native Windows tar supports long paths and the release ZIP format.
+  & tar.exe -xf (Join-Path $temporary $archive) -C $temporary
+  if ($LASTEXITCODE -ne 0) { throw "release extraction failed: $LASTEXITCODE" }
   $root = Join-Path $temporary "distributed-workbench-$Version-$target"
   $applicationParameters = @{}
   if ($PSBoundParameters.ContainsKey("ApplicationRoot")) {
@@ -34,5 +37,5 @@ try {
   }
   & (Join-Path $root "scripts\install-windows.ps1") -Binary (Join-Path $root "bin\workbench.exe") -NodeId $NodeId -AllowRoot $AllowRoot @applicationParameters
 } finally {
-  Remove-Item -Recurse -Force $temporary -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath ("\\?\" + $temporary) -Recurse -Force -ErrorAction SilentlyContinue
 }

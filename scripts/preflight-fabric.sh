@@ -40,7 +40,7 @@ for host in "$@"; do
   printf 'preflight-fabric: %s: checking platform and release prerequisites\n' "$host"
   if [ "$(platform_of "$host")" = windows ]; then
     ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
-      "powershell.exe -NoProfile -NonInteractive -Command \"if (\$env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'x86_64 Windows is required' }; Get-Command Invoke-WebRequest,Expand-Archive,ssh.exe | Out-Null; Invoke-WebRequest -Method Head -UseBasicParsing '$base/distributed-workbench-$version-x86_64-pc-windows-msvc.zip' | Out-Null; Invoke-WebRequest -Method Head -UseBasicParsing '$base/SHA256SUMS' | Out-Null; Write-Output ready\"" \
+      "powershell.exe -NoProfile -NonInteractive -Command \"if (\$env:PROCESSOR_ARCHITECTURE -ne 'AMD64') { throw 'x86_64 Windows is required' }; Get-Command Invoke-WebRequest,tar.exe,robocopy.exe,ssh.exe | Out-Null; Invoke-WebRequest -Method Head -UseBasicParsing '$base/distributed-workbench-$version-x86_64-pc-windows-msvc.zip' | Out-Null; Invoke-WebRequest -Method Head -UseBasicParsing '$base/SHA256SUMS' | Out-Null; Write-Output ready\"" \
       >/dev/null
   else
     ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
