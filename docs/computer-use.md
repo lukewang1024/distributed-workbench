@@ -160,3 +160,33 @@ or F18) must use the original plugin's discovered `act_ui` keyboard schema, with
 a fresh observation and foreground delivery permitted. Text insertion is not raw
 keyboard input. An unlocked interactive desktop and appropriate integrity level
 are still required; configuration alone does not prove a global hotkey fired.
+
+## Linux helper with an isolated C runtime
+
+On older Linux hosts, the upstream prebuilt helper may require a newer glibc.
+Provision a verified, separate glibc runtime in an administrator-owned data directory,
+then write `linux-runtime.json` beside `environment.json` in CU state:
+
+```json
+{
+  "loader": "/absolute/compat/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+  "libraryPath": ["/absolute/compat/usr/lib/x86_64-linux-gnu"]
+}
+```
+
+The CU host redirects only `spawn` of the exact managed `linux-bridge` path to
+`loader --library-path <paths> <original-helper> <args>`. It preserves argv, stdio,
+signals/child handles, and the graphical-session environment. The original Pi
+installer continues to verify/copy the unchanged helper; no wrapper occupies its
+install path, and no UI behavior is forked. Other child commands, the Executor,
+clipboard, and system libc are unaffected. No shell evaluation or global
+LD_LIBRARY_PATH is used. Runtime paths must be absolute and available before use;
+invalid configuration fails closed. Non-Linux hosts ignore this file. Finish the
+old CU session before changing it; each new host reads it again.
+
+The runtime is node-local administration, not remote tool input. Pin and verify
+its distribution package digest, retain its license notices, and maintain security
+updates independently. Debian 10 / glibc 2.28 has been tested to start the original
+0.5.1 helper with the Ubuntu 2.39-0ubuntu8.9 libc6 runtime; desktop acceptance also
+requires valid X11/AT-SPI access. Do not replace system libc or place a shell wrapper
+at the helper install path: the original plugin installer overwrites that path.

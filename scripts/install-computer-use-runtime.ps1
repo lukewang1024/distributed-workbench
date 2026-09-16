@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 
 if (Test-Path (Join-Path $computerUseSource 'host.mjs')) {
   if (!(Test-Path (Join-Path $computerUseSource 'node.exe'))) { throw 'packaged Computer Use Node is missing' }
-  $parts = @('host.mjs', 'extension-host.mjs', 'environment.mjs', 'package-lock.json', 'node-runtimes.json') | ForEach-Object {
+  $parts = @('host.mjs', 'extension-host.mjs', 'environment.mjs', 'linux-runtime.mjs', 'package-lock.json', 'node-runtimes.json') | ForEach-Object {
     (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $computerUseSource $_)).Hash.Substring(0, 16)
   }
   $computerUseRoot = Join-Path $installRoot ('computer-use/' + ($parts -join ''))

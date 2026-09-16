@@ -11,7 +11,7 @@ const destination = path.resolve(process.argv[2] || source);
 if (Number(process.versions.node.split('.')[0]) < 24) throw new Error('Node >=24 is required');
 mkdirSync(destination, { recursive: true });
 if (source !== destination) {
-  for (const name of ['package.json', 'package-lock.json', 'node-runtimes.json', 'extension-host.mjs', 'environment.mjs', 'host.mjs']) copyFileSync(path.join(source, name), path.join(destination, name));
+  for (const name of ['package.json', 'package-lock.json', 'node-runtimes.json', 'extension-host.mjs', 'environment.mjs', 'linux-runtime.mjs', 'host.mjs']) copyFileSync(path.join(source, name), path.join(destination, name));
 }
 const manifest = JSON.parse(readFileSync(path.join(source, 'node-runtimes.json')));
 const entry = manifest.archives[`${process.platform}-${process.arch}`];

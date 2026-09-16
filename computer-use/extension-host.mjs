@@ -5,6 +5,7 @@ import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { Value } from 'typebox/value';
 import { configureEnvironment } from './environment.mjs';
+import { configureLinuxRuntime } from './linux-runtime.mjs';
 
 export const packageRoot = path.dirname(fileURLToPath(import.meta.url));
 export function configurePaths(stateDir) {
@@ -24,25 +25,34 @@ export async function loadHost(stateDir) {
   await configureEnvironment(stateDir);
   configurePaths(stateDir);
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
-  const sdk = await import('@earendil-works/pi-coding-agent');
-  const extensionPath = path.join(packageRoot, 'node_modules', '@injaneity', 'pi-computer-use', 'extensions', 'computer-use.ts');
-  const loaded = await sdk.discoverAndLoadExtensions([extensionPath], stateDir, process.env.PI_CODING_AGENT_DIR);
-  if (loaded.errors.length) throw new Error(JSON.stringify(loaded.errors));
-  if (loaded.extensions.length !== 1) throw new Error('Expected exactly the pinned computer-use extension');
-  const models = await sdk.ModelRuntime.create({ authPath: path.join(stateDir, 'unused-auth.json'), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
-  const runner = new sdk.ExtensionRunner(loaded.extensions, loaded.runtime, stateDir,
-    sdk.SessionManager.inMemory(stateDir), new sdk.ModelRegistry(models));
-  loaded.runtime.getActiveTools = () => runner.getAllRegisteredTools().map(t => t.definition.name);
-  await runner.emit({ type: 'session_start' });
-  const tools = new Map(sdk.wrapRegisteredTools(runner.getAllRegisteredTools(), runner).map(t => [t.name, t]));
-  return {
-    tools: () => [...tools.values()].map(({name, description, parameters}) => ({name, description, inputSchema: parameters})),
-    async call(name, args, id, signal) {
-      const tool = tools.get(name);
-      if (!tool) throw new Error(`Unknown computer-use tool: ${name}`);
-      if (!Value.Check(tool.parameters, args)) throw new Error(`Invalid arguments for ${name}: ${JSON.stringify([...Value.Errors(tool.parameters, args)])}`);
-      return await tool.execute(id, args, signal);
-    },
-    close: () => runner.emit({ type: 'session_shutdown', reason: 'exit' }),
-  };
+  const restoreRuntime = await configureLinuxRuntime(stateDir, process.env.PI_COMPUTER_USE_LINUX_HELPER_PATH);
+  try {
+    const sdk = await import('@earendil-works/pi-coding-agent');
+    const extensionPath = path.join(packageRoot, 'node_modules', '@injaneity', 'pi-computer-use', 'extensions', 'computer-use.ts');
+    const loaded = await sdk.discoverAndLoadExtensions([extensionPath], stateDir, process.env.PI_CODING_AGENT_DIR);
+    if (loaded.errors.length) throw new Error(JSON.stringify(loaded.errors));
+    if (loaded.extensions.length !== 1) throw new Error('Expected exactly the pinned computer-use extension');
+    const models = await sdk.ModelRuntime.create({ authPath: path.join(stateDir, 'unused-auth.json'), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false });
+    const runner = new sdk.ExtensionRunner(loaded.extensions, loaded.runtime, stateDir,
+      sdk.SessionManager.inMemory(stateDir), new sdk.ModelRegistry(models));
+    loaded.runtime.getActiveTools = () => runner.getAllRegisteredTools().map(t => t.definition.name);
+    await runner.emit({ type: 'session_start' });
+    const tools = new Map(sdk.wrapRegisteredTools(runner.getAllRegisteredTools(), runner).map(t => [t.name, t]));
+    return {
+      tools: () => [...tools.values()].map(({name, description, parameters}) => ({name, description, inputSchema: parameters})),
+      async call(name, args, id, signal) {
+        const tool = tools.get(name);
+        if (!tool) throw new Error(`Unknown computer-use tool: ${name}`);
+        if (!Value.Check(tool.parameters, args)) throw new Error(`Invalid arguments for ${name}: ${JSON.stringify([...Value.Errors(tool.parameters, args)])}`);
+        return await tool.execute(id, args, signal);
+      },
+      async close() {
+        try { await runner.emit({ type: 'session_shutdown', reason: 'exit' }); }
+        finally { restoreRuntime(); }
+      },
+    };
+  } catch (error) {
+    restoreRuntime();
+    throw error;
+  }
 }
