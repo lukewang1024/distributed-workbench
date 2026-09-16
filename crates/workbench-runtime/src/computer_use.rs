@@ -178,7 +178,8 @@ impl Host {
             state_root.to_string_lossy().into_owned(),
         ];
         #[cfg(windows)]
-        let spawned = crate::windows::spawn_in_active_session(&node, &args, &root).map(|_| None);
+        let spawned: Result<Option<Child>, RpcError> =
+            crate::windows::spawn_in_active_session(&node, &args, &root).map(|_| None);
         #[cfg(not(windows))]
         let spawned = Command::new(&node)
             .args(&args)
