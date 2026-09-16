@@ -939,7 +939,11 @@ public static class WorkbenchInput {
     try{
       // A service-hosted helper may not own the last-input foreground grant.
       // Use a bounded ALT pulse and a reversible topmost pulse before retrying.
-      Send(new[]{K(18,0,0),K(18,0,KeyUp)});
+      // The ALT pulse is only a foreground hint.  A service-hosted helper can
+      // be allowed to activate the target window while SendInput itself is
+      // rejected by the current desktop.  Keep trying the native focus
+      // sequence; real click/key/text actions still fail closed in Send().
+      try{Send(new[]{K(18,0,0),K(18,0,KeyUp)});}catch(System.ComponentModel.Win32Exception){}
       ShowWindowAsync(window,9);
       SetWindowPos(window,new IntPtr(-1),0,0,0,0,0x0001|0x0002|0x0010);
       SetWindowPos(window,new IntPtr(-2),0,0,0,0,0x0001|0x0002|0x0010);
@@ -1382,7 +1386,9 @@ mod tests {
         let source = include_str!("windows.rs");
         assert!(source.contains("if(GetForegroundWindow()==window)return"));
         assert!(source.contains("AttachThreadInput(current,target,true)"));
-        assert!(source.contains("Send(new[]{K(18,0,0),K(18,0,KeyUp)})"));
+        assert!(source.contains(
+            "try{Send(new[]{K(18,0,0),K(18,0,KeyUp)});}catch(System.ComponentModel.Win32Exception){}"
+        ));
         assert!(source.contains("SetWindowPos(window,new IntPtr(-1)"));
         assert!(source.contains("SetWindowPos(window,new IntPtr(-2)"));
         assert!(source.contains("attempt<3&&GetForegroundWindow()!=window"));
