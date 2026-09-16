@@ -237,7 +237,8 @@ IFS='
 '
 set -f
 for root in $local_allow_roots; do
-  printf '%s\n' "$local_executor_status" | grep -F '"'$root'"' >/dev/null || {
+  canonical_root=$(CDPATH='' cd -- "$root" 2>/dev/null && pwd -P) || canonical_root=$root
+  printf '%s\n' "$local_executor_status" | grep -F '"'$canonical_root'"' >/dev/null || {
     printf 'bootstrap-fabric: local Executor is missing allow-root: %s\n' "$root" >&2
     exit 1
   }

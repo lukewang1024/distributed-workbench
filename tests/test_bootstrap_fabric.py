@@ -130,6 +130,12 @@ class BootstrapFabricContractTest(unittest.TestCase):
         self.assertIn('elif [ "$verify_only" = false ] && [ "$skip_release_install" = false ]', script)
         self.assertEqual(script.count('DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS=$local_allow_roots'), 2)
 
+    def test_local_allow_root_verification_uses_physical_paths(self) -> None:
+        script = (ROOT / "scripts/bootstrap-fabric.sh").read_text()
+
+        self.assertIn("canonical_root=$(CDPATH='' cd -- \"$root\" 2>/dev/null && pwd -P)", script)
+        self.assertIn("grep -F '\"'$canonical_root'\"'", script)
+
     def test_release_installer_preserves_composition_identity_and_allow_roots(self) -> None:
         script = (ROOT / "scripts/install-from-release.sh").read_text()
 
