@@ -25,4 +25,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --verify-tag --title "Computer Use host $TAG" --generate-notes
+        run: gh release create "$TAG" dist/* --verify-tag --latest=false --title "Computer Use host $TAG" --generate-notes
