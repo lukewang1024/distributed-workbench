@@ -3,7 +3,7 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { hostFiles, sha256 } from '../computer-use/release.mjs';
+import { hostFiles, sha256, lockDigest } from '../computer-use/release.mjs';
 const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../computer-use');
 export async function packageHost(destination, version) {
   if (!/^\d+\.\d+\.\d+$/.test(version)) throw new Error('Host version must be exact semver');
@@ -16,7 +16,7 @@ export async function packageHost(destination, version) {
   }
   const manifest = { component: 'computer-use-host', version, protocol: 1,
     nodeVersion: JSON.parse(await readFile(path.join(source, 'node-runtimes.json'))).version,
-    dependencyDigest: sha256(await readFile(path.join(source, 'package-lock.json'))), files: digests };
+    dependencyDigest: lockDigest(await readFile(path.join(source, 'package-lock.json'))), files: digests };
   await mkdir(destination, { recursive: true });
   const artifact = path.join(destination, `computer-use-host-${version}.json`);
   await writeFile(artifact, JSON.stringify({ manifest, files }) + '\n');

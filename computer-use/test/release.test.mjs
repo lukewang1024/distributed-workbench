@@ -15,7 +15,7 @@ test('independent host verifies dependencies, switches atomically and rolls back
     const state = path.join(root, 'state');
     const runtime = path.join(root, 'runtime');
     await mkdir(state); await mkdir(runtime);
-    await copyFile(path.join(packageRoot, 'package-lock.json'), path.join(runtime, 'package-lock.json'));
+    await writeFile(path.join(runtime, 'package-lock.json'), (await readFile(path.join(packageRoot, 'package-lock.json'), 'utf8')).replace(/\r?\n/g, '\r\n'));
     const first = await packageHost(root, '0.1.0');
     for (const name of hostFiles) await copyFile(path.join(packageRoot, name), path.join(runtime, name));
     first.manifest.nodeVersion = process.versions.node;
