@@ -4,6 +4,7 @@ import os from 'node:os';
 import { mkdir } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { Value } from 'typebox/value';
+import { configureEnvironment } from './environment.mjs';
 
 export const packageRoot = path.dirname(fileURLToPath(import.meta.url));
 export function configurePaths(stateDir) {
@@ -20,6 +21,7 @@ export function configurePaths(stateDir) {
 }
 
 export async function loadHost(stateDir) {
+  await configureEnvironment(stateDir);
   configurePaths(stateDir);
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const sdk = await import('@earendil-works/pi-coding-agent');

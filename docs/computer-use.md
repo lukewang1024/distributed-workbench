@@ -99,7 +99,7 @@ OS automation process.
 | --- | --- | --- |
 | macOS | AX + native capture helper | macOS 14+, Accessibility and Screen Recording grants for the upstream helper app |
 | Windows | UI Automation + native input/capture | Native interactive user desktop; workbench launches the host into the active session. Locked/secure desktops or integrity-level mismatches can prevent physical input. |
-| Linux X11 | AT-SPI2 + XComposite/XTEST | Executor must inherit the target user's DISPLAY, XAUTHORITY and accessibility/session bus environment |
+| Linux X11 | AT-SPI2 + XComposite/XTEST | CU host must use the target user's DISPLAY, XAUTHORITY and accessibility/session bus environment (see environment.json below) |
 | Linux Wayland | AT-SPI2 | Semantic operations only; upstream does not implement portal capture/input |
 
 `COMPUTER_USE_UNAVAILABLE` means runtime/transport readiness failed.
@@ -124,3 +124,39 @@ Live acceptance must separately observe an actual window, perform an authorized
 interaction, check the successor state and save its screenshot.
 
 Reference: https://github.com/injaneity/pi-computer-use
+
+## Per-desktop CU environment
+
+Administrators may write `environment.json` in the Executor's `computer-use`
+state directory (beside `runtime-root`). The dedicated CU host reads it before
+loading the upstream SDK on every new host. It changes only the CU process and
+its helpers, never the Executor or its clipboard backend. Finish existing CU
+sessions before changing it; no Executor restart is needed. Missing files inherit
+the service environment; invalid files fail closed. Configuration is local
+administrator state, never accepted from a remote tool call.
+
+For an Xfce desktop independent of the clipboard Xvfb:
+
+```json
+{
+  "DISPLAY": ":1",
+  "XAUTHORITY": "/home/wangyuanlv/.Xauthority",
+  "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1001/bus"
+}
+```
+
+Allowed keys are `DISPLAY`, `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS`,
+`AT_SPI_BUS_ADDRESS`, `XDG_RUNTIME_DIR`, and `PI_COMPUTER_USE_HEADLESS`; values
+are strings. The latter accepts only `"true"` or `"false"`. Keep this file readable
+only by the service/interactive user and administrators.
+
+On Windows the default path is
+`C:/ProgramData/distributed-workbench/computer-use/environment.json`.
+`{"PI_COMPUTER_USE_HEADLESS":"false"}` enables upstream foreground input policy
+and overrides the upstream `.pi/computer-use.json` headless setting. Alternatively
+keep using the upstream config file directly; omit the environment override if
+that file should remain authoritative. Physical keys (for example Hyper CapsLock
+or F18) must use the original plugin's discovered `act_ui` keyboard schema, with
+a fresh observation and foreground delivery permitted. Text insertion is not raw
+keyboard input. An unlocked interactive desktop and appropriate integrity level
+are still required; configuration alone does not prove a global hotkey fired.
