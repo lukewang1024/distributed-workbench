@@ -3173,7 +3173,7 @@ fn capability_authority(name: &str) -> CapabilityAuthority {
         | "application.open-file"
         | "application.stop"
         | "application.runtime.record" => CapabilityAuthority::ResourceLease {
-            resource: "runtime:${executorId}:doubao".to_owned(),
+            resource: "runtime:${executorId}".to_owned(),
         },
         "ui.automate" | "ui.input" => CapabilityAuthority::ResourceLease {
             resource: "acceptance:${executorId}:${remoteDebuggingPort}".to_owned(),
@@ -4913,7 +4913,7 @@ mod tests {
                 ))
                 .ok
         );
-        let application = downloads.join("Doubao.app");
+        let application = downloads.join("Sample.app");
         fs::create_dir_all(&application).unwrap();
         let application_params = json!({
             "applicationPath": application,
@@ -4924,7 +4924,7 @@ mod tests {
             runtime
                 .readable_application_path(&application_params, "applicationPath")
                 .unwrap(),
-            downloads.join("Doubao.app").canonicalize().unwrap()
+            downloads.join("Sample.app").canonicalize().unwrap()
         );
         #[cfg(target_os = "macos")]
         assert_eq!(

@@ -1159,7 +1159,7 @@ mod tests {
     #[test]
     fn derived_generation_survives_removal_of_its_base() {
         let directory = tempfile::tempdir().unwrap();
-        let base = directory.path().join("base/Doubao.app");
+        let base = directory.path().join("base/Sample.app");
         fs::create_dir_all(&base).unwrap();
         fs::write(base.join("payload"), "base").unwrap();
         let root = directory.path().join("client");
@@ -1174,9 +1174,9 @@ mod tests {
     }
 
     #[test]
-    fn office_pack_uses_final_overlay_tree_and_flow_biz_resources() {
+    fn indexed_pack_uses_final_overlay_tree_and_shared_resources() {
         let directory = tempfile::tempdir().unwrap();
-        let application = directory.path().join("Doubao");
+        let application = directory.path().join("Sample");
         let webcontents = application.join("resources/local_webcontents");
         let office = webcontents.join("apps/sample-app");
         let word = office.join("static/v/w");

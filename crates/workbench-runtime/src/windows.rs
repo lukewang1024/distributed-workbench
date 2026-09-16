@@ -116,7 +116,7 @@ pub fn launch(
         });
     let prelaunch_local_state_patch =
         match (local_state.as_deref(), options.chromium_local_state_patch) {
-            (Some(local_state), Some(patch)) if options.chromium_local_state_reapply => {
+            (Some(local_state), Some(patch)) => {
                 Some(patch_chromium_local_state(local_state, patch)?)
             }
             (None, Some(_)) => {
