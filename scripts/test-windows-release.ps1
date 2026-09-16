@@ -1,14 +1,18 @@
 param([Parameter(Mandatory = $true)][string]$Archive)
 $ErrorActionPreference = "Stop"
 $temporary = Join-Path $env:TEMP ("distributed-workbench-long-path-install-regression-" + [guid]::NewGuid())
-New-Item -ItemType Directory -Path $temporary | Out-Null
+# Keep the final runtime root comparable to Program Files on production nodes.
+# Node package imports can fail under an artificially elongated installation root,
+# independently of the archive/copy APIs being tested here.
+$installedFixture = Join-Path $env:TEMP ("dwb-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $temporary, $installedFixture | Out-Null
 try {
   & tar.exe -xf $Archive -C $temporary
   if ($LASTEXITCODE -ne 0) { throw 'release extraction failed' }
   $package = @(Get-ChildItem -LiteralPath $temporary -Directory)[0].FullName
   $source = Join-Path $package 'computer-use'
-  $install = Join-Path $temporary 'Program Files/distributed-workbench'
-  $state = Join-Path $temporary 'ProgramData/distributed-workbench'
+  $install = Join-Path $installedFixture 'install'
+  $state = Join-Path $installedFixture 'state'
   $installer = Join-Path $package 'scripts/install-computer-use-runtime.ps1'
   & $installer -ComputerUseSource $source -InstallRoot $install -StateRoot $state
   & $installer -ComputerUseSource $source -InstallRoot $install -StateRoot $state
@@ -27,7 +31,7 @@ function compare(relative = '') {
     if (entry.isDirectory()) compare(item);
     else {
       assert.deepEqual(readFileSync(join(source,item)), readFileSync(join(runtime,item)), item);
-      if (join(runtime,item).length > 260) longPaths++;
+      if (join(source,item).length > 260 || join(runtime,item).length > 260) longPaths++;
     }
   }
 }
@@ -42,5 +46,5 @@ console.log(`Installed original plugin with ${longPaths} long paths; all files m
   & (Join-Path $runtime 'node.exe') --input-type=module -e $check $source $runtime (Join-Path $state 'probe')
   if ($LASTEXITCODE -ne 0) { throw 'installed plugin validation failed' }
 } finally {
-  & node -e "require('node:fs').rmSync(process.argv[1],{recursive:true,force:true})" $temporary
+  & node -e "for(const p of process.argv.slice(1)) require('node:fs').rmSync(p,{recursive:true,force:true})" $temporary $installedFixture
 }
