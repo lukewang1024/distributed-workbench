@@ -9,9 +9,14 @@ $ErrorActionPreference = "Stop"
 if (Test-Path (Join-Path $computerUseSource 'host.mjs')) {
   if (!(Test-Path (Join-Path $computerUseSource 'node.exe'))) { throw 'packaged Computer Use Node is missing' }
   $parts = @('host.mjs', 'extension-host.mjs', 'environment.mjs', 'linux-runtime.mjs', 'package-lock.json', 'node-runtimes.json') | ForEach-Object {
-    (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $computerUseSource $_)).Hash.Substring(0, 16)
+    (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $computerUseSource $_)).Hash
   }
-  $computerUseRoot = Join-Path $installRoot ('computer-use/' + ($parts -join ''))
+  # Keep the directory fixed-length as host modules are added (Windows path limits).
+  $hasher = [Security.Cryptography.SHA256]::Create()
+  try {
+    $digest = ([BitConverter]::ToString($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes(($parts -join ''))))).Replace('-', '').ToLowerInvariant()
+  } finally { $hasher.Dispose() }
+  $computerUseRoot = Join-Path $installRoot ('computer-use/' + $digest)
   if (!(Test-Path $computerUseRoot)) {
     New-Item -ItemType Directory -Force -Path (Split-Path $computerUseRoot) | Out-Null
     $computerUseTemporary = $computerUseRoot + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
