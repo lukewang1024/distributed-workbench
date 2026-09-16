@@ -125,3 +125,14 @@ For every selected node, bootstrap must prove that both local roles are healthy,
 each node pair has one ready peer, both logical directions work, laptop-devbox
 routes work without reverse SSH, and restarting a peer restores all routes with
 a higher generation.
+
+## Declaration execution
+
+`bootstrap-fabric.sh --file FABRIC --version VERSION` validates the public manifest
+and uses the same resolved nodes for installation and verification. Node identities
+are independent of SSH aliases, and authorization roots are passed per node.
+`--verify-only` reads the running Executor's configured roots and rejects drift;
+`--skip-release-install` is overridden if root configuration has drifted. A read-only
+command plan is available through `scripts/reconcile-fabric.py --file FABRIC --version
+VERSION --plan`. Remote macOS/Termux supervision is rejected before mutation by this
+compatibility bootstrap; validation alone does not imply installer support.

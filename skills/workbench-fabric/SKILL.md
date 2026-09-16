@@ -28,7 +28,11 @@ Operate the domain-neutral machine fabric. Keep product workflows in their ownin
 
 Before an installing run, report the selected nodes and version. Installation, upgrade, service replacement, or topology changes require explicit user intent; diagnosis defaults to `--verify-only`.
 
-Keep the Fabric manifest domain-neutral: node identities, platform, architecture, SSH alias, allow roots, initiator, and topology belong here; product adapters, workflows, profiles, credentials, and application paths do not. The current shell bootstrap is a compatibility executor, not a general manifest reconciler: verify that the composition layer has translated every selected node and policy without loss. In particular, do not claim custom node identities or allow roots were applied unless the executor explicitly supports them.
+Keep the Fabric manifest domain-neutral: node identities, platform, architecture, SSH alias, allow roots, initiator, and topology belong here; product adapters, workflows, profiles, credentials, and application paths do not. Use `scripts/bootstrap-fabric.sh --file FABRIC --version VERSION` so the public layer
+receives the complete resolved declaration. The public reconciler preserves independent
+node IDs, SSH aliases and per-node roots, then compares running configured roots.
+Its current supervision support is local macOS/Linux and remote Linux/native Windows;
+unsupported platforms fail before mutation.
 
 ## Execute from the laptop
 

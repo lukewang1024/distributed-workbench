@@ -1,0 +1,28 @@
+name: Release Computer Use host
+on:
+  push:
+    tags: ['cu-host-v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.14.0'
+      - run: npm ci --prefix computer-use --ignore-scripts --no-audit --no-fund
+      - run: npm test --prefix computer-use
+      - name: Package host
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#cu-host-v}
+          test "$version" = "$(node -p "require('./computer-use/host-version.json').version")"
+          node scripts/package-computer-use-host.mjs "$version" dist
+      - name: Publish host
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/* --verify-tag --title "Computer Use host $TAG" --generate-notes

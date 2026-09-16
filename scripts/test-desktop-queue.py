@@ -82,7 +82,16 @@ with tempfile.TemporaryDirectory(prefix="desktop-fifo-") as directory:
         rpc("a","desktop.recover",{"executorId":"desktop","confirmDesktopReset":True})
         assert rpc("b","desktop.get",creds(waiting))["state"] == "active"
         rpc("b","desktop.finish",creds(waiting))
-        print(json.dumps({"passed":True,"controllers":3,"executors":2,"fifo":order,"checks":["concurrent-submit","dedup","legacy-exclusion","independent-desktops","stale-token","cancel","automatic-expiry","restart-quarantine","recovery"]}))
+        maintenance = {"executorId":"desktop", "owner":"upgrade", "enabled":True}
+        assert rpc("a", "desktop.maintenance", maintenance)["safePoint"]
+        pending = submit("b", "during-maintenance")
+        assert pending["state"] == "queued"
+        assert rpc("c", "desktop.list", {"executorId":"desktop"})["safePoint"]
+        assert rpc("c", "desktop.maintenance", {**maintenance, "owner":"other", "enabled":False}, ok=False) == "MAINTENANCE_OWNED"
+        rpc("a", "desktop.maintenance", {**maintenance, "enabled":False})
+        assert rpc("b", "desktop.get", creds(pending))["state"] == "active"
+        rpc("b", "desktop.finish", creds(pending))
+        print(json.dumps({"passed":True,"controllers":3,"executors":2,"fifo":order,"checks":["concurrent-submit","dedup","legacy-exclusion","independent-desktops","stale-token","cancel","automatic-expiry","restart-quarantine","recovery","maintenance-admission"]}))
     finally:
         for child in reversed(children):
             if child.poll() is None:

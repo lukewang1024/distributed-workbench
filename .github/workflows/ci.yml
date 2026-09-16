@@ -74,3 +74,16 @@ jobs:
           echo "CC_${cc_key}=$linker" >> "$GITHUB_ENV"
           echo "AR_${cc_key}=$toolchain/llvm-ar" >> "$GITHUB_ENV"
       - run: cargo build --locked --target '${{ matrix.target }}' --bin workbench
+
+  updater:
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+      - run: go test ./...
+      - run: go vet ./...

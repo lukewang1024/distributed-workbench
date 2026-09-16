@@ -29,6 +29,7 @@ use crate::telemetry::{event_fields, request_event};
 pub struct ExecutorRuntime {
     id: String,
     allowed_roots: Vec<PathBuf>,
+    configured_roots: Vec<PathBuf>,
     application_roots: Vec<PathBuf>,
     grantable_read_roots: Vec<PathBuf>,
     processes: ProcessTable,
@@ -199,6 +200,7 @@ impl ExecutorRuntime {
         allowed_roots: Vec<PathBuf>,
         grantable_read_roots: Vec<PathBuf>,
     ) -> Result<Self, RpcError> {
+        let configured_roots = allowed_roots.clone();
         let mut roots = Vec::with_capacity(allowed_roots.len());
         for root in allowed_roots {
             roots.push(root.canonicalize().map_err(|error| {
@@ -222,6 +224,7 @@ impl ExecutorRuntime {
         Ok(Self {
             id: id.into(),
             allowed_roots: roots,
+            configured_roots,
             application_roots: Vec::new(),
             grantable_read_roots: grantable,
             processes: ProcessTable::default(),
@@ -610,8 +613,13 @@ impl ExecutorRuntime {
         match action {
             "ping" | "status" => Ok(json!({
                 "executorId": self.id,
+                "runtimeIdentity": {"component":"executor", "version":env!("CARGO_PKG_VERSION")},
+                "computerUse": self.computer_use.status(&self.relay_root.with_file_name("computer-use")),
+                "computerUseStateRoot": self.relay_root.with_file_name("computer-use"),
+                "configuredRoots": self.configured_roots,
+                "userHome": std::env::var("HOME").ok(),
                 "status": "ready",
-                "protocolFeatures": ["capability-authority-v2", "driver-draining-v1", "read-grant-v1", "acceptance-handoff-v1", "desktop-queue-v1"],
+                "protocolFeatures": ["capability-authority-v2", "driver-draining-v1", "read-grant-v1", "acceptance-handoff-v1", "desktop-queue-v1", "desktop-maintenance-v1"],
                 "allowedRoots": self.allowed_roots,
                 "applicationRoots": self.application_roots,
                 "grantableReadRoots": self.grantable_read_roots,
@@ -1601,15 +1609,14 @@ impl ExecutorRuntime {
                     &root_path,
                     &resource_trees,
                     Path::new(required_str(&params, "outputRelative")?),
-                    params
-                        .get("platform")
-                        .and_then(Value::as_str)
-                        .unwrap_or("win"),
-                    params.get("arch").and_then(Value::as_str).unwrap_or("x64"),
-                    params
-                        .get("bundleName")
-                        .and_then(Value::as_str)
-                        .unwrap_or("doubao-office"),
+                    &params.get("manifestMetadata").cloned().unwrap_or_else(|| json!({
+                        // Compatibility for the original indexed-pack RPC. New
+                        // adapters own every application metadata field.
+                        "platform": params.get("platform").and_then(Value::as_str).unwrap_or("win"),
+                        "arch": params.get("arch").and_then(Value::as_str).unwrap_or("x64"),
+                        "bundle_name": params.get("bundleName").and_then(Value::as_str).unwrap_or("resources"),
+                        "code_cache": Value::Null, "tool_version":"1", "v8_version":"",
+                    })),
                     base_pack_path.as_deref(),
                     params.get("basePackDigest").and_then(Value::as_str),
                     &params
@@ -1751,12 +1758,26 @@ impl ExecutorRuntime {
                     .and_then(Value::as_str)
                     .map(|_| self.path(&params, "file", true))
                     .transpose()?;
+                let mutable_paths = params
+                    .get("runtimeShadowMutablePaths")
+                    .map(|_| string_array(&params, "runtimeShadowMutablePaths"))
+                    .transpose()?;
+                if let Some(paths) = &mutable_paths {
+                    for path in paths {
+                        crate::generation::validate_relative(Path::new(path))?;
+                    }
+                }
                 crate::windows::launch(
                     &application_path,
                     &string_array(&params, "args")?,
                     crate::windows::LaunchOptions {
                         user_data_dir: user_data_dir.as_deref(),
                         runtime_shadow_dir: runtime_shadow_dir.as_deref(),
+                        runtime_shadow_mutable_paths: mutable_paths.as_deref(),
+                        chromium_local_state_reapply: params
+                            .get("chromiumLocalStateReapply")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
                         chromium_local_state_path: chromium_local_state_path.as_deref(),
                         chromium_local_state_patch: params.get("chromiumLocalStatePatch"),
                         chromium_local_state_settle_ms: params
@@ -2632,6 +2653,7 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "platform": {"type": "string"},
                 "arch": {"type": "string"},
                 "bundleName": {"type": "string"},
+                "manifestMetadata": {"type":"object"},
                 "basePackPath": {"type": "string"},
                 "basePackDigest": {"type": "string"},
                 "changedPrefixes": {"type": "array", "items": {"type": "string"}}
@@ -2701,6 +2723,8 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                 "args": {"type": "array", "items": {"type": "string"}},
                 "userDataDir": {"type": "string"},
                 "runtimeShadowDir": {"type": "string"},
+                "runtimeShadowMutablePaths": {"type":"array", "items":{"type":"string"}},
+                "chromiumLocalStateReapply": {"type":"boolean"},
                 "chromiumLocalStatePath": {"type": "string"},
                 "chromiumLocalStatePatch": {"type": "object"},
                 "chromiumLocalStateSettleMs": {"type": "integer", "minimum": 0, "maximum": 30000},
@@ -3044,12 +3068,17 @@ fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
                                     | "chromiumLocalStateSettleMs"
                                     | "file"
                                     | "runtimeShadowDir"
+                                    | "runtimeShadowMutablePaths"
+                                    | "chromiumLocalStateReapply"
                                     | "userDataDir"
                             ) | ("application.open-file", "handlerPath")
                                 | ("application.materialize", "derivedFrom")
                                 | (
                                     "artifact.pack-chromium-datapack",
-                                    "basePackPath" | "basePackDigest" | "changedPrefixes"
+                                    "basePackPath"
+                                        | "basePackDigest"
+                                        | "changedPrefixes"
+                                        | "manifestMetadata"
                                 )
                                 | ("filesystem.read", "offset" | "limit")
                         )

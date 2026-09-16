@@ -68,6 +68,8 @@ pub fn inspect(application: &Path) -> Result<Value, RpcError> {
 
 pub struct LaunchOptions<'a> {
     pub user_data_dir: Option<&'a Path>,
+    pub runtime_shadow_mutable_paths: Option<&'a [String]>,
+    pub chromium_local_state_reapply: bool,
     pub runtime_shadow_dir: Option<&'a Path>,
     pub chromium_local_state_path: Option<&'a Path>,
     pub chromium_local_state_patch: Option<&'a Value>,
@@ -114,7 +116,7 @@ pub fn launch(
         });
     let prelaunch_local_state_patch =
         match (local_state.as_deref(), options.chromium_local_state_patch) {
-            (Some(local_state), Some(patch)) => {
+            (Some(local_state), Some(patch)) if options.chromium_local_state_reapply => {
                 Some(patch_chromium_local_state(local_state, patch)?)
             }
             (None, Some(_)) => {
@@ -135,12 +137,11 @@ pub fn launch(
     if let Some(file) = options.file {
         launch_args.push(file.to_string_lossy().into_owned());
     }
-    // The packaged client rewrites debug.log beside its executable regardless
-    // of the process working directory. Launch from a same-volume shadow whose
-    // read-only files are hard-linked but whose known mutable files are copied.
-    // This keeps the prepared generation byte-for-byte immutable.
+    // Application policy determines which shadow files may be shared.
     let runtime_application = match options.runtime_shadow_dir {
-        Some(shadow) => create_runtime_shadow(application, shadow)?,
+        Some(shadow) => {
+            create_runtime_shadow(application, shadow, options.runtime_shadow_mutable_paths)?
+        }
         None => application.to_path_buf(),
     };
     let executable = find_executable(&runtime_application).ok_or_else(|| {
@@ -160,18 +161,18 @@ pub fn launch(
             }
         });
     let pid = spawn_in_active_session(&executable, &launch_args, working_directory)?;
-    if options.chromium_local_state_patch.is_some() && options.chromium_local_state_settle_ms > 0 {
+    if options.chromium_local_state_reapply
+        && options.chromium_local_state_patch.is_some()
+        && options.chromium_local_state_settle_ms > 0
+    {
         thread::sleep(Duration::from_millis(
             options.chromium_local_state_settle_ms,
         ));
     }
-    // The native CCM bootstrap can flush its startup snapshot after process
-    // creation, replacing values written before launch. Re-apply the exact
-    // patch after that startup settle window and fail launch if the atomic
-    // write/read path cannot be completed.
+    // Reapply only when the application plan requests a second patch.
     let postlaunch_local_state_patch =
         match (local_state.as_deref(), options.chromium_local_state_patch) {
-            (Some(local_state), Some(patch)) => {
+            (Some(local_state), Some(patch)) if options.chromium_local_state_reapply => {
                 Some(patch_chromium_local_state(local_state, patch)?)
             }
             _ => None,
@@ -195,7 +196,11 @@ pub fn launch(
     }))
 }
 
-fn create_runtime_shadow(application: &Path, shadow: &Path) -> Result<PathBuf, RpcError> {
+fn create_runtime_shadow(
+    application: &Path,
+    shadow: &Path,
+    mutable_paths: Option<&[String]>,
+) -> Result<PathBuf, RpcError> {
     if shadow.exists() {
         return Err(RpcError::new(
             "RUNTIME_SHADOW_EXISTS",
@@ -212,7 +217,7 @@ fn create_runtime_shadow(application: &Path, shadow: &Path) -> Result<PathBuf, R
         std::process::id(),
         now_ms()
     ));
-    if let Err(error) = shadow_tree(application, &temporary, application) {
+    if let Err(error) = shadow_tree(application, &temporary, application, mutable_paths) {
         let _ = fs::remove_dir_all(&temporary);
         return Err(error);
     }
@@ -221,7 +226,12 @@ fn create_runtime_shadow(application: &Path, shadow: &Path) -> Result<PathBuf, R
     Ok(shadow.to_path_buf())
 }
 
-fn shadow_tree(source: &Path, target: &Path, root: &Path) -> Result<(), RpcError> {
+fn shadow_tree(
+    source: &Path,
+    target: &Path,
+    root: &Path,
+    mutable_paths: Option<&[String]>,
+) -> Result<(), RpcError> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| RpcError::new("RUNTIME_SHADOW_FAILED", error.to_string()))?;
     if metadata.is_dir() {
@@ -232,12 +242,19 @@ fn shadow_tree(source: &Path, target: &Path, root: &Path) -> Result<(), RpcError
         {
             let entry =
                 entry.map_err(|error| RpcError::new("RUNTIME_SHADOW_FAILED", error.to_string()))?;
-            shadow_tree(&entry.path(), &target.join(entry.file_name()), root)?;
+            shadow_tree(
+                &entry.path(),
+                &target.join(entry.file_name()),
+                root,
+                mutable_paths,
+            )?;
         }
         return Ok(());
     }
     let relative = source.strip_prefix(root).unwrap_or(source);
-    let mutable = relative == Path::new("debug.log");
+    // Unspecified policy copies everything. Only an explicit application policy
+    // may declare the remaining files safe to hard-link.
+    let mutable = mutable_paths.is_none_or(|paths| paths.iter().any(|p| relative.starts_with(p)));
     if !mutable && fs::hard_link(source, target).is_ok() {
         return Ok(());
     }

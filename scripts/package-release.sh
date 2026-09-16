@@ -34,11 +34,11 @@ case $target in
     # Release consumers reject archive links; dereference npm's CLI shims.
     cp -RL computer-use "$staging/computer-use"
     rm -rf "$staging/computer-use/test"
-    cp scripts/install-computer-use.mjs "$staging/scripts/"
+    cp scripts/install-computer-use.mjs scripts/package-computer-use-host.mjs scripts/install-computer-use-host.mjs "$staging/scripts/"
     ;;
 esac
 cp README.md LICENSE "$staging/"
-cp scripts/install-computer-use-runtime.ps1 scripts/install-computer-use-runtime.sh scripts/install-from-release.sh scripts/install-from-release.ps1 scripts/install-linux-user.sh scripts/install-termux-user.sh scripts/connect-termux-peer.sh scripts/install-macos-app.sh scripts/install-windows.ps1 scripts/install-windows-peer.ps1 scripts/bootstrap-fabric.sh scripts/repair-fabric.sh scripts/preflight-fabric.sh scripts/plan-release-fabric.sh scripts/install-agent-skills.sh scripts/prune-state.sh "$staging/scripts/"
+cp scripts/install-computer-use-runtime.ps1 scripts/install-computer-use-runtime.sh scripts/install-from-release.sh scripts/install-from-release.ps1 scripts/install-linux-user.sh scripts/install-termux-user.sh scripts/connect-termux-peer.sh scripts/install-macos-app.sh scripts/install-windows.ps1 scripts/install-windows-peer.ps1 scripts/bootstrap-fabric.sh scripts/reconcile-fabric.py scripts/deploy-computer-use-host.py scripts/repair-fabric.sh scripts/preflight-fabric.sh scripts/plan-release-fabric.sh scripts/install-agent-skills.sh scripts/prune-state.sh "$staging/scripts/"
 cp packaging/* "$staging/packaging/"
 cp -R skills/workbench-fabric "$staging/skills/"
 case $target in

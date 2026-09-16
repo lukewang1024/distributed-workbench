@@ -11,7 +11,7 @@ case $namespace in *[!0-9A-Za-z._-]*|'') exit 2;; esac
 if [ "$namespace" = stable ]; then suffix=; else suffix=-$namespace; fi
 if command -v sha256sum >/dev/null 2>&1; then hash_command=sha256sum; else hash_command='shasum -a 256'; fi
 # Deliberate word splitting for this constant command, never user input.
-digest=$(cat "$source_root/host.mjs" "$source_root/extension-host.mjs" "$source_root/environment.mjs" "$source_root/linux-runtime.mjs" "$source_root/package-lock.json" "$source_root/node-runtimes.json" | $hash_command | cut -d ' ' -f 1)
+digest=$(cat "$source_root/host.mjs" "$source_root/extension-host.mjs" "$source_root/environment.mjs" "$source_root/linux-runtime.mjs" "$source_root/release.mjs" "$source_root/host-release.json" "$source_root/package-lock.json" "$source_root/node-runtimes.json" | $hash_command | cut -d ' ' -f 1)
 data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
 destination=$data_home/distributed-workbench$suffix/computer-use-runtimes/$digest
 if [ ! -d "$destination" ]; then

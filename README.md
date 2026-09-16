@@ -399,3 +399,17 @@ Use the original `pi-computer-use` extension on desktop Executors through
 upstream supplies all macOS, Windows and Linux desktop behavior. See
 [Computer Use](docs/computer-use.md) for installation, original tool schemas,
 platform prerequisites and lease lifecycle. No model credentials are required.
+
+## Immutable package installation
+
+The Go `updater` library owns download verification, archive/path safety, installation
+transactions, immutable versions, atomic activation, health-check recovery, rollback,
+active-release protection and rollout state. Its `Policy` contains schema identities,
+package identity, optional required-platform inventory and a caller-supplied HTTP
+header provider. The engine has no built-in private hosts, credentials or team channels.
+Composition wrappers preserve their existing command names and state paths.
+
+A package manifest identifies `packageId` separately from `version`; platform subsets
+are valid. An updater instance refuses a manifest or verified record for another
+package. Existing private manifests/records can be admitted only through an explicit
+legacy-identity policy during migration.

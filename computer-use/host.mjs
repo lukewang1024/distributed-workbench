@@ -2,9 +2,10 @@
 import net from 'node:net';
 import readline from 'node:readline';
 import { readFile, unlink } from 'node:fs/promises';
-import { loadHost } from './extension-host.mjs';
+import { loadHost, packageRoot } from './extension-host.mjs';
+import { validateCompatibility } from './release.mjs';
 
-const [endpoint, handshakeFile, stateDir] = process.argv.slice(2);
+const [endpoint, handshakeFile, stateDir, runtimeRoot = packageRoot] = process.argv.slice(2);
 if (!/^127\.0\.0\.1:\d+$/.test(endpoint || '') || !handshakeFile || !stateDir) {
   throw new Error('usage: node host.mjs 127.0.0.1:PORT HANDSHAKE_FILE STATE_DIR');
 }
@@ -18,16 +19,18 @@ await new Promise(resolve => socket.once('connect', resolve));
 socket.write(JSON.stringify({token}) + '\n');
 let host;
 try {
-  host = await loadHost(stateDir);
+  const identity = await validateCompatibility(packageRoot, runtimeRoot);
+  host = await loadHost(stateDir, runtimeRoot);
   for await (const line of readline.createInterface({ input: socket, crlfDelay: Infinity })) {
     let request;
     try {
       if (Buffer.byteLength(line) > 1024 * 1024) throw new Error('Request exceeds 1 MiB');
       request = JSON.parse(line);
-      const result = request.method === 'tools' ? host.tools()
+      const result = request.method === 'identity' ? identity
+        : request.method === 'tools' ? host.tools()
         : request.method === 'close' ? await host.close()
         : await host.call(request.method, request.args, request.id, AbortSignal.timeout(90_000));
-      socket.write(JSON.stringify({ id: request.id, ok: true, result: result ?? null }) + '\n');
+      socket.write(JSON.stringify({ id: request.id, ok: true, identity, result: result ?? null }) + '\n');
       if (request.method === 'close') break;
     } catch (error) {
       socket.write(JSON.stringify({id: request?.id, ok: false, error: String(error.message || error)}) + '\n');

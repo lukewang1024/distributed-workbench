@@ -8,7 +8,7 @@ $ErrorActionPreference = "Stop"
 
 if (Test-Path (Join-Path $computerUseSource 'host.mjs')) {
   if (!(Test-Path (Join-Path $computerUseSource 'node.exe'))) { throw 'packaged Computer Use Node is missing' }
-  $parts = @('host.mjs', 'extension-host.mjs', 'environment.mjs', 'linux-runtime.mjs', 'package-lock.json', 'node-runtimes.json') | ForEach-Object {
+  $parts = @('host.mjs', 'extension-host.mjs', 'environment.mjs', 'linux-runtime.mjs', 'release.mjs', 'host-release.json', 'package-lock.json', 'node-runtimes.json') | ForEach-Object {
     (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $computerUseSource $_)).Hash
   }
   # Keep the directory fixed-length as host modules are added (Windows path limits).

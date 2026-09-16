@@ -15,3 +15,12 @@ _Avoid_: Per-controller desktop lease
 
 **Quarantined desktop**: A desktop whose previous operation or cleanup outcome is uncertain, so new ownership is withheld pending explicit recovery.
 _Avoid_: Idle desktop
+
+**Component release**: An immutable, independently identified version of one installable component, with explicit compatibility requirements.
+_Avoid_: Fabric version when referring only to a host or provider
+
+**Composition release**: A team's chosen combination of component releases, policies and adapters.
+_Avoid_: Core release
+
+**Desktop maintenance**: A temporary hold on new desktop ownership while existing ownership is allowed to finish.
+_Avoid_: Desktop quarantine

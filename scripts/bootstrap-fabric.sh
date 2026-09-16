@@ -18,8 +18,34 @@ skip_release_install=false
 local_allow_roots=
 windows_allow_roots=
 windows_application_roots=
+node_transports=
+node_allow_roots=
 while [ "$#" -gt 0 ]; do
   case $1 in
+    --file)
+      test "$#" -ge 2 || { usage >&2; exit 2; }
+      manifest=$2
+      shift 2
+      exec python3 "$(dirname -- "$0")/reconcile-fabric.py" --file "$manifest" "$@"
+      ;;
+    --node-transport)
+      test "$#" -ge 3 || { usage >&2; exit 2; }
+      case $2:$3 in *[!0-9A-Za-z._:-]*|:*) exit 2;; esac
+      node_transports="$node_transports
+$2|$3"
+      shift 3
+      ;;
+    --node-allow-root)
+      test "$#" -ge 3 || { usage >&2; exit 2; }
+      case $2 in *[!0-9A-Za-z._-]*|'') exit 2;; esac
+      case $3 in *"'"*|*'"'*|*'`'*|*'|'*|*'
+'*) echo 'unsupported character in node root' >&2; exit 2;; esac
+      root_suffix=${3#'${user.home}/'}
+      case $root_suffix in *'$'*) echo 'unsupported variable in node root' >&2; exit 2;; esac
+      node_allow_roots="$node_allow_roots
+$2|$3"
+      shift 3
+      ;;
     --version)
       test "$#" -ge 2 || { usage >&2; exit 2; }
       version=$2
@@ -176,6 +202,15 @@ if [ -n "$clipboard_display" ]; then
   case ${clipboard_display#:} in ''|*[!0-9]*) echo 'invalid clipboard display' >&2; exit 2;; esac
 fi
 
+transport_of() {
+  resolved_transport=$(printf '%s\n' "$node_transports" | awk -F '|' -v id="$1" '$1 == id { print $2; exit }')
+  printf '%s\n' "${resolved_transport:-$1}"
+}
+
+roots_of() {
+  printf '%s\n' "$node_allow_roots" | awk -F '|' -v id="$1" '$1 == id { print $2 }'
+}
+
 install_linux_release() {
   install_host=$1
   install_node_id=$2
@@ -192,10 +227,26 @@ install_linux_release() {
     actual=$(shasum -a 256 "$release_cache/$archive" | awk '{print $1}')
     test "$actual" = "$expected" || { printf '%s\n' 'bootstrap-fabric: Linux release checksum mismatch' >&2; return 1; }
   fi
+  install_roots=$(roots_of "$install_host")
+  root_arguments=
+  old_ifs=$IFS
+  IFS='
+'
+  for install_root in $install_roots; do
+    case $install_root in
+      '${user.home}/'*) root_arguments="$root_arguments \"\$HOME/${install_root#*/}\"" ;;
+      /*) root_arguments="$root_arguments '$install_root'" ;;
+      *) echo 'invalid POSIX node root' >&2; return 2;;
+    esac
+  done
+  IFS=$old_ifs
+  if [ -z "$root_arguments" ]; then
+    root_arguments='"$HOME/Code" "$HOME/Workspace" "${XDG_STATE_HOME:-$HOME/.local/state}"'
+  fi
   remote_archive=/tmp/$archive.$$
-  scp -q "$release_cache/$archive" "$install_host:$remote_archive"
-  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$install_host" \
-    "set -eu; temporary=\$(mktemp -d /tmp/distributed-workbench-install.XXXXXX); trap 'rm -rf \"\$temporary\" \"$remote_archive\"' EXIT HUP INT TERM; tar -C \"\$temporary\" -xzf \"$remote_archive\"; root=\"\$temporary/distributed-workbench-$version-$target\"; cd \"\$root\"; DISTRIBUTED_WORKBENCH_CLIPBOARD_DISPLAY='$clipboard_display' DISTRIBUTED_WORKBENCH_CONTROLLER_ID='$install_node_id' scripts/install-linux-user.sh bin/workbench '$install_executor_id' \"\$HOME/Code\" \"\$HOME/Workspace\" \"\${XDG_STATE_HOME:-\$HOME/.local/state}\"" \
+  scp -q "$release_cache/$archive" "$(transport_of "$install_host"):$remote_archive"
+  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$install_host")" \
+    "set -eu; temporary=\$(mktemp -d /tmp/distributed-workbench-install.XXXXXX); trap 'rm -rf \"\$temporary\" \"$remote_archive\"' EXIT HUP INT TERM; tar -C \"\$temporary\" -xzf \"$remote_archive\"; root=\"\$temporary/distributed-workbench-$version-$target\"; cd \"\$root\"; DISTRIBUTED_WORKBENCH_CLIPBOARD_DISPLAY='$clipboard_display' DISTRIBUTED_WORKBENCH_CONTROLLER_ID='$install_node_id' scripts/install-linux-user.sh bin/workbench '$install_executor_id' $root_arguments" \
     >/dev/null
 }
 
@@ -296,7 +347,7 @@ install_peer_service() {
       -e "s|@BINARY@|$(escape_sed "$workbench")|g" \
       -e "s|@PEER_ID@|$peer_host|g" \
       -e "s|@LOCAL_ID@|$local_id|g" \
-      -e "s|@HOST@|$peer_host|g" \
+      -e "s|@HOST@|$(transport_of "$peer_host")|g" \
       -e "s|@EXPOSE_CONTROLLER_SOCKET@|$(escape_sed "$expose_controller")|g" \
       -e "s|@EXPOSE_EXECUTOR_SOCKET@|$(escape_sed "$expose_executor")|g" \
       -e "s|@REMOTE_STATE_ROOT@|$(escape_sed "$remote_state_root")|g" \
@@ -317,7 +368,7 @@ install_peer_service() {
     -e "s|@EXECUTABLE@|$(escape_sed "$workbench")|g" \
     -e "s|@PEER_ID@|$(escape_sed "$peer_host")|g" \
     -e "s|@LOCAL_ID@|$(escape_sed "$local_id")|g" \
-    -e "s|@HOST@|$(escape_sed "$peer_host")|g" \
+    -e "s|@HOST@|$(transport_of "$peer_host")|g" \
     -e "s|@EXPOSE_CONTROLLER_SOCKET@|$(escape_sed "$expose_controller")|g" \
     -e "s|@EXPOSE_EXECUTOR_SOCKET@|$(escape_sed "$expose_executor")|g" \
     -e "s|@REMOTE_STATE_ROOT@|$(escape_sed "$remote_state_root")|g" \
@@ -394,9 +445,9 @@ reconcile_local_peer_services() {
 reconcile_remote_posix_peer_services() {
   reconcile_host=$1
   selected_peers="$local_id$nodes"
-  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$reconcile_host" \
+  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$reconcile_host")" \
     "set -eu; selected=' $selected_peers '; root=\"\${XDG_STATE_HOME:-\$HOME/.local/state}/distributed-workbench\"; state=\"\$root/peers\"; unit_root=\"\$HOME/.config/systemd/user\"; for unit_path in \$(find \"\$unit_root\" -maxdepth 1 -type f -name 'distributed-workbench-peer-*.service' -print); do unit=\${unit_path##*/}; peer=\${unit#distributed-workbench-peer-}; peer=\${peer%.service}; case \"\$peer\" in *[!0-9A-Za-z._-]*|'') echo \"invalid managed peer name: \$peer\" >&2; exit 1;; esac; case \"\$selected\" in *\" \$peer \"*) continue;; esac; systemctl --user disable --now \"\$unit\" >/dev/null 2>&1 || true; rm -f \"\$unit_path\"; rm -rf \"\$state/\$peer\"; \"\$HOME/.local/bin/workbench\" --socket \"\$root/controller.sock\" call controller.unregister \"{\\\"controllerId\\\":\\\"\$peer\\\"}\" >/dev/null; \"\$HOME/.local/bin/workbench\" --socket \"\$root/controller.sock\" call executor.unregister \"{\\\"executorId\\\":\\\"\$peer-rust\\\"}\" >/dev/null; \"\$HOME/.local/bin/workbench\" --socket \"\$root/controller.sock\" call executor.unregister \"{\\\"executorId\\\":\\\"\$peer-native\\\"}\" >/dev/null; echo \"bootstrap-fabric: removed unselected peer service on $reconcile_host: \$peer\"; done; systemctl --user daemon-reload"
-  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$reconcile_host" \
+  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$reconcile_host")" \
     "set -eu; selected=' $selected_peers '; root=\"\${XDG_STATE_HOME:-\$HOME/.local/state}/distributed-workbench\"; wb=\"\$HOME/.local/bin/workbench\"; controllers=\$(\"\$wb\" --socket \"\$root/controller.sock\" call controller.list); managed_controllers=' '; for peer in \$(printf '%s\\n' \"\$controllers\" | sed -n 's/.*\"id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p'); do managed_controllers=\"\$managed_controllers\$peer \"; case \"\$selected\" in *\" \$peer \"*) continue;; esac; \"\$wb\" --socket \"\$root/controller.sock\" call controller.unregister \"{\\\"controllerId\\\":\\\"\$peer\\\"}\" >/dev/null; echo \"bootstrap-fabric: removed unselected Controller registration on $reconcile_host: \$peer\"; done; executors=\$(\"\$wb\" --socket \"\$root/controller.sock\" call executor.list); for executor in \$(printf '%s\\n' \"\$executors\" | sed -n 's/.*\"id\":[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p'); do case \"\$executor\" in *-rust) peer=\${executor%-rust};; *-native) peer=\${executor%-native};; *) continue;; esac; case \"\$managed_controllers\" in *\" \$peer \"*) :;; *) continue;; esac; case \"\$selected\" in *\" \$peer \"*) continue;; esac; \"\$wb\" --socket \"\$root/controller.sock\" call executor.unregister \"{\\\"executorId\\\":\\\"\$executor\\\"}\" >/dev/null; echo \"bootstrap-fabric: removed unselected Executor registration on $reconcile_host: \$executor\"; done"
 }
 
@@ -418,7 +469,7 @@ windows_call() {
   call_json=$4
   request=$(printf '{"apiVersion":"workbench.dev/v1","requestId":"req_bootstrap_fabric","action":"%s","params":%s}' "$call_action" "$call_json")
   encoded=$(printf '%s' "$request" | base64 | tr -d '\n')
-  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$call_host" \
+  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$call_host")" \
     "powershell.exe -NoProfile -NonInteractive -Command \"\$request=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$encoded')); \$psi=New-Object System.Diagnostics.ProcessStartInfo; \$psi.FileName='C:\\Program Files\\distributed-workbench\\workbench.exe'; \$psi.Arguments='--socket $call_socket call-stdin'; \$psi.UseShellExecute=\$false; \$psi.RedirectStandardInput=\$true; \$psi.RedirectStandardOutput=\$true; \$psi.RedirectStandardError=\$true; \$p=[Diagnostics.Process]::Start(\$psi); \$p.StandardInput.WriteLine(\$request); \$p.StandardInput.Close(); \$stdout=\$p.StandardOutput.ReadToEnd(); \$stderr=\$p.StandardError.ReadToEnd(); \$p.WaitForExit(); [Console]::Out.Write(\$stdout); [Console]::Error.Write(\$stderr); if (\$p.ExitCode -ne 0) { exit \$p.ExitCode }\""
 }
 
@@ -430,7 +481,7 @@ remote_call() {
   if [ "$call_platform" = windows ]; then
     windows_call "$call_host" 'C:\ProgramData\distributed-workbench\controller.sock' "$call_action" "$call_json"
   else
-    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$call_host" \
+    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$call_host")" \
       "\"\$HOME/.local/bin/workbench\" --socket \"\${XDG_STATE_HOME:-\$HOME/.local/state}/distributed-workbench/controller.sock\" call '$call_action' '$call_json'"
   fi
 }
@@ -495,18 +546,18 @@ install_remote_peer_service() {
     -e "s|@BINARY@|$(escape_sed "$dialer_home/.local/bin/workbench")|g" \
     -e "s|@PEER_ID@|$peer|g" \
     -e "s|@LOCAL_ID@|$dialer|g" \
-    -e "s|@HOST@|$peer|g" \
+    -e "s|@HOST@|$(transport_of "$peer")|g" \
     -e "s|@EXPOSE_CONTROLLER_SOCKET@|$(escape_sed "$expose_controller")|g" \
     -e "s|@EXPOSE_EXECUTOR_SOCKET@|$(escape_sed "$expose_executor")|g" \
     -e "s|@REMOTE_STATE_ROOT@|$(escape_sed "$peer_state_root")|g" \
     -e "s|@REMOTE_EXECUTABLE@|$(escape_sed "$peer_executable")|g" \
     -e "s|@REMOTE_PLATFORM@|$peer_platform|g" \
     -e "s|@STATE_PATH@|$(escape_sed "$remote_status_path")|g" \
-    "$remote_peer_template" | ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" \
+    "$remote_peer_template" | ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$dialer")" \
       "mkdir -p '$remote_peer_dir' \"\$HOME/.config/systemd/user\"; cat >\"\$HOME/.config/systemd/user/$unit\"; if [ -f '$remote_status_path' ]; then mv '$remote_status_path' '$remote_status_path.previous'; fi; systemctl --user daemon-reload; systemctl --user enable --now '$unit'; systemctl --user restart '$unit'"
   attempt=0
   while [ "$attempt" -lt 200 ]; do
-    if ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" \
+    if ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$dialer")" \
       "\"\$HOME/.local/bin/workbench\" peer status --state '$remote_status_path'" 2>/dev/null | grep '"state": "ready"' >/dev/null; then
       return 0
     fi
@@ -525,13 +576,13 @@ install_windows_peer_service() {
     peer_state_root='C:\ProgramData\distributed-workbench'
     peer_executable='C:\Program Files\distributed-workbench\workbench.exe'
   else
-    peer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$peer" 'printf %s "$HOME"')
+    peer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$peer")" 'printf %s "$HOME"')
     peer_state_root=$peer_home/.local/state/distributed-workbench
     peer_executable=.local/bin/workbench
   fi
-  scp -q "$script_dir/install-windows-peer.ps1" "$dialer:install-distributed-workbench-peer.ps1"
-  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" \
-    "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& './install-distributed-workbench-peer.ps1' -PeerId '$peer' -LocalId '$dialer' -HostName '$peer' -RemotePlatform '$peer_platform' -RemoteExecutable '$peer_executable' -RemoteStateRoot '$peer_state_root'; Remove-Item './install-distributed-workbench-peer.ps1' -Force -ErrorAction SilentlyContinue\"" \
+  scp -q "$script_dir/install-windows-peer.ps1" "$(transport_of "$dialer"):install-distributed-workbench-peer.ps1"
+  ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$dialer")" \
+    "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& './install-distributed-workbench-peer.ps1' -PeerId '$peer' -LocalId '$dialer' -HostName '$(transport_of "$peer")' -RemotePlatform '$peer_platform' -RemoteExecutable '$peer_executable' -RemoteStateRoot '$peer_state_root'; Remove-Item './install-distributed-workbench-peer.ps1' -Force -ErrorAction SilentlyContinue\"" \
     >/dev/null
 }
 
@@ -543,10 +594,10 @@ wait_remote_peer_ready() {
   attempt=0
   while [ "$attempt" -lt 200 ]; do
     if [ "$dialer_platform" = windows ]; then
-      output=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" \
+      output=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$dialer")" \
         "powershell.exe -NoProfile -NonInteractive -Command \"& 'C:\Program Files\distributed-workbench\workbench.exe' peer status --state 'C:\ProgramData\distributed-workbench\peers\$peer\status.json'\"" 2>/dev/null || true)
     else
-      output=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" \
+      output=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$dialer")" \
         "\"\$HOME/.local/bin/workbench\" peer status --state '$dialer_home/.local/state/distributed-workbench/peers/$peer/status.json'" 2>/dev/null || true)
     fi
     if printf '%s' "$output" | grep '"state": "ready"' >/dev/null; then
@@ -565,10 +616,10 @@ remote_peer_status() {
   status_home=$3
   status_peer=$4
   if [ "$status_platform" = windows ]; then
-    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$status_dialer" \
+    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$status_dialer")" \
       "powershell.exe -NoProfile -NonInteractive -Command \"& 'C:\Program Files\distributed-workbench\workbench.exe' peer status --state 'C:\ProgramData\distributed-workbench\peers\$status_peer\status.json'\""
   else
-    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$status_dialer" \
+    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$status_dialer")" \
       "\"\$HOME/.local/bin/workbench\" peer status --state '$status_home/.local/state/distributed-workbench/peers/$status_peer/status.json'"
   fi
 }
@@ -608,26 +659,32 @@ for host in "$@"; do
   fi
   printf 'bootstrap-fabric: %s: checking SSH\n' "$host"
   if [ "$host_platform" = windows ]; then
-    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
+    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$host")" \
       'powershell.exe -NoProfile -NonInteractive -Command "Write-Output ready"' >/dev/null
-    remote_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
+    remote_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$host")" \
       'powershell.exe -NoProfile -NonInteractive -Command "[Environment]::GetFolderPath('"'"'UserProfile'"'"')"' | tr -d '\r')
   else
-    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" 'printf ready' >/dev/null
-    remote_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" 'printf %s "$HOME"')
+    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$host")" 'printf ready' >/dev/null
+    remote_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$host")" 'printf %s "$HOME"')
   fi
 
   if [ "$verify_only" = false ] && [ "$skip_release_install" = false ]; then
     printf 'bootstrap-fabric: %s: installing %s\n' "$host" "$version"
     if [ "$host_platform" = windows ]; then
-      scp -q "$script_dir/install-from-release.ps1" "$host:install-distributed-workbench.ps1"
+      scp -q "$script_dir/install-from-release.ps1" "$(transport_of "$host"):install-distributed-workbench.ps1"
       allow_literal="'C:\Users','C:\ProgramData\distributed-workbench'"
+      selected_windows_roots=$(roots_of "$host")
+      if [ -n "$selected_windows_roots" ]; then
+        allow_literal=
+      else
+        selected_windows_roots=$windows_allow_roots
+      fi
       old_ifs=$IFS
       IFS='
 '
-      for allow_root in $windows_allow_roots; do
+      for allow_root in $selected_windows_roots; do
         test -n "$allow_root" || continue
-        allow_literal="$allow_literal,'$allow_root'"
+        allow_literal="${allow_literal:+$allow_literal,}'$allow_root'"
       done
       application_literal=
       for application_root in $windows_application_roots; do
@@ -639,7 +696,7 @@ for host in "$@"; do
         application_argument=" -ApplicationRoot @($application_literal)"
       fi
       IFS=$old_ifs
-      ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
+      ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$host")" \
       "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& './install-distributed-workbench.ps1' -Version '$version' -NodeId '$host' -AllowRoot @($allow_literal)$application_argument; Remove-Item './install-distributed-workbench.ps1' -Force -ErrorAction SilentlyContinue\"" \
         >/dev/null
     else
@@ -652,10 +709,10 @@ for host in "$@"; do
   fi
 
   if [ "$host_platform" = windows ]; then
-    remote_version=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
+    remote_version=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$host")" \
       "powershell.exe -NoProfile -NonInteractive -Command \"& 'C:\\Program Files\\distributed-workbench\\workbench.exe' --version\"" | tr -d '\r' | awk 'NR == 1 {print $2}')
   else
-    remote_version=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
+    remote_version=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$host")" \
       '"$HOME/.local/bin/workbench" --version' | awk 'NR == 1 {print $2}')
   fi
   if [ "$remote_version" != "$version" ]; then
@@ -664,11 +721,11 @@ for host in "$@"; do
   fi
 
   if [ "$host_platform" = windows ]; then
-    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
+    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$host")" \
       "powershell.exe -NoProfile -NonInteractive -Command \"& 'C:\Program Files\distributed-workbench\workbench.exe' --socket 'C:\ProgramData\distributed-workbench\executor.sock' status\"" \
       >/dev/null
   else
-    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$host" \
+    ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$host")" \
       'mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/distributed-workbench/fabric"; "$HOME/.local/bin/workbench" --socket "${XDG_STATE_HOME:-$HOME/.local/state}/distributed-workbench/executor.sock" status' \
       >/dev/null
   fi
@@ -719,22 +776,22 @@ for node_a in "$@"; do
     dialer_platform=$(platform_of "$dialer")
     peer_platform=$(platform_of "$peer")
     if [ "$dialer_platform" = windows ]; then
-      dialer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" \
+      dialer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$dialer")" \
         'powershell.exe -NoProfile -NonInteractive -Command "[Environment]::GetFolderPath('"'"'UserProfile'"'"')"' | tr -d '\r')
       peer_executor="C:\ProgramData\distributed-workbench\peers\$peer\executor.sock"
       peer_controller="C:\ProgramData\distributed-workbench\peers\$peer\controller.sock"
     else
-      dialer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$dialer" 'printf %s "$HOME"')
+      dialer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$dialer")" 'printf %s "$HOME"')
       peer_executor=$dialer_home/.local/state/distributed-workbench/peers/$peer/executor.sock
       peer_controller=$dialer_home/.local/state/distributed-workbench/peers/$peer/controller.sock
     fi
     if [ "$peer_platform" = windows ]; then
-      peer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$peer" \
+      peer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$peer")" \
         'powershell.exe -NoProfile -NonInteractive -Command "[Environment]::GetFolderPath('"'"'UserProfile'"'"')"' | tr -d '\r')
       reverse_executor="C:\ProgramData\distributed-workbench\fabric\\${dialer}-executor.sock"
       reverse_controller="C:\ProgramData\distributed-workbench\fabric\\${dialer}-controller.sock"
     else
-      peer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$peer" 'printf %s "$HOME"')
+      peer_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$peer")" 'printf %s "$HOME"')
       reverse_executor=$peer_home/.local/state/distributed-workbench/fabric/$dialer-executor.sock
       reverse_controller=$peer_home/.local/state/distributed-workbench/fabric/$dialer-controller.sock
     fi
@@ -856,10 +913,10 @@ if [ "$verify_only" = false ]; then
       if [ "$reconnect_a" != "$reconnect_first" ]; then continue; fi
       reconnect_platform=$(platform_of "$reconnect_a")
       if [ "$reconnect_platform" = windows ]; then
-        reconnect_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$reconnect_a" \
+        reconnect_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$reconnect_a")" \
           'powershell.exe -NoProfile -NonInteractive -Command "[Environment]::GetFolderPath('"'"'UserProfile'"'"')"' | tr -d '\r')
       else
-        reconnect_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$reconnect_a" 'printf %s "$HOME"')
+        reconnect_home=$(ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$reconnect_a")" 'printf %s "$HOME"')
       fi
       reconnect_status=$(remote_peer_status "$reconnect_a" "$reconnect_platform" "$reconnect_home" "$reconnect_b")
       before_generation=$(printf '%s\n' "$reconnect_status" |
@@ -869,10 +926,10 @@ if [ "$verify_only" = false ]; then
         exit 1
       }
       if [ "$reconnect_platform" = windows ]; then
-        ssh -o BatchMode=yes -o ClearAllForwardings=yes "$reconnect_a" \
+        ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$reconnect_a")" \
           "powershell.exe -NoProfile -NonInteractive -Command \"Restart-Service -Name 'DistributedWorkbenchPeer_$reconnect_b' -Force\""
       else
-        ssh -o BatchMode=yes -o ClearAllForwardings=yes "$reconnect_a" \
+        ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$reconnect_a")" \
           "systemctl --user restart 'distributed-workbench-peer-$reconnect_b.service'"
       fi
       wait_remote_peer_generation "$reconnect_a" "$reconnect_platform" "$reconnect_home" "$reconnect_b" "$before_generation"

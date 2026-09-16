@@ -19,6 +19,7 @@ const TIMEOUT: Duration = Duration::from_secs(100);
 pub(crate) struct ComputerUseService(Mutex<Option<Host>>);
 struct Host {
     session: String,
+    identity: Value,
     stream: BufReader<TcpStream>,
     child: Option<Child>,
 }
@@ -48,6 +49,30 @@ fn read_frame(reader: &mut BufReader<TcpStream>) -> Result<Value, RpcError> {
     serde_json::from_slice(&bytes).map_err(failed)
 }
 impl ComputerUseService {
+    pub(crate) fn status(&self, state_root: &Path) -> Value {
+        let selected = fs::read_to_string(state_root.join("host-root")).ok();
+        let digest = selected
+            .as_ref()
+            .and_then(|s| Path::new(s.trim()).file_name())
+            .and_then(|s| s.to_str());
+        let mut status = json!({"selectedArtifactDigest":digest});
+        match self.0.try_lock() {
+            Ok(guard) => match guard.as_ref() {
+                Some(host) => {
+                    status["running"] = json!(true);
+                    status["sessionId"] = json!(host.session);
+                    status["identity"] = host.identity.clone();
+                }
+                None => {
+                    status["running"] = json!(false);
+                }
+            },
+            Err(_) => {
+                status["busy"] = json!(true);
+            }
+        }
+        status
+    }
     pub(crate) fn close_existing(&self, state_root: &Path) -> Result<(), RpcError> {
         let session = self
             .0
@@ -105,6 +130,9 @@ impl ComputerUseService {
             bytes.push(b'\n');
             host.stream.get_mut().write_all(&bytes).map_err(failed)?;
             let response = read_frame(&mut host.stream)?;
+            if let Some(identity) = response.get("identity") {
+                host.identity = identity.clone();
+            }
             if response["id"] != id {
                 return Err(failed(
                     response["error"]
@@ -121,7 +149,7 @@ impl ComputerUseService {
                 ));
             }
             Ok(if tools_only {
-                json!({"tools":response["result"]})
+                json!({"tools":response["result"], "hostIdentity":host.identity})
             } else if method == "close" {
                 json!({"closed":true})
             } else {
@@ -155,7 +183,20 @@ impl Host {
             })
             .ok_or_else(|| failed("cannot locate computer-use package"))?;
         let node = root.join(if cfg!(windows) { "node.exe" } else { "node" });
-        let script = root.join("host.mjs");
+        // Read the host selection only when starting a new session. An existing
+        // session retains its process and immutable host until acknowledged close.
+        let host_root = match fs::read_to_string(state_root.join("host-root")) {
+            Ok(value) => {
+                let selected = PathBuf::from(value.trim());
+                if !selected.is_absolute() {
+                    return Err(failed("computer-use host-root must be absolute"));
+                }
+                selected
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => root.clone(),
+            Err(error) => return Err(failed(error)),
+        };
+        let script = host_root.join("host.mjs");
         if !node.is_file()
             || !script.is_file()
             || !root
@@ -193,6 +234,7 @@ impl Host {
             listener.local_addr().map_err(failed)?.to_string(),
             handshake.to_string_lossy().into_owned(),
             state_root.to_string_lossy().into_owned(),
+            root.to_string_lossy().into_owned(),
         ];
         #[cfg(windows)]
         let spawned: Result<Option<Child>, RpcError> =
@@ -252,6 +294,7 @@ impl Host {
         match result {
             Ok(stream) => Ok(Self {
                 session: session.into(),
+                identity: Value::Null,
                 stream,
                 child,
             }),

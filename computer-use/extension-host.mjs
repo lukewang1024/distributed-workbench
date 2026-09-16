@@ -2,8 +2,8 @@
 import path from 'node:path';
 import os from 'node:os';
 import { mkdir } from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
-import { Value } from 'typebox/value';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
 import { configureEnvironment } from './environment.mjs';
 import { configureLinuxRuntime } from './linux-runtime.mjs';
 
@@ -21,14 +21,16 @@ export function configurePaths(stateDir) {
   return helpers;
 }
 
-export async function loadHost(stateDir) {
+export async function loadHost(stateDir, runtimeRoot = packageRoot) {
+  const requireRuntime = createRequire(path.join(runtimeRoot, 'package.json'));
+  const { Value } = await import(pathToFileURL(requireRuntime.resolve('typebox/value')).href);
   await configureEnvironment(stateDir);
   configurePaths(stateDir);
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   const restoreRuntime = await configureLinuxRuntime(stateDir, process.env.PI_COMPUTER_USE_LINUX_HELPER_PATH);
   try {
-    const sdk = await import('@earendil-works/pi-coding-agent');
-    const extensionPath = path.join(packageRoot, 'node_modules', '@injaneity', 'pi-computer-use', 'extensions', 'computer-use.ts');
+    const sdk = await import(pathToFileURL(path.join(runtimeRoot, 'node_modules/@earendil-works/pi-coding-agent/dist/index.js')).href);
+    const extensionPath = path.join(runtimeRoot, 'node_modules', '@injaneity', 'pi-computer-use', 'extensions', 'computer-use.ts');
     const loaded = await sdk.discoverAndLoadExtensions([extensionPath], stateDir, process.env.PI_CODING_AGENT_DIR);
     if (loaded.errors.length) throw new Error(JSON.stringify(loaded.errors));
     if (loaded.extensions.length !== 1) throw new Error('Expected exactly the pinned computer-use extension');

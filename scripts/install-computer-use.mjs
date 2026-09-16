@@ -6,12 +6,13 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { packageHost } from './package-computer-use-host.mjs';
 const source = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../computer-use');
 const destination = path.resolve(process.argv[2] || source);
 if (Number(process.versions.node.split('.')[0]) < 24) throw new Error('Node >=24 is required');
 mkdirSync(destination, { recursive: true });
 if (source !== destination) {
-  for (const name of ['package.json', 'package-lock.json', 'node-runtimes.json', 'extension-host.mjs', 'environment.mjs', 'linux-runtime.mjs', 'host.mjs']) copyFileSync(path.join(source, name), path.join(destination, name));
+  for (const name of ['package.json', 'package-lock.json', 'node-runtimes.json', 'extension-host.mjs', 'environment.mjs', 'linux-runtime.mjs', 'release.mjs', 'host.mjs']) copyFileSync(path.join(source, name), path.join(destination, name));
 }
 const manifest = JSON.parse(readFileSync(path.join(source, 'node-runtimes.json')));
 const entry = manifest.archives[`${process.platform}-${process.arch}`];
@@ -43,3 +44,6 @@ if (installed.status !== 0) process.exit(installed.status || 1);
 copyFileSync(path.join(extracted, 'LICENSE'), path.join(destination, 'NODE-LICENSE'));
 console.log(`Installed locked Pi computer-use host and Node ${manifest.version} at ${destination}`);
 console.log('Native helpers remain upstream-owned; OS permissions may be required on first use.');
+
+const { manifest: hostManifest } = await packageHost(cache, JSON.parse(readFileSync(path.join(source, 'host-version.json'))).version);
+writeFileSync(path.join(destination, 'host-release.json'), JSON.stringify(hostManifest));

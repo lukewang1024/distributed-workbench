@@ -194,17 +194,13 @@ pub struct DataPackResourceTree {
     pub exclude_root_files: Vec<String>,
 }
 
-/// Rebuild the Chromium DataPack consumed by Windows Doubao Office from the
-/// final expanded resource tree. This intentionally runs after every overlay,
-/// so the pack and the loose runtime cannot represent different generations.
+/// Pack an indexed resource tree. Application metadata is supplied by its adapter.
 #[allow(clippy::too_many_arguments)]
 pub fn pack_chromium_datapack(
     root_path: &Path,
     resource_trees: &[DataPackResourceTree],
     output_relative: &Path,
-    platform: &str,
-    arch: &str,
-    bundle_name: &str,
+    metadata: &Value,
     base_pack_path: Option<&Path>,
     base_pack_digest: Option<&str>,
     changed_prefixes: &[String],
@@ -249,16 +245,13 @@ pub fn pack_chromium_datapack(
     for pair in resources.windows(2) {
         if pair[0].0 == pair[1].0 {
             return Err(RpcError::new(
-                "OFFICE_PACK_DUPLICATE_PATH",
+                "DATAPACK_DUPLICATE_PATH",
                 format!("duplicate packed resource path: {}", pair[0].0),
             ));
         }
     }
     if resources.is_empty() {
-        return Err(RpcError::new(
-            "OFFICE_PACK_EMPTY",
-            "no Office resources to pack",
-        ));
+        return Err(RpcError::new("DATAPACK_EMPTY", "no resources to pack"));
     }
     let base_entries = if let Some(base_path) = base_pack_path {
         let expected = base_pack_digest.ok_or_else(|| {
@@ -289,7 +282,7 @@ pub fn pack_chromium_datapack(
     let resource_count = resources.len() + 1;
     if resource_count > u16::MAX as usize {
         return Err(RpcError::new(
-            "OFFICE_PACK_RESOURCE_LIMIT",
+            "DATAPACK_RESOURCE_LIMIT",
             format!("DataPack resource limit exceeded: {resource_count}"),
         ));
     }
@@ -313,19 +306,24 @@ pub fn pack_chromium_datapack(
         }
     }
     let content_hash = hex::encode(content_digest.finalize());
-    let manifest = serde_json::to_vec(&serde_json::json!({
-        "arch": arch,
-        "bundle_name": bundle_name,
-        "code_cache": Value::Null,
-        "content_hash": content_hash.clone(),
-        "entries": resources.iter().enumerate().map(|(index, (relative, _))| {
-            serde_json::json!({"id": index + 2, "path": relative})
-        }).collect::<Vec<_>>(),
-        "platform": platform,
-        "tool_version": "1",
-        "v8_version": "",
-    }))
-    .expect("Office pack manifest serializes");
+    let mut manifest = metadata
+        .as_object()
+        .cloned()
+        .ok_or_else(|| RpcError::new("INVALID_PARAMS", "manifestMetadata must be an object"))?;
+    manifest.insert("content_hash".into(), Value::String(content_hash.clone()));
+    manifest.insert(
+        "entries".into(),
+        serde_json::json!(
+            resources
+                .iter()
+                .enumerate()
+                .map(|(index, (relative, _))| {
+                    serde_json::json!({"id": index + 2, "path": relative})
+                })
+                .collect::<Vec<_>>()
+        ),
+    );
+    let manifest = serde_json::to_vec(&manifest).expect("DataPack metadata serializes");
 
     let header_size = 12_u64;
     let index_size = ((resource_count + 1) * 6) as u64;
@@ -347,14 +345,14 @@ pub fn pack_chromium_datapack(
                 .1
         } else {
             fs::metadata(path)
-                .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?
+                .map_err(|error| io_error("DATAPACK_READ_FAILED", path, error))?
                 .len()
         };
         offsets.push(offsets.last().copied().unwrap_or(0) + size);
     }
     if offsets.last().copied().unwrap_or(0) > u32::MAX as u64 {
         return Err(RpcError::new(
-            "OFFICE_PACK_SIZE_LIMIT",
+            "DATAPACK_SIZE_LIMIT",
             format!(
                 "DataPack exceeds 4 GiB offset limit: {}",
                 offsets.last().unwrap()
@@ -363,47 +361,43 @@ pub fn pack_chromium_datapack(
     }
 
     let output = root_path.join(output_relative);
-    let parent = output.parent().ok_or_else(|| {
-        RpcError::new(
-            "OFFICE_PACK_OUTPUT_INVALID",
-            "Office pack output has no parent",
-        )
-    })?;
-    fs::create_dir_all(parent)
-        .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", parent, error))?;
-    let temporary = parent.join(format!(".doubao_office.pak.{}.tmp", std::process::id()));
+    let parent = output
+        .parent()
+        .ok_or_else(|| RpcError::new("DATAPACK_OUTPUT_INVALID", "DataPack output has no parent"))?;
+    fs::create_dir_all(parent).map_err(|error| io_error("DATAPACK_WRITE_FAILED", parent, error))?;
+    let temporary = parent.join(format!(".datapack.{}.tmp", std::process::id()));
     let result = (|| -> Result<(), RpcError> {
         let mut target = fs::File::create(&temporary)
-            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
         target
             .write_all(&5_u32.to_le_bytes())
-            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
         target
             .write_all(&[0, 0, 0, 0])
-            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
         target
             .write_all(&(resource_count as u16).to_le_bytes())
-            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
         target
             .write_all(&0_u16.to_le_bytes())
-            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
         for (index, offset) in offsets.iter().take(resource_count).enumerate() {
             target
                 .write_all(&((index + 1) as u16).to_le_bytes())
-                .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+                .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
             target
                 .write_all(&(*offset as u32).to_le_bytes())
-                .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+                .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
         }
         target
             .write_all(&0_u16.to_le_bytes())
-            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
         target
             .write_all(&(offsets[resource_count] as u32).to_le_bytes())
-            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
         target
             .write_all(&manifest)
-            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
         for (relative, path) in &resources {
             if let Some((base_path, entries)) = &base_entries
                 && !path_matches_prefix(relative, changed_prefixes)
@@ -412,16 +406,16 @@ pub fn pack_chromium_datapack(
                 copy_file_range(base_path, *offset, *length, &mut target)?;
             } else {
                 let mut source = fs::File::open(path)
-                    .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?;
+                    .map_err(|error| io_error("DATAPACK_READ_FAILED", path, error))?;
                 std::io::copy(&mut source, &mut target)
-                    .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+                    .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
             }
         }
         target
             .sync_all()
-            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &temporary, error))?;
+            .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &temporary, error))?;
         atomic_replace(&temporary, &output)
-            .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", &output, error))
+            .map_err(|error| io_error("DATAPACK_WRITE_FAILED", &output, error))
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -434,7 +428,7 @@ pub fn pack_chromium_datapack(
         "output": output,
         "resources": resource_count,
         "entries": resources.len(),
-        "size": fs::metadata(&output).map_err(|error| io_error("OFFICE_PACK_READ_FAILED", &output, error))?.len(),
+        "size": fs::metadata(&output).map_err(|error| io_error("DATAPACK_READ_FAILED", &output, error))?.len(),
         "sha256": format!("sha256:{}", hex::encode(digest.finalize())),
         "contentHash": format!("sha256:{content_hash}"),
         "incremental": base_entries.is_some(),
@@ -582,7 +576,7 @@ fn copy_file_range(
         .seek(SeekFrom::Start(offset))
         .map_err(|error| io_error("BASE_DATAPACK_INVALID", path, error))?;
     let copied = std::io::copy(&mut source.take(length), target)
-        .map_err(|error| io_error("OFFICE_PACK_WRITE_FAILED", path, error))?;
+        .map_err(|error| io_error("DATAPACK_WRITE_FAILED", path, error))?;
     if copied != length {
         return Err(RpcError::new(
             "BASE_DATAPACK_INVALID",
@@ -601,15 +595,15 @@ fn collect_pack_tree(
     resources: &mut Vec<(String, PathBuf)>,
 ) -> Result<(), RpcError> {
     let mut entries = fs::read_dir(current)
-        .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", current, error))?
+        .map_err(|error| io_error("DATAPACK_READ_FAILED", current, error))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", current, error))?;
+        .map_err(|error| io_error("DATAPACK_READ_FAILED", current, error))?;
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
         let metadata = entry
             .metadata()
-            .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", &path, error))?;
+            .map_err(|error| io_error("DATAPACK_READ_FAILED", &path, error))?;
         if metadata.is_dir() {
             collect_pack_tree(
                 root,
@@ -645,12 +639,12 @@ fn collect_pack_tree(
 
 fn hash_file_into(path: &Path, digest: &mut Sha256) -> Result<(), RpcError> {
     let mut source =
-        fs::File::open(path).map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?;
+        fs::File::open(path).map_err(|error| io_error("DATAPACK_READ_FAILED", path, error))?;
     let mut buffer = [0_u8; 1024 * 1024];
     loop {
         let count = source
             .read(&mut buffer)
-            .map_err(|error| io_error("OFFICE_PACK_READ_FAILED", path, error))?;
+            .map_err(|error| io_error("DATAPACK_READ_FAILED", path, error))?;
         if count == 0 {
             break;
         }
@@ -1006,7 +1000,7 @@ fn validate_generation_id(value: &str) -> Result<(), RpcError> {
     Ok(())
 }
 
-fn validate_relative(path: &Path) -> Result<(), RpcError> {
+pub(crate) fn validate_relative(path: &Path) -> Result<(), RpcError> {
     if path.is_absolute()
         || path
             .components()
@@ -1184,7 +1178,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let application = directory.path().join("Doubao");
         let webcontents = application.join("resources/local_webcontents");
-        let office = webcontents.join("apps/doubao-office");
+        let office = webcontents.join("apps/sample-app");
         let word = office.join("static/v/w");
         let biz = webcontents.join("biz/static/js");
         fs::create_dir_all(&word).unwrap();
@@ -1194,16 +1188,16 @@ mod tests {
         fs::write(word.join("formula.js"), "equation").unwrap();
         fs::write(biz.join("entry.js"), "flow").unwrap();
         fs::write(biz.join("entry.js.map"), "source-map").unwrap();
-        fs::write(office.join("doubao_office.pak"), "stale-pack").unwrap();
+        fs::write(office.join("sample.pak"), "stale-pack").unwrap();
 
         let result = pack_chromium_datapack(
             &application,
             &[
                 DataPackResourceTree {
-                    root_relative: PathBuf::from("resources/local_webcontents/apps/doubao-office"),
+                    root_relative: PathBuf::from("resources/local_webcontents/apps/sample-app"),
                     prefix: String::new(),
                     exclude_source_maps: false,
-                    exclude_root_files: vec!["doubao_office.pak".to_owned()],
+                    exclude_root_files: vec!["sample.pak".to_owned()],
                 },
                 DataPackResourceTree {
                     root_relative: PathBuf::from("resources/local_webcontents/biz"),
@@ -1212,10 +1206,8 @@ mod tests {
                     exclude_root_files: Vec::new(),
                 },
             ],
-            Path::new("resources/local_webcontents/apps/doubao-office/doubao_office.pak"),
-            "win",
-            "x64",
-            "doubao-office",
+            Path::new("resources/local_webcontents/apps/sample-app/sample.pak"),
+            &serde_json::json!({"format":"fixture-resources"}),
             None,
             None,
             &[],
@@ -1240,9 +1232,9 @@ mod tests {
         assert!(paths.contains(&"static/v/w/formula.js"));
         assert!(paths.contains(&"biz/static/js/entry.js"));
         assert!(!paths.contains(&"biz/static/js/entry.js.map"));
-        assert!(!paths.contains(&"doubao_office.pak"));
+        assert!(!paths.contains(&"sample.pak"));
 
-        let base_pack = directory.path().join("base-doubao-office.pak");
+        let base_pack = directory.path().join("base-sample-app.pak");
         fs::copy(result["output"].as_str().unwrap(), &base_pack).unwrap();
         let base_digest = result["sha256"].as_str().unwrap().to_owned();
         fs::write(word.join("runtime.js"), "selected-bear-v2-longer").unwrap();
@@ -1250,10 +1242,10 @@ mod tests {
             &application,
             &[
                 DataPackResourceTree {
-                    root_relative: PathBuf::from("resources/local_webcontents/apps/doubao-office"),
+                    root_relative: PathBuf::from("resources/local_webcontents/apps/sample-app"),
                     prefix: String::new(),
                     exclude_source_maps: false,
-                    exclude_root_files: vec!["doubao_office.pak".to_owned()],
+                    exclude_root_files: vec!["sample.pak".to_owned()],
                 },
                 DataPackResourceTree {
                     root_relative: PathBuf::from("resources/local_webcontents/biz"),
@@ -1262,10 +1254,8 @@ mod tests {
                     exclude_root_files: Vec::new(),
                 },
             ],
-            Path::new("resources/local_webcontents/apps/doubao-office/doubao_office.pak"),
-            "win",
-            "x64",
-            "doubao-office",
+            Path::new("resources/local_webcontents/apps/sample-app/sample.pak"),
+            &serde_json::json!({"format":"fixture-resources"}),
             None,
             None,
             &[],
@@ -1276,10 +1266,10 @@ mod tests {
             &application,
             &[
                 DataPackResourceTree {
-                    root_relative: PathBuf::from("resources/local_webcontents/apps/doubao-office"),
+                    root_relative: PathBuf::from("resources/local_webcontents/apps/sample-app"),
                     prefix: String::new(),
                     exclude_source_maps: false,
-                    exclude_root_files: vec!["doubao_office.pak".to_owned()],
+                    exclude_root_files: vec!["sample.pak".to_owned()],
                 },
                 DataPackResourceTree {
                     root_relative: PathBuf::from("resources/local_webcontents/biz"),
@@ -1288,10 +1278,8 @@ mod tests {
                     exclude_root_files: Vec::new(),
                 },
             ],
-            Path::new("resources/local_webcontents/apps/doubao-office/doubao_office.pak"),
-            "win",
-            "x64",
-            "doubao-office",
+            Path::new("resources/local_webcontents/apps/sample-app/sample.pak"),
+            &serde_json::json!({"format":"fixture-resources"}),
             Some(&base_pack),
             Some(&base_digest),
             &["static/v/w".to_owned()],

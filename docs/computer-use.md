@@ -190,3 +190,39 @@ updates independently. Debian 10 / glibc 2.28 has been tested to start the origi
 0.5.1 helper with the Ubuntu 2.39-0ubuntu8.9 libc6 runtime; desktop acceptance also
 requires valid X11/AT-SPI access. Do not replace system libc or place a shell wrapper
 at the helper install path: the original plugin installer overwrites that path.
+
+## Independently released host
+
+`cu-host-vVERSION` tags publish a platform-neutral JSON bundle and SHA-256 sidecar.
+The bundle contains only host modules and a release manifest (about 15 KB at 0.1.0).
+`vVERSION` tags continue publishing the full compatible platform runtime.
+
+Install with the **managed runtime's Node**, never an arbitrary system Node:
+
+```sh
+node scripts/install-computer-use-host.mjs HOST.json SHA256 CU_STATE DATA_ROOT
+```
+
+The installer checks the artifact digest, every file, protocol 1, exact Node version
+and dependency-lock digest before atomically selecting `CU_STATE/host-root`. It
+records `host-previous`; rollback uses `--rollback - CU_STATE DATA_ROOT`. Concurrent
+installs fail on an exclusive lock. A failed validation leaves the selection intact.
+No symlink/junction privileges or npm installation are required. Existing sessions
+retain their process; the next host start reads the new selection. Executor status
+reports the actual running host identity separately from installed state.
+
+For selected Fabric nodes, use `python3 scripts/deploy-computer-use-host.py --file
+FABRIC --artifact HOST.json --sha256 SHA256`. It transfers only the bundle and the
+installer, reuses the installed runtime, and does not restart services. Upgrade all
+cores to a host-selection-aware release before using this entrypoint. The existing
+full runtime remains the fallback when no host selection exists.
+
+Desktop maintenance uses the same durable queue authority:
+`desktop.maintenance {executorId, owner, enabled:true}` pauses new grants while the
+current session may finish. New submissions remain FIFO-queued; bare GUI writes are
+rejected. `desktop.list.safePoint` is true only while maintenance is held, no owner or
+action is active, and the desktop is not quarantined. Only the maintenance owner may
+release it. The gate survives an Executor restart. Host deployment acquires this gate,
+waits up to two minutes for cleanup, switches the host, then releases the gate. Timeout
+changes no host selection. This is a desktop gate, not a claim that arbitrary long-lived
+product processes have stopped; whole-node upgrades still require product/task draining.

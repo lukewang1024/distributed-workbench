@@ -15,6 +15,8 @@ pub(crate) struct DesktopQueue {
     // Persist before dispatch: an interrupted action is never replayed on restart.
     in_flight: bool,
     blocked: bool,
+    #[serde(default)]
+    maintenance_owner: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -121,7 +123,8 @@ impl DesktopQueue {
         self.promote()
     }
     pub(crate) fn promote(&mut self) -> Result<(), RpcError> {
-        if !self.blocked
+        if self.maintenance_owner.is_none()
+            && !self.blocked
             && !self.in_flight
             && self.active().is_none()
             && let Some(job) = self.jobs.iter_mut().find(|j| j.state == "queued")
@@ -136,6 +139,26 @@ impl DesktopQueue {
     }
     pub(crate) fn command(&mut self, action: &str, params: &Value) -> Result<Value, RpcError> {
         match action {
+            "desktop.maintenance" => {
+                let owner = field(params, "owner")?;
+                let enabled = params["enabled"]
+                    .as_bool()
+                    .ok_or_else(|| error("INVALID_PARAMS", "enabled is required"))?;
+                if self
+                    .maintenance_owner
+                    .as_deref()
+                    .is_some_and(|current| current != owner)
+                {
+                    return Err(error(
+                        "MAINTENANCE_OWNED",
+                        "another operator owns desktop maintenance",
+                    ));
+                }
+                self.maintenance_owner = enabled.then(|| owner.to_owned());
+                self.save()?;
+                self.promote()?;
+                self.command("desktop.list", &json!({}))
+            }
             "desktop.submit" => {
                 let owner = field(params, "owner")?;
                 let key = field(params, "requestKey")?;
@@ -181,7 +204,9 @@ impl DesktopQueue {
                         value
                     })
                     .collect();
-                Ok(json!({"jobs":jobs,"blocked":self.blocked,"inFlight":self.in_flight}))
+                Ok(
+                    json!({"jobs":jobs,"blocked":self.blocked,"inFlight":self.in_flight,"maintenanceOwner":self.maintenance_owner,"safePoint":self.maintenance_owner.is_some() && !self.blocked && !self.in_flight && self.active().is_none()}),
+                )
             }
             "desktop.get" | "desktop.renew" | "desktop.finish" | "desktop.cancel" => {
                 let token = field(params, "token")?;
@@ -260,6 +285,11 @@ impl DesktopQueue {
             if action == "computer-use.call" {
                 params["sessionId"] = json!(format!("{}:{}", job.id, job.epoch));
             }
+        } else if self.maintenance_owner.is_some() {
+            return Err(error(
+                "DESKTOP_MAINTENANCE",
+                "desktop admission is paused for maintenance",
+            ));
         } else if action == "computer-use.call" || params.get("_desktop").is_some() {
             return Err(error(
                 "DESKTOP_SESSION_REQUIRED",
@@ -288,6 +318,56 @@ mod tests {
     }
     fn credentials(job: &Value) -> Value {
         json!({"owner":job["owner"],"token":job["token"]})
+    }
+    #[test]
+    fn maintenance_drains_owner_and_preserves_fifo_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let mut q = DesktopQueue::open(path.clone()).unwrap();
+        let a = submit(&mut q, "a");
+        let b = submit(&mut q, "b");
+        let status = q
+            .command(
+                "desktop.maintenance",
+                &json!({"owner":"upgrade", "enabled":true}),
+            )
+            .unwrap();
+        assert_eq!(status["safePoint"], false);
+        q.begin(
+            "computer-use.call",
+            &mut json!({"_desktop":credentials(&a)}),
+        )
+        .unwrap();
+        q.end(false).unwrap();
+        q.command("desktop.finish", &credentials(&a)).unwrap();
+        q.cleanup_done(true).unwrap();
+        assert_eq!(
+            q.command("desktop.list", &json!({})).unwrap()["safePoint"],
+            true
+        );
+        assert_eq!(
+            q.command("desktop.get", &credentials(&b)).unwrap()["state"],
+            "queued"
+        );
+        drop(q);
+        let mut q = DesktopQueue::open(path).unwrap();
+        assert!(q.begin("clipboard.write", &mut json!({})).is_err());
+        assert!(
+            q.command(
+                "desktop.maintenance",
+                &json!({"owner":"other", "enabled":false})
+            )
+            .is_err()
+        );
+        q.command(
+            "desktop.maintenance",
+            &json!({"owner":"upgrade", "enabled":false}),
+        )
+        .unwrap();
+        assert_eq!(
+            q.command("desktop.get", &credentials(&b)).unwrap()["state"],
+            "active"
+        );
     }
     #[test]
     fn fifo_dedup_cancel_and_stale_credentials() {
