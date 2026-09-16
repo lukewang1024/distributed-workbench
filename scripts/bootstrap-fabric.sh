@@ -673,9 +673,11 @@ for host in "$@"; do
     if [ "$host_platform" = windows ]; then
       scp -q "$script_dir/install-from-release.ps1" "$(transport_of "$host"):install-distributed-workbench.ps1"
       allow_literal="'C:\Users','C:\ProgramData\distributed-workbench'"
+      replace_roots_argument=
       selected_windows_roots=$(roots_of "$host")
       if [ -n "$selected_windows_roots" ]; then
         allow_literal=
+        replace_roots_argument=" -ReplaceAllowRoots"
       else
         selected_windows_roots=$windows_allow_roots
       fi
@@ -684,6 +686,7 @@ for host in "$@"; do
 '
       for allow_root in $selected_windows_roots; do
         test -n "$allow_root" || continue
+        case $allow_root in '${user.home}/'*) allow_root="$remote_home/${allow_root#*/}";; esac
         allow_literal="${allow_literal:+$allow_literal,}'$allow_root'"
       done
       application_literal=
@@ -697,7 +700,7 @@ for host in "$@"; do
       fi
       IFS=$old_ifs
       ssh -o BatchMode=yes -o ClearAllForwardings=yes "$(transport_of "$host")" \
-      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& './install-distributed-workbench.ps1' -Version '$version' -NodeId '$host' -AllowRoot @($allow_literal)$application_argument; Remove-Item './install-distributed-workbench.ps1' -Force -ErrorAction SilentlyContinue\"" \
+      "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"& './install-distributed-workbench.ps1' -Version '$version' -NodeId '$host' -AllowRoot @($allow_literal)$replace_roots_argument$application_argument; Remove-Item './install-distributed-workbench.ps1' -Force -ErrorAction SilentlyContinue\"" \
         >/dev/null
     else
       install_linux_release "$host" "$host" "$executor_id"

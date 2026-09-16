@@ -3,6 +3,7 @@ param(
   [string]$NodeId = $env:COMPUTERNAME,
   [ValidatePattern('^[0-9A-Za-z._-]+$')][string]$Namespace = "stable",
   [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\distributed-workbench"),
+  [switch]$ReplaceAllowRoots,
   [string[]]$ApplicationRoot = @()
 )
 
@@ -51,7 +52,7 @@ function Add-AllowRoot([string]$Root) {
 }
 foreach ($root in $AllowRoot) { Add-AllowRoot $root }
 $existingExecutor = Get-CimInstance Win32_Service -Filter "Name='$executorService'" -ErrorAction SilentlyContinue
-if ($existingExecutor -and $existingExecutor.PathName) {
+if (-not $ReplaceAllowRoots -and $existingExecutor -and $existingExecutor.PathName) {
   foreach ($match in [regex]::Matches($existingExecutor.PathName, '(?i)--allow-root\s+"([^"]+)"')) {
     Add-AllowRoot $match.Groups[1].Value
   }
@@ -121,7 +122,7 @@ $executorParts = @(
   "executor", "serve", "--id", (Quote-Arg ($NodeId + "-native"))
   "--state", (Quote-Arg $executorState)
 )
-Add-AllowRoot $stateRoot
+if (-not $ReplaceAllowRoots) { Add-AllowRoot $stateRoot }
 foreach ($root in $effectiveAllowRoots) {
   $executorParts += @("--allow-root", (Quote-Arg $root))
 }

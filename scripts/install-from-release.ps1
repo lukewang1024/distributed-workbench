@@ -2,6 +2,7 @@ param(
   [string]$Version = "latest",
   [string]$NodeId = $env:COMPUTERNAME,
   [string[]]$AllowRoot = @("C:\Users", "C:\ProgramData\distributed-workbench"),
+  [switch]$ReplaceAllowRoots,
   [string[]]$ApplicationRoot = @()
 )
 
@@ -35,7 +36,7 @@ try {
   if ($PSBoundParameters.ContainsKey("ApplicationRoot")) {
     $applicationParameters.ApplicationRoot = $ApplicationRoot
   }
-  & (Join-Path $root "scripts\install-windows.ps1") -Binary (Join-Path $root "bin\workbench.exe") -NodeId $NodeId -AllowRoot $AllowRoot @applicationParameters
+  & (Join-Path $root "scripts\install-windows.ps1") -Binary (Join-Path $root "bin\workbench.exe") -NodeId $NodeId -AllowRoot $AllowRoot -ReplaceAllowRoots:$ReplaceAllowRoots @applicationParameters
 } finally {
   Remove-Item -LiteralPath ("\\?\" + $temporary) -Recurse -Force -ErrorAction SilentlyContinue
 }

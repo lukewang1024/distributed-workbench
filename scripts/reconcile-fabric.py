@@ -37,7 +37,7 @@ def compile_plan(manifest, version, *, verify=False, skip_install=False):
             if any(c in suffix for c in "\"'`$|\n\r\x00"):
                 raise ValueError(f'unsupported root characters on {identity}')
             if platform == 'windows':
-                if not re.match(r'^[A-Za-z]:[\\/]', root):
+                if not (re.match(r'^[A-Za-z]:[\\/]', root) or root.startswith('${user.home}/')):
                     raise ValueError('Windows roots must be absolute')
             elif not (root.startswith('/') or root.startswith('${user.home}/')):
                 raise ValueError('POSIX roots must be absolute or home-relative')
@@ -67,6 +67,10 @@ def verify_roots(binary, manifest):
         if roots is None:
             raise RuntimeError(f'{executor} cannot report configured roots; upgrade core first')
         home = status.get('userHome') or ''
+        if node['platform'] == 'windows' and any('${user.home}' in root for root in node['allowRoots']):
+            alias = node['connection']['sshAlias']
+            home = subprocess.check_output(['ssh', '-o', 'BatchMode=yes', '-o', 'ClearAllForwardings=yes', alias,
+                'powershell.exe -NoProfile -NonInteractive -Command "[Environment]::GetFolderPath(\'UserProfile\')"'], text=True).strip()
         expected = [root.replace('${user.home}', home) for root in node['allowRoots']]
         def normalize(root):
             if node['platform'] == 'windows':
