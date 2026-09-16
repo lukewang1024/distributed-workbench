@@ -43,11 +43,29 @@ tar -C "$temporary" -xzf "$temporary/$archive"
 root=$temporary/distributed-workbench-$version-$target
 case $target in
   *-linux-musl)
-    executor_id=${DISTRIBUTED_WORKBENCH_EXECUTOR_ID:-$(hostname -s)}
-    if [ "$#" -gt 0 ]; then
-      (cd "$root" && scripts/install-linux-user.sh "$root/bin/workbench" "$executor_id" "$@")
+    node_id=${DISTRIBUTED_WORKBENCH_NODE_ID:-}
+    if [ -n "$node_id" ]; then
+      default_executor_id=$node_id-rust
     else
-      (cd "$root" && scripts/install-linux-user.sh "$root/bin/workbench" "$executor_id")
+      default_executor_id=$(hostname -s)
+    fi
+    executor_id=${DISTRIBUTED_WORKBENCH_EXECUTOR_ID:-$default_executor_id}
+    controller_id=${DISTRIBUTED_WORKBENCH_CONTROLLER_ID:-${node_id:-$(hostname -s)}}
+    if [ "$#" -eq 0 ] && [ -n "${DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS:-}" ]; then
+      old_ifs=$IFS
+      IFS='
+'
+      set -f
+      set -- $DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS
+      set +f
+      IFS=$old_ifs
+    fi
+    if [ "$#" -gt 0 ]; then
+      (cd "$root" && DISTRIBUTED_WORKBENCH_CONTROLLER_ID=$controller_id \
+        scripts/install-linux-user.sh "$root/bin/workbench" "$executor_id" "$@")
+    else
+      (cd "$root" && DISTRIBUTED_WORKBENCH_CONTROLLER_ID=$controller_id \
+        scripts/install-linux-user.sh "$root/bin/workbench" "$executor_id")
     fi
     ;;
   *-apple-darwin)

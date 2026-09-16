@@ -130,6 +130,18 @@ class BootstrapFabricContractTest(unittest.TestCase):
         self.assertIn('elif [ "$verify_only" = false ] && [ "$skip_release_install" = false ]', script)
         self.assertEqual(script.count('DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS=$local_allow_roots'), 2)
 
+    def test_release_installer_preserves_composition_identity_and_allow_roots(self) -> None:
+        script = (ROOT / "scripts/install-from-release.sh").read_text()
+
+        self.assertIn('node_id=${DISTRIBUTED_WORKBENCH_NODE_ID:-}', script)
+        self.assertIn('default_executor_id=$node_id-rust', script)
+        self.assertIn(
+            'controller_id=${DISTRIBUTED_WORKBENCH_CONTROLLER_ID:-${node_id:-$(hostname -s)}}',
+            script,
+        )
+        self.assertIn('DISTRIBUTED_WORKBENCH_LOCAL_ALLOW_ROOTS', script)
+        self.assertIn('DISTRIBUTED_WORKBENCH_CONTROLLER_ID=$controller_id', script)
+
     def test_prune_state_accepts_only_valid_managed_namespaces(self) -> None:
         script = ROOT / "scripts" / "prune-state.sh"
         with tempfile.TemporaryDirectory() as temporary:
