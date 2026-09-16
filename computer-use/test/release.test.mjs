@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, writeFile, copyFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { packageHost } from '../../scripts/package-computer-use-host.mjs';
 import { installHost } from '../../scripts/install-computer-use-host.mjs';
 import { sha256, hostFiles } from '../release.mjs';
@@ -30,7 +31,7 @@ test('independent host verifies dependencies, switches atomically and rolls back
     assert.equal(installed.version, '0.1.1');
     assert.equal((await readFile(path.join(state, 'runtime-root'), 'utf8')), runtime);
     // Load the actual pinned extension from the old runtime under a separate host root.
-    const module = await import(new URL('file://' + path.join(installed.selected, 'extension-host.mjs')));
+    const module = await import(pathToFileURL(path.join(installed.selected, 'extension-host.mjs')));
     const host = await module.loadHost(path.join(root, 'session'), packageRoot);
     assert.equal(host.tools().length, 11);
     await host.close();
