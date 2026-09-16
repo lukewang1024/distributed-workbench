@@ -918,6 +918,7 @@ public static class WorkbenchInput {
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
   [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr window);
   [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr window,int command);
+  [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr window,IntPtr insertAfter,int x,int y,int width,int height,uint flags);
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
   [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
   [DllImport("user32.dll")] static extern bool AttachThreadInput(uint source,uint target,bool attach);
@@ -933,8 +934,13 @@ public static class WorkbenchInput {
     bool attachedForeground=foreground!=0&&foreground!=current&&AttachThreadInput(current,foreground,true);
     bool attachedTarget=target!=0&&target!=current&&target!=foreground&&AttachThreadInput(current,target,true);
     try{
-      ShowWindowAsync(window,9);BringWindowToTop(window);SetForegroundWindow(window);
-      if(GetForegroundWindow()!=window){Thread.Sleep(100);BringWindowToTop(window);SetForegroundWindow(window);}
+      // A service-hosted helper may not own the last-input foreground grant.
+      // Use a bounded ALT pulse and a reversible topmost pulse before retrying.
+      Send(new[]{K(18,0,0),K(18,0,KeyUp)});
+      ShowWindowAsync(window,9);
+      SetWindowPos(window,new IntPtr(-1),0,0,0,0,0x0001|0x0002|0x0010);
+      SetWindowPos(window,new IntPtr(-2),0,0,0,0,0x0001|0x0002|0x0010);
+      for(int attempt=0;attempt<3&&GetForegroundWindow()!=window;attempt++){BringWindowToTop(window);SetForegroundWindow(window);Thread.Sleep(100);}
       if(GetForegroundWindow()!=window)throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(),"SetForegroundWindow failed");
     }finally{
       if(attachedTarget)AttachThreadInput(current,target,false);
@@ -1373,6 +1379,10 @@ mod tests {
         let source = include_str!("windows.rs");
         assert!(source.contains("if(GetForegroundWindow()==window)return"));
         assert!(source.contains("AttachThreadInput(current,target,true)"));
+        assert!(source.contains("Send(new[]{K(18,0,0),K(18,0,KeyUp)})"));
+        assert!(source.contains("SetWindowPos(window,new IntPtr(-1)"));
+        assert!(source.contains("SetWindowPos(window,new IntPtr(-2)"));
+        assert!(source.contains("attempt<3&&GetForegroundWindow()!=window"));
         assert!(source.contains("if(GetForegroundWindow()!=window)throw"));
     }
 }
