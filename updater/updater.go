@@ -1089,6 +1089,9 @@ func resolveReference(baseLocation, reference string) (string, error) {
 	if parsedReference.IsAbs() {
 		return reference, nil
 	}
+	if filepath.IsAbs(baseLocation) {
+		return filepath.Clean(filepath.Join(filepath.Dir(baseLocation), filepath.FromSlash(reference))), nil
+	}
 	parsedBase, err := url.Parse(baseLocation)
 	if err != nil {
 		return "", err
