@@ -101,6 +101,9 @@ if [ -x "$executable" ]; then
     sleep 0.1
   done
 fi
+# Preserve the separately packaged upstream plugin across release staging cleanup.
+sh "$(dirname "$0")/install-computer-use-runtime.sh" "$source_binary" "$state_root"
+
 app_changed=false
 source_uuid=$(/usr/bin/dwarfdump --uuid "$source_binary" 2>/dev/null | awk 'NR == 1 { print $2 }')
 installed_uuid=

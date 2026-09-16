@@ -1,0 +1,12 @@
+{
+  "name": "@workbench/computer-use-host",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@injaneity/pi-computer-use": "0.5.1",
+    "typebox": "1.1.38"
+  },
+  "scripts": { "test": "node --test test/*.test.mjs" }
+}

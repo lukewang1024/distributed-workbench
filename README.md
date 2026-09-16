@@ -390,3 +390,12 @@ cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+
+## Computer Use
+
+Use the original `pi-computer-use` extension on desktop Executors through
+`workbench computer-use`. Workbench supplies transport and exclusive control;
+upstream supplies all macOS, Windows and Linux desktop behavior. See
+[Computer Use](docs/computer-use.md) for installation, original tool schemas,
+platform prerequisites and lease lifecycle. No model credentials are required.

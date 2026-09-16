@@ -1,5 +1,6 @@
 #[path = "clipboard_cli.rs"]
 mod clipboard_cli;
+mod computer_use_cli;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -33,6 +34,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Use the original pi-computer-use extension on a selected Executor.
+    ComputerUse {
+        #[command(subcommand)]
+        command: computer_use_cli::ComputerUseCommand,
+    },
     Status,
     Dashboard {
         #[arg(long)]
@@ -420,6 +426,10 @@ fn run_cli(cli: Cli) -> Result<()> {
                 ),
             }
         }
+        Command::ComputerUse { command } => computer_use_cli::run(
+            &cli.socket.unwrap_or_else(default_controller_socket),
+            command,
+        ),
         Command::Clipboard { command } => {
             let socket = cli.socket.unwrap_or_else(default_controller_socket);
             match command {

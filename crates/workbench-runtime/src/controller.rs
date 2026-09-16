@@ -4967,7 +4967,7 @@ fn lease_order_rank(resource: &str) -> u8 {
         1
     } else if resource.starts_with("runtime:") {
         2
-    } else if resource.starts_with("acceptance:") {
+    } else if resource.starts_with("acceptance:") || resource.starts_with("computer-use:") {
         3
     } else {
         0

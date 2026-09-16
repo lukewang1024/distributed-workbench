@@ -61,6 +61,9 @@ cp "$binary" "$temporary"
 chmod 755 "$temporary"
 mv "$temporary" "$installed_binary"
 
+# Preserve the separately packaged upstream plugin across release staging cleanup.
+sh "$(dirname "$0")/install-computer-use-runtime.sh" "$binary" "$state_root"
+
 allow_args=
 if [ "$#" -eq 0 ]; then
   set -- "$HOME/Code" "$HOME/Workspace" "$state_home"

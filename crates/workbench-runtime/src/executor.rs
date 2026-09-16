@@ -37,6 +37,7 @@ pub struct ExecutorRuntime {
     relay_root: PathBuf,
     observations: Option<ObservabilityStore>,
     clipboard: crate::clipboard::ClipboardService,
+    computer_use: crate::computer_use::ComputerUseService,
 }
 
 #[derive(Debug)]
@@ -163,7 +164,8 @@ fn execution_class(action: &str, params: &Value) -> ExecutionClass {
         | "ui.evaluate"
         | "ui.native-inspect"
         | "clipboard.read"
-        | "clipboard.status" => ExecutionClass::ReadOnly,
+        | "clipboard.status"
+        | "computer-use.tools" => ExecutionClass::ReadOnly,
         "command.run" if params.get("mode").and_then(Value::as_str) == Some("readonly") => {
             ExecutionClass::Probe
         }
@@ -226,6 +228,7 @@ impl ExecutorRuntime {
             relay_root,
             observations: None,
             clipboard: crate::clipboard::ClipboardService::default(),
+            computer_use: crate::computer_use::ComputerUseService::default(),
         })
     }
 
@@ -536,6 +539,11 @@ impl ExecutorRuntime {
                 },
             })),
             "capability.list" => Ok(serde_json::to_value(capability_catalog()).unwrap()),
+            "computer-use.tools" | "computer-use.call" => self.computer_use.call(
+                &self.relay_root.with_file_name("computer-use"),
+                &params,
+                action == "computer-use.tools",
+            ),
             "clipboard.status" => self.clipboard.status(),
             "clipboard.read" => self.clipboard.read(
                 params
@@ -2206,6 +2214,8 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
         ("filesystem.restore", Effect::Mutating),
         ("filesystem.mkdir", Effect::Mutating),
         ("command.run", Effect::Mutating),
+        ("computer-use.tools", Effect::ReadOnly),
+        ("computer-use.call", Effect::Mutating),
         ("clipboard.status", Effect::ReadOnly),
         ("clipboard.read", Effect::ReadOnly),
         ("clipboard.write", Effect::Mutating),
@@ -2276,6 +2286,19 @@ pub fn capability_catalog() -> Vec<CapabilityDescriptor> {
 
 fn contract(name: &str, effect: Effect) -> CapabilityDescriptor {
     let (required, properties, locks, key_fields, timeout_ms, rollback, evidence) = match name {
+        "computer-use.tools" | "computer-use.call" => (
+            vec!["computer-use"],
+            if name == "computer-use.tools" {
+                json!({})
+            } else {
+                json!({"sessionId": {"type":"string", "minLength":1, "maxLength":256}, "tool":{"type":"string"}, "arguments":{"type":"object"}})
+            },
+            Vec::new(),
+            Vec::new(),
+            120_000,
+            RollbackStrategy::None,
+            vec!["computer-use-result"],
+        ),
         "clipboard.status" => (
             vec!["clipboard"],
             json!({}),
@@ -3021,6 +3044,10 @@ fn capability_authority(name: &str) -> CapabilityAuthority {
         | "ui.native-inspect"
         | "clipboard.status"
         | "clipboard.read" => CapabilityAuthority::None,
+        "computer-use.tools" => CapabilityAuthority::None,
+        "computer-use.call" => CapabilityAuthority::ResourceLease {
+            resource: "computer-use:${executorId}".to_owned(),
+        },
         "clipboard.write" => CapabilityAuthority::ResourceLease {
             resource: "clipboard:${executorId}".to_owned(),
         },
@@ -5157,5 +5184,29 @@ mod tests {
         ));
         assert!(built.ok, "{built:?}");
         assert_eq!(built.result.unwrap()["artifact"]["files"], 1);
+    }
+}
+
+#[cfg(test)]
+mod computer_use_contract_tests {
+    use super::*;
+    #[test]
+    fn desktop_calls_require_one_machine_lease_and_never_retry() {
+        let call = contract("computer-use.call", Effect::Mutating);
+        assert_eq!(
+            call.authority,
+            CapabilityAuthority::ResourceLease {
+                resource: "computer-use:${executorId}".into(),
+            }
+        );
+        assert_eq!(call.retry.max_attempts, 1);
+        assert!(
+            call.input_schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("sessionId"))
+        );
+        let discovery = contract("computer-use.tools", Effect::ReadOnly);
+        assert_eq!(discovery.authority, CapabilityAuthority::None);
     }
 }

@@ -85,6 +85,13 @@ jobs:
           else
             cargo build --release --locked --target '${{ matrix.target }}' --bins
           fi
+      - uses: actions/setup-node@v4
+        if: ${{ !endsWith(matrix.target, '-linux-android') }}
+        with:
+          node-version: '24.14.0'
+      - name: Install pinned Computer Use extension
+        if: ${{ !endsWith(matrix.target, '-linux-android') }}
+        run: node scripts/install-computer-use.mjs
       - name: Package release archive
         shell: bash
         run: >-

@@ -418,7 +418,7 @@ fn native_process_argument(value: &str) -> String {
     }
 }
 
-fn spawn_in_active_session(
+pub(crate) fn spawn_in_active_session(
     executable: &Path,
     args: &[String],
     cwd: &Path,

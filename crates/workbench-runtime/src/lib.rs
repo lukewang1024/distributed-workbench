@@ -3,6 +3,7 @@ pub mod clipboard;
 #[cfg(target_os = "android")]
 #[path = "clipboard_unsupported.rs"]
 pub mod clipboard;
+mod computer_use;
 mod controller;
 mod executor;
 mod generation;

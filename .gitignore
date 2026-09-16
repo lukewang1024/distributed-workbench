@@ -3,3 +3,8 @@
 *.tmp
 .DS_Store
 
+
+/computer-use/node_modules/
+/computer-use/node
+/computer-use/node.exe
+/computer-use/NODE-LICENSE

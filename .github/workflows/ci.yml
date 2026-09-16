@@ -20,6 +20,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2.9.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.14.0'
+      - run: npm ci --ignore-scripts --prefix computer-use
+      - run: npm test --prefix computer-use
       - run: cargo fmt --check
       - run: cargo test --workspace
       - run: cargo clippy --workspace --all-targets -- -D warnings
