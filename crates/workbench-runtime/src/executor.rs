@@ -3633,6 +3633,10 @@ fn listener_owned(pid: u32, addresses: &[std::net::SocketAddr]) -> Option<bool> 
         ])
         .output()
         .ok()?;
+    // lsof exits 1 with no output when a valid process has no matching sockets.
+    if output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty() {
+        return Some(false);
+    }
     if !output.status.success() {
         return None;
     }

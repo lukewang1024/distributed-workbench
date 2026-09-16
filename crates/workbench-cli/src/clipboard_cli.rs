@@ -293,6 +293,55 @@ fn transfer(
     )
 }
 
+/// The installer owns this two-line configuration. Parse as data, never eval a shell file.
+pub fn exec(args: &[String]) -> Result<()> {
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })
+        .ok_or_else(|| anyhow!("HOME or XDG_CONFIG_HOME is required"))?
+        .join("distributed-workbench/clipboard-env");
+    let text = std::fs::read_to_string(&config).map_err(|_| {
+        anyhow!(
+            "CLIPBOARD_UNAVAILABLE: managed display is not configured ({})",
+            config.display()
+        )
+    })?;
+    let mut command = std::process::Command::new(&args[0]);
+    command.args(&args[1..]);
+    let mut display = false;
+    let mut authority = false;
+    for line in text.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            match key {
+                "DISPLAY" => {
+                    display = true;
+                    command.env(key, value);
+                }
+                "XAUTHORITY" => {
+                    authority = true;
+                    command.env(key, value);
+                }
+                _ => bail!("invalid managed clipboard environment"),
+            }
+        }
+    }
+    if !display || !authority {
+        bail!("managed clipboard environment is incomplete");
+    }
+    command.env_remove("WAYLAND_DISPLAY");
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec().into())
+    }
+    #[cfg(not(unix))]
+    {
+        std::process::exit(command.status()?.code().unwrap_or(1));
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -386,54 +435,5 @@ mod tests {
         .unwrap();
         assert_eq!(result["target"], "dev");
         assert!(!result.to_string().contains("private"));
-    }
-}
-
-/// The installer owns this two-line configuration. Parse as data, never eval a shell file.
-pub fn exec(args: &[String]) -> Result<()> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
-        })
-        .ok_or_else(|| anyhow!("HOME or XDG_CONFIG_HOME is required"))?
-        .join("distributed-workbench/clipboard-env");
-    let text = std::fs::read_to_string(&config).map_err(|_| {
-        anyhow!(
-            "CLIPBOARD_UNAVAILABLE: managed display is not configured ({})",
-            config.display()
-        )
-    })?;
-    let mut command = std::process::Command::new(&args[0]);
-    command.args(&args[1..]);
-    let mut display = false;
-    let mut authority = false;
-    for line in text.lines() {
-        if let Some((key, value)) = line.split_once('=') {
-            match key {
-                "DISPLAY" => {
-                    display = true;
-                    command.env(key, value);
-                }
-                "XAUTHORITY" => {
-                    authority = true;
-                    command.env(key, value);
-                }
-                _ => bail!("invalid managed clipboard environment"),
-            }
-        }
-    }
-    if !display || !authority {
-        bail!("managed clipboard environment is incomplete");
-    }
-    command.env_remove("WAYLAND_DISPLAY");
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        Err(command.exec().into())
-    }
-    #[cfg(not(unix))]
-    {
-        std::process::exit(command.status()?.code().unwrap_or(1));
     }
 }

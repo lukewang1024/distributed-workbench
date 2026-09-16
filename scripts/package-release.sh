@@ -31,7 +31,8 @@ case $target in
   *-linux-android) ;;
   *)
     [ -d computer-use/node_modules ] || { echo 'build computer-use runtime before packaging' >&2; exit 2; }
-    cp -R computer-use "$staging/computer-use"
+    # Release consumers reject archive links; dereference npm's CLI shims.
+    cp -RL computer-use "$staging/computer-use"
     rm -rf "$staging/computer-use/test"
     cp scripts/install-computer-use.mjs "$staging/scripts/"
     ;;
