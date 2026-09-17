@@ -324,6 +324,19 @@ impl Controller {
     }
 
     fn dispatch(&self, action: &str, params: Value) -> Result<Value, RpcError> {
+        if action.starts_with("lease.")
+            && let Some(executor_id) = self.resource_executor(&params)
+        {
+            let mut forwarded = params.clone();
+            if let Some(owner) = params.get("owner").and_then(Value::as_str) {
+                forwarded["owner"] = json!(self.resource_owner(owner));
+            }
+            return self.call_registered_executor(
+                &executor_id,
+                &format!("resource.{action}"),
+                forwarded,
+            );
+        }
         if let Some(routed) = self.route_session_action(action, &params)? {
             return Ok(routed);
         }
@@ -1061,6 +1074,28 @@ impl Controller {
             "session.put" => {
                 let mut session: WorkspaceSession = serde_json::from_value(params)
                     .map_err(|error| RpcError::new("INVALID_PARAMS", error.to_string()))?;
+                if let Some(existing) = self
+                    .state
+                    .lock()
+                    .expect("state lock")
+                    .sessions
+                    .iter()
+                    .find(|s| s.metadata.id == session.metadata.id)
+                {
+                    if existing
+                        .authority
+                        .as_ref()
+                        .is_some_and(|a| a.controller_id != self.id)
+                    {
+                        return Err(RpcError::new(
+                            "SESSION_REMOTE_REFERENCE_REQUIRED",
+                            "legacy remote session identity is reserved; create a new local session ID",
+                        ));
+                    }
+                    if session.authority.is_none() {
+                        session.authority = existing.authority.clone();
+                    }
+                }
                 match &session.authority {
                     None => {
                         session.authority = Some(SessionAuthority {
@@ -1136,188 +1171,10 @@ impl Controller {
                 self.persist()?;
                 Ok(serde_json::to_value(session).expect("session serializes"))
             }
-            "session.accept-handoff" => {
-                let session: WorkspaceSession = serde_json::from_value(
-                    params
-                        .get("session")
-                        .cloned()
-                        .ok_or_else(|| RpcError::new("INVALID_PARAMS", "session is required"))?,
-                )
-                .map_err(|error| RpcError::new("INVALID_PARAMS", error.to_string()))?;
-                let authority = session.authority.as_ref().ok_or_else(|| {
-                    RpcError::new("INVALID_AUTHORITY", "handoff has no session authority")
-                })?;
-                if authority.controller_id != self.id {
-                    return Err(RpcError::new(
-                        "INVALID_AUTHORITY",
-                        "handoff target does not match this controller",
-                    ));
-                }
-                let mut state = self.state.lock().expect("state lock");
-                if let Some(existing) = state
-                    .sessions
-                    .iter()
-                    .find(|existing| existing.metadata.id == session.metadata.id)
-                {
-                    if existing.authority.as_ref() == Some(authority) {
-                        return Ok(serde_json::to_value(existing).expect("session serializes"));
-                    }
-                    if existing
-                        .authority
-                        .as_ref()
-                        .is_some_and(|current| current.epoch >= authority.epoch)
-                    {
-                        return Err(RpcError::new(
-                            "STALE_AUTHORITY_EPOCH",
-                            "handoff epoch must increase",
-                        ));
-                    }
-                }
-                upsert_by(&mut state.sessions, session.clone(), |existing| {
-                    existing.metadata.id == session.metadata.id
-                });
-                for task in optional_array::<Task>(&params, "tasks")? {
-                    let id = task.id.clone();
-                    upsert_by(&mut state.tasks, task, |existing| existing.id == id);
-                }
-                for artifact in optional_array::<Artifact>(&params, "artifacts")? {
-                    let digest = artifact.digest.clone();
-                    upsert_by(&mut state.artifacts, artifact, |existing| {
-                        existing.digest == digest
-                    });
-                }
-                for generation in optional_array::<Generation>(&params, "generations")? {
-                    let id = generation.id.clone();
-                    upsert_by(&mut state.generations, generation, |existing| {
-                        existing.id == id
-                    });
-                }
-                for transaction in optional_array::<ActivationTransaction>(&params, "transactions")?
-                {
-                    let id = transaction.id.clone();
-                    upsert_by(&mut state.transactions, transaction, |existing| {
-                        existing.id == id
-                    });
-                }
-                for agent in optional_array::<AgentInstance>(&params, "agents")? {
-                    let id = agent.id.clone();
-                    upsert_by(&mut state.agents, agent, |existing| existing.id == id);
-                }
-                for handoff in optional_array::<Handoff>(&params, "handoffs")? {
-                    let id = handoff.id.clone();
-                    upsert_by(&mut state.handoffs, handoff, |existing| existing.id == id);
-                }
-                *self.tasks.lock().expect("task lock") = TaskTable::from_tasks(state.tasks.clone());
-                drop(state);
-                self.persist()?;
-                Ok(serde_json::to_value(session).expect("session serializes"))
-            }
-            "session.handoff" => {
-                let session_id = required_str(&params, "sessionId")?;
-                let target_id = required_str(&params, "targetControllerId")?;
-                let target = self
-                    .state
-                    .lock()
-                    .expect("state lock")
-                    .controllers
-                    .iter()
-                    .find(|controller| controller.metadata.id == target_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        RpcError::new("CONTROLLER_NOT_FOUND", "target not registered")
-                    })?;
-                if self
-                    .tasks
-                    .lock()
-                    .expect("task lock")
-                    .snapshot()
-                    .iter()
-                    .any(|task| {
-                        task.workspace_session_id == session_id
-                            && !matches!(
-                                task.state,
-                                TaskState::Succeeded
-                                    | TaskState::Failed
-                                    | TaskState::Cancelled
-                                    | TaskState::TimedOut
-                                    | TaskState::OutcomeUnknown
-                            )
-                    })
-                {
-                    return Err(RpcError::new(
-                        "SESSION_NOT_QUIESCENT",
-                        "session has queued or running tasks",
-                    ));
-                }
-                let mut session = self
-                    .state
-                    .lock()
-                    .expect("state lock")
-                    .sessions
-                    .iter()
-                    .find(|session| session.metadata.id == session_id)
-                    .cloned()
-                    .ok_or_else(|| RpcError::new("SESSION_NOT_FOUND", "session not found"))?;
-                let current = session.authority.clone().ok_or_else(|| {
-                    RpcError::new("INVALID_AUTHORITY", "session has no authority")
-                })?;
-                if current.controller_id != self.id {
-                    return Err(RpcError::new(
-                        "NOT_SESSION_AUTHORITY",
-                        format!("session is owned by {}", current.controller_id),
-                    ));
-                }
-                if current
-                    .pending_controller_id
-                    .as_deref()
-                    .is_some_and(|pending| pending != target_id)
-                {
-                    return Err(RpcError::new(
-                        "HANDOFF_IN_PROGRESS",
-                        format!(
-                            "handoff is already pending to {:?}",
-                            current.pending_controller_id
-                        ),
-                    ));
-                }
-                if current.pending_controller_id.is_none() {
-                    session.authority = Some(SessionAuthority {
-                        controller_id: self.id.clone(),
-                        epoch: current.epoch,
-                        pending_controller_id: Some(target_id.to_owned()),
-                    });
-                    let mut state = self.state.lock().expect("state lock");
-                    upsert_by(&mut state.sessions, session.clone(), |existing| {
-                        existing.metadata.id == session.metadata.id
-                    });
-                    drop(state);
-                    self.persist()?;
-                }
-                session.authority = Some(SessionAuthority {
-                    controller_id: target_id.to_owned(),
-                    epoch: current.epoch.saturating_add(1),
-                    pending_controller_id: None,
-                });
-                session.metadata.updated_at = now_ms();
-                let bundle = self.session_bundle(&session);
-                let response = call_executor(
-                    &target.endpoint,
-                    &traced_request("session.accept-handoff", bundle),
-                )
-                .map_err(|error| RpcError::new("CONTROLLER_UNAVAILABLE", error.to_string()))?;
-                if !response.ok {
-                    return Err(response.error.unwrap_or_else(|| {
-                        RpcError::new("HANDOFF_REJECTED", "target rejected session handoff")
-                    }));
-                }
-                let mut state = self.state.lock().expect("state lock");
-                upsert_by(&mut state.sessions, session.clone(), |existing| {
-                    existing.metadata.id == session.metadata.id
-                });
-                drop(state);
-                self.persist()?;
-                Ok(serde_json::to_value(session).expect("session serializes"))
-            }
+            "session.accept-handoff" | "session.handoff" => Err(RpcError::new(
+                "SESSION_IMMUTABLE_HOME",
+                "sessions have a permanent Controller identity; create a new session to continue on another Controller",
+            )),
             "session.get" => {
                 let id = required_str(&params, "sessionId")?;
                 let state = self.state.lock().expect("state lock");
@@ -1620,24 +1477,36 @@ impl Controller {
                         })
                     });
                 if let Some(lease_params) = lease_params {
-                    let leases = self.leases.lock().expect("lease lock");
-                    let authorities = lease_params
-                        .iter()
-                        .map(|item| {
-                            let lease = leases
-                                .validate(
-                                    required_str(item, "resource")?,
-                                    required_str(item, "owner")?,
-                                    required_str(item, "token")?,
-                                )
-                                .map_err(map_lease_error)?;
-                            Ok(json!({
-                                "controllerId": self.id,
-                                "resource": lease.resource,
-                                "fence": lease.fence,
-                            }))
-                        })
-                        .collect::<Result<Vec<_>, RpcError>>()?;
+                    let mut authorities = Vec::new();
+                    let mut grants = Vec::new();
+                    for item in &lease_params {
+                        let resource = required_str(item, "resource")?;
+                        let owner = required_str(item, "owner")?;
+                        let token = required_str(item, "token")?;
+                        let lease = if self
+                            .resource_executor(&json!({"resource":resource}))
+                            .is_some()
+                        {
+                            let grant = json!({"resource":resource, "owner":self.resource_owner(owner), "token":token});
+                            let value = self.call_registered_executor(
+                                id,
+                                "resource.lease.validate",
+                                grant.clone(),
+                            )?;
+                            grants.push(grant);
+                            serde_json::from_value::<workbench_schema::Lease>(value)
+                                .map_err(|e| RpcError::new("INVALID_LEASE", e.to_string()))?
+                        } else {
+                            self.leases
+                                .lock()
+                                .expect("lease lock")
+                                .validate(resource, owner, token)
+                                .map_err(map_lease_error)?
+                                .clone()
+                        };
+                        authorities.push(json!({"controllerId":self.id, "resource":lease.resource, "fence":lease.fence}));
+                    }
+                    nested_params["_resourceLeases"] = json!(grants);
                     nested_params["_authority"] = Value::Array(authorities);
                 }
                 let nested = traced_request(nested_action, nested_params);
@@ -1814,10 +1683,14 @@ impl Controller {
                 grant.state = ReadGrantState::Approved;
                 grant.approved_at = Some(now_ms());
                 grant.approved_by = Some(approver.to_owned());
+                grant.audit["sessionControllerId"] = json!(self.id);
+                let mut executor_grant = grant.clone();
+                executor_grant.workspace_session_id =
+                    self.session_scope(&grant.workspace_session_id);
                 self.call_registered_executor(
                     &grant.executor_id,
                     "read-grant.approve",
-                    serde_json::to_value(&grant).expect("grant serializes"),
+                    serde_json::to_value(&executor_grant).expect("grant serializes"),
                 )?;
                 let mut state = self.state.lock().expect("state lock");
                 let stored = state
@@ -2046,17 +1919,28 @@ impl Controller {
                     workbench_schema::CapabilityAuthority::ResourceLease { resource } => {
                         let resource =
                             render_capability_authority_resource(resource, executor_id, &input)?;
-                        let leases = self.leases.lock().expect("lease lock");
-                        Some(
-                            leases
-                                .validate(
-                                    &resource,
-                                    owner,
-                                    required_str(&params, "authorityLeaseToken")?,
-                                )
-                                .map_err(map_lease_error)?
-                                .clone(),
-                        )
+                        if let Some(token) =
+                            params.get("authorityLeaseToken").and_then(Value::as_str)
+                        {
+                            let grant = json!({"resource":resource, "owner":self.resource_owner(owner), "token":token});
+                            let lease = self.call_registered_executor(
+                                executor_id,
+                                "resource.lease.validate",
+                                grant.clone(),
+                            )?;
+                            input["_resourceLeases"] = json!([grant]);
+                            Some(
+                                serde_json::from_value::<workbench_schema::Lease>(lease)
+                                    .map_err(|e| RpcError::new("INVALID_LEASE", e.to_string()))?,
+                            )
+                        } else if matches!(capability_name, "tunnel.ensure" | "tunnel.stop") {
+                            None
+                        } else {
+                            return Err(RpcError::new(
+                                "RESOURCE_LEASE_REQUIRED",
+                                "resource operation requires an Executor-issued lease",
+                            ));
+                        }
                     }
                 };
                 validate_schema(&contract.input_schema, &input, "input")?;
@@ -2311,6 +2195,7 @@ impl Controller {
                                     "controllerId": self.id,
                                     "resource": lease.resource,
                                     "fence": executor_execution_fence(lease.fence),
+                                    "expiresAt": lease.expires_at,
                                 })
                             })
                             .collect(),
@@ -2321,6 +2206,9 @@ impl Controller {
                     "executor.dispatch.started",
                     json!({"taskId": task.id, "executorId": executor_id, "capability": capability_name, "timeoutMs": contract.timeout_ms}),
                 );
+                input["_sessionRef"] =
+                    json!({"controllerId":self.id, "sessionId":workspace_session_id});
+                input["_agentSessionId"] = json!(owner);
                 let dispatch_started = Instant::now();
                 let response = call_executor_with_timeout(
                     &executor.endpoint,
@@ -3452,6 +3340,11 @@ impl Controller {
             .iter()
             .find(|grant| {
                 grant.workspace_session_id == workspace_session_id
+                    && grant
+                        .audit
+                        .get("sessionControllerId")
+                        .and_then(Value::as_str)
+                        == Some(self.id.as_str())
                     && grant.executor_id == executor_id
                     && grant.state == ReadGrantState::Approved
                     && grant.capabilities.iter().any(|item| item == capability)
@@ -3466,7 +3359,7 @@ impl Controller {
             executor_id,
             "read-grant.find",
             json!({
-                "workspaceSessionId": workspace_session_id,
+                "workspaceSessionId": self.session_scope(workspace_session_id),
                 "capability": capability,
                 "path": path,
             }),
@@ -3474,8 +3367,9 @@ impl Controller {
         if value.is_null() {
             return Ok(None);
         }
-        let grant: ReadGrant = serde_json::from_value(value)
+        let mut grant: ReadGrant = serde_json::from_value(value)
             .map_err(|error| RpcError::new("INVALID_READ_GRANT", error.to_string()))?;
+        grant.workspace_session_id = workspace_session_id.to_owned();
         let mut state = self.state.lock().expect("state lock");
         state.read_grants.retain(|item| item.id != grant.id);
         state.read_grants.push(grant.clone());
@@ -3643,29 +3537,23 @@ impl Controller {
         let expected_digest = required_str(&manifest, "digest")?.to_owned();
         let resource = format!("artifact-relay:{destination_path}");
         let owner = format!("controller:{}", self.id);
-        let lease = self
-            .leases
-            .lock()
-            .expect("lease lock")
-            .acquire(
-                LeaseKind::Resource,
-                resource.clone(),
-                owner.clone(),
-                3_600_000,
-            )
-            .map_err(map_lease_error)?;
-        self.persist()?;
+        let lease = self.call_registered_executor(
+            destination_executor,
+            "resource.lease.acquire",
+            json!({"resource":resource,"owner":owner,"ttlMs":3_600_000}),
+        )?;
+        let grants = json!([{"resource":resource,"owner":owner,"token":lease["token"]}]);
         let staging = format!(
             "{destination_path}.workbench-relay-{}",
             Uuid::new_v4().simple()
         );
         let authority =
-            json!([{"controllerId": self.id, "resource": resource, "fence": lease.fence}]);
+            json!([{"controllerId": self.id, "resource": resource, "fence": lease["fence"]}]);
         let result = (|| {
             self.call_registered_executor(
                 destination_executor,
                 "artifact.relay.prepare",
-                json!({"destination": destination_path, "staging": staging, "entries": entries, "_authority": authority}),
+                json!({"destination": destination_path, "staging": staging, "entries": entries, "_authority": authority, "_resourceLeases": grants}),
             )?;
             for entry in &entries {
                 if required_str(entry, "kind")? != "file" {
@@ -3695,7 +3583,7 @@ impl Controller {
                     self.call_registered_executor(
                         destination_executor,
                         "artifact.relay.write",
-                        json!({"destination": destination_path, "staging": staging, "relativePath": relative, "offset": offset, "data": chunk["data"], "_authority": authority}),
+                        json!({"destination": destination_path, "staging": staging, "relativePath": relative, "offset": offset, "data": chunk["data"], "_authority": authority, "_resourceLeases": grants}),
                     )?;
                     offset = offset.saturating_add(bytes);
                 }
@@ -3703,7 +3591,7 @@ impl Controller {
             let committed = self.call_registered_executor(
                 destination_executor,
                 "artifact.relay.commit",
-                json!({"destination": destination_path, "staging": staging, "expectedDigest": expected_digest, "_authority": authority}),
+                json!({"destination": destination_path, "staging": staging, "expectedDigest": expected_digest, "_authority": authority, "_resourceLeases": grants}),
             )?;
             Ok(json!({
                 "source": {"executorId": source_executor, "path": source_path},
@@ -3712,12 +3600,11 @@ impl Controller {
                 "digest": committed["digest"], "size": committed["size"], "files": committed["files"]
             }))
         })();
-        let _ = self
-            .leases
-            .lock()
-            .expect("lease lock")
-            .release(&resource, &owner, &lease.token);
-        self.persist()?;
+        let _ = self.call_registered_executor(
+            destination_executor,
+            "resource.lease.release",
+            grants[0].clone(),
+        );
         result
     }
 
@@ -3731,24 +3618,18 @@ impl Controller {
     ) -> Result<Value, RpcError> {
         let resource = format!("artifact-relay:{destination_path}");
         let owner = format!("controller:{}", self.id);
-        let lease = self
-            .leases
-            .lock()
-            .expect("lease lock")
-            .acquire(
-                LeaseKind::Resource,
-                resource.clone(),
-                owner.clone(),
-                3_600_000,
-            )
-            .map_err(map_lease_error)?;
-        self.persist()?;
+        let lease = self.call_registered_executor(
+            executor_id,
+            "resource.lease.acquire",
+            json!({"resource":resource,"owner":owner,"ttlMs":3_600_000}),
+        )?;
+        let grants = json!([{"resource":resource,"owner":owner,"token":lease["token"]}]);
         let staging = format!(
             "{destination_path}.workbench-local-{}",
             Uuid::new_v4().simple()
         );
         let authority =
-            json!([{"controllerId": self.id, "resource": resource, "fence": lease.fence}]);
+            json!([{"controllerId": self.id, "resource": resource, "fence": lease["fence"]}]);
         let result = (|| {
             transfer_event(
                 "local-started",
@@ -3757,7 +3638,7 @@ impl Controller {
             let copied = self.call_registered_executor(
                 executor_id,
                 "artifact.relay.local-copy",
-                json!({"source": source_path, "destination": destination_path, "staging": staging, "_authority": authority}),
+                json!({"source": source_path, "destination": destination_path, "staging": staging, "_authority": authority, "_resourceLeases": grants}),
             )?;
             transfer_event(
                 "committed",
@@ -3774,12 +3655,8 @@ impl Controller {
                     "totalDurationMs": transfer_started.elapsed().as_millis()}
             }))
         })();
-        let _ = self
-            .leases
-            .lock()
-            .expect("lease lock")
-            .release(&resource, &owner, &lease.token);
-        self.persist()?;
+        let _ =
+            self.call_registered_executor(executor_id, "resource.lease.release", grants[0].clone());
         result
     }
 
@@ -3811,18 +3688,12 @@ impl Controller {
             .unwrap_or("directory");
         let resource = format!("artifact-relay:{destination_path}");
         let owner = format!("controller:{}", self.id);
-        let lease = self
-            .leases
-            .lock()
-            .expect("lease lock")
-            .acquire(
-                LeaseKind::Resource,
-                resource.clone(),
-                owner.clone(),
-                3_600_000,
-            )
-            .map_err(map_lease_error)?;
-        self.persist()?;
+        let lease = self.call_registered_executor(
+            destination_executor,
+            "resource.lease.acquire",
+            json!({"resource":resource,"owner":owner,"ttlMs":3_600_000}),
+        )?;
+        let grants = json!([{"resource":resource,"owner":owner,"token":lease["token"]}]);
         let staging = format!(
             "{destination_path}.workbench-relay-{}",
             Uuid::new_v4().simple()
@@ -3830,7 +3701,7 @@ impl Controller {
         let authority = json!([{
             "controllerId": self.id,
             "resource": resource,
-            "fence": lease.fence
+            "fence": lease["fence"]
         }]);
         let result = (|| {
             let prepare_started = Instant::now();
@@ -3841,7 +3712,7 @@ impl Controller {
             self.call_registered_executor(
                 destination_executor,
                 "artifact.relay.archive.prepare",
-                json!({"destination": destination_path, "staging": staging, "_authority": authority}),
+                json!({"destination": destination_path, "staging": staging, "_authority": authority, "_resourceLeases": grants}),
             )
             .map_err(|error| transfer_error(error, "preparing", 0, 0))?;
             transfer_event(
@@ -3887,7 +3758,7 @@ impl Controller {
                 self.call_registered_executor(
                     destination_executor,
                     "artifact.relay.archive.write",
-                    json!({"destination": destination_path, "staging": staging, "offset": offset, "data": chunk["data"], "_authority": authority}),
+                    json!({"destination": destination_path, "staging": staging, "offset": offset, "data": chunk["data"], "_authority": authority, "_resourceLeases": grants}),
                 )
                 .map_err(|error| transfer_error(error, "writing", offset, chunks))?;
                 offset = offset.saturating_add(bytes);
@@ -3910,7 +3781,7 @@ impl Controller {
                     json!({
                         "destination": destination_path, "staging": staging,
                         "expectedDigest": expected_digest, "archiveSize": archive_size,
-                        "size": size, "files": files, "kind": kind, "_authority": authority
+                        "size": size, "files": files, "kind": kind, "_authority": authority, "_resourceLeases": grants
                     }),
                 )
                 .map_err(|error| transfer_error(error, "committing", offset, chunks))?;
@@ -3934,13 +3805,44 @@ impl Controller {
                 }
             }))
         })();
-        let _ = self
-            .leases
-            .lock()
-            .expect("lease lock")
-            .release(&resource, &owner, &lease.token);
-        self.persist()?;
+        let _ = self.call_registered_executor(
+            destination_executor,
+            "resource.lease.release",
+            grants[0].clone(),
+        );
         result
+    }
+
+    fn session_scope(&self, session: &str) -> String {
+        serde_json::to_string(&[self.id.as_str(), session]).expect("session scope serializes")
+    }
+
+    fn resource_owner(&self, owner: &str) -> String {
+        serde_json::to_string(&[self.id.as_str(), owner]).expect("owner serializes")
+    }
+
+    fn resource_executor(&self, params: &Value) -> Option<String> {
+        if let Some(id) = params.get("executorId").and_then(Value::as_str) {
+            return Some(id.to_owned());
+        }
+        let resource = params.get("resource")?.as_str()?;
+        let (kind, tail) = resource.split_once(':')?;
+        if !matches!(kind, "tunnel" | "runtime" | "acceptance" | "clipboard") {
+            return None;
+        }
+        self.state
+            .lock()
+            .expect("state lock")
+            .executors
+            .iter()
+            .filter(|e| {
+                tail == e.metadata.id
+                    || tail
+                        .strip_prefix(&e.metadata.id)
+                        .is_some_and(|s| s.starts_with(':'))
+            })
+            .max_by_key(|e| e.metadata.id.len())
+            .map(|e| e.metadata.id.clone())
     }
 
     fn route_session_action(
@@ -3955,36 +3857,28 @@ impl Controller {
         let Some(session_id) = session_id else {
             return Ok(None);
         };
-        let authority_id = self
-            .state
-            .lock()
-            .expect("state lock")
-            .sessions
-            .iter()
-            .find(|session| session.metadata.id == session_id)
-            .and_then(|session| session.authority.as_ref())
-            .map(|authority| authority.controller_id.clone());
-        let pending = self
-            .state
-            .lock()
-            .expect("state lock")
-            .sessions
-            .iter()
-            .find(|session| session.metadata.id == session_id)
-            .and_then(|session| session.authority.as_ref())
-            .and_then(|authority| authority.pending_controller_id.clone());
-        if let Some(target) = pending
-            && !matches!(action, "session.get" | "session.handoff")
-        {
-            return Err(RpcError::new(
-                "SESSION_HANDOFF_IN_PROGRESS",
-                format!("session handoff to {target} is in progress"),
-            ));
-        }
-        let Some(authority_id) = authority_id else {
-            return Ok(None);
-        };
+        let authority_id = params
+            .get("sessionControllerId")
+            .and_then(Value::as_str)
+            .unwrap_or(&self.id)
+            .to_owned();
         if authority_id == self.id {
+            let state = self.state.lock().expect("state lock");
+            if let Some(authority) = state
+                .sessions
+                .iter()
+                .find(|s| s.metadata.id == session_id)
+                .and_then(|s| s.authority.as_ref())
+                && authority.controller_id != self.id
+            {
+                return Err(RpcError::new(
+                    "SESSION_REMOTE_REFERENCE_REQUIRED",
+                    format!(
+                        "legacy session {session_id} belongs to {}; specify sessionControllerId explicitly or create a new local session",
+                        authority.controller_id
+                    ),
+                ));
+            }
             return Ok(None);
         }
         let controller = self
@@ -4190,26 +4084,6 @@ impl Controller {
         session_id
     }
 
-    fn session_bundle(&self, session: &WorkspaceSession) -> Value {
-        let session_id = &session.metadata.id;
-        let state = self.state.lock().expect("state lock");
-        json!({
-            "session": session,
-            "tasks": self.tasks.lock().expect("task lock").snapshot().into_iter()
-                .filter(|task| &task.workspace_session_id == session_id).collect::<Vec<_>>(),
-            "artifacts": state.artifacts.iter()
-                .filter(|artifact| &artifact.provenance.workspace_session_id == session_id).cloned().collect::<Vec<_>>(),
-            "generations": state.generations.iter()
-                .filter(|generation| &generation.workspace_session_id == session_id).cloned().collect::<Vec<_>>(),
-            "transactions": state.transactions.iter()
-                .filter(|transaction| &transaction.workspace_session_id == session_id).cloned().collect::<Vec<_>>(),
-            "agents": state.agents.iter()
-                .filter(|agent| &agent.workspace_session_id == session_id).cloned().collect::<Vec<_>>(),
-            "handoffs": state.handoffs.iter()
-                .filter(|handoff| &handoff.workspace_session_id == session_id).cloned().collect::<Vec<_>>(),
-        })
-    }
-
     fn persist(&self) -> Result<(), RpcError> {
         let mut state = self.state.lock().expect("state lock");
         let leases = self.leases.lock().expect("lease lock");
@@ -4394,19 +4268,6 @@ fn safe_request_fields(action: &str, params: &Value) -> Value {
         );
     }
     Value::Object(fields)
-}
-
-fn optional_array<T: serde::de::DeserializeOwned>(
-    params: &Value,
-    key: &str,
-) -> Result<Vec<T>, RpcError> {
-    params
-        .get(key)
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|error| RpcError::new("INVALID_PARAMS", format!("{key}: {error}")))
-        .map(Option::unwrap_or_default)
 }
 
 fn validate_schema(schema: &Value, value: &Value, path: &str) -> Result<(), RpcError> {
@@ -4812,7 +4673,7 @@ fn render_lock(template: &str, input: &Value) -> Result<String, RpcError> {
     Ok(rendered)
 }
 
-fn command_resources(input: &Value) -> Result<Vec<String>, RpcError> {
+pub(crate) fn command_resources(input: &Value) -> Result<Vec<String>, RpcError> {
     let Some(values) = input.get("resources") else {
         return Ok(Vec::new());
     };
@@ -4996,9 +4857,11 @@ fn lease_order_rank(resource: &str) -> u8 {
     }
 }
 
-fn protocol_features() -> [&'static str; 4] {
+fn protocol_features() -> [&'static str; 6] {
     [
         "capability-authority-v2",
+        "local-session-v1",
+        "executor-resource-authority-v1",
         "driver-draining-v1",
         "read-grant-v1",
         "acceptance-handoff-v1",
@@ -5230,7 +5093,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn approved_read_grant_is_reused_across_controllers() {
+    fn same_named_sessions_on_different_controllers_do_not_share_read_grants() {
         let directory = tempfile::tempdir().unwrap();
         let managed = directory.path().join("managed");
         let downloads = directory.path().join("Downloads");
@@ -5298,8 +5161,8 @@ mod tests {
         let reused = controller_b.handle(request());
         assert!(reused.ok, "{:?}", reused.error);
         let reused = reused.result.unwrap();
-        assert_eq!(reused["id"], first["id"]);
-        assert_eq!(reused["state"], "approved");
+        assert_ne!(reused["id"], first["id"]);
+        assert_eq!(reused["state"], "requested");
         assert_eq!(controller_b.state.lock().unwrap().read_grants.len(), 1);
     }
 
@@ -5685,139 +5548,26 @@ mod tests {
     }
 
     #[test]
-    fn session_handoff_moves_authority_and_routes_through_old_home() {
+    fn sessions_have_permanent_local_identity_and_remote_access_is_explicit() {
         let directory = tempfile::tempdir().unwrap();
-        let controller_b = Arc::new(
+        let b = Arc::new(
             Controller::open_with_id(
                 JsonStore::new(directory.path().join("b.json")),
-                Some("node-b".to_owned()),
+                Some("node-b".into()),
             )
             .unwrap(),
         );
-        let socket_b = directory.path().join("b.sock");
-        let server_b = Arc::clone(&controller_b);
-        let listen_b = socket_b.clone();
-        std::thread::spawn(move || {
-            RpcServer::new(listen_b)
-                .serve(move |request| server_b.handle(request))
-                .unwrap();
-        });
-        for _ in 0..100 {
-            if socket_b.exists() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let controller_a = Controller::open_with_id(
+        let a = Controller::open_with_id(
             JsonStore::new(directory.path().join("a.json")),
-            Some("node-a".to_owned()),
+            Some("node-a".into()),
         )
         .unwrap();
-        assert!(
-            controller_a
-                .handle(Request::new(
-                    "controller.register",
-                    json!({"controllerId": "node-b", "endpoint": {"transport": "local", "socket": socket_b}}),
-                ))
-                .ok
-        );
-        let session = controller_a.handle(Request::new(
-            "session.put",
-            json!({
-                "apiVersion": "workbench.dev/v1",
-                "metadata": {"id": "session-1", "labels": {}, "createdAt": 1, "updatedAt": 1},
-                "objective": "test",
-                "state": "active"
-            }),
-        ));
-        assert_eq!(
-            session.result.unwrap()["authority"]["controllerId"],
-            "node-a"
-        );
-        let submitted = controller_a.handle(Request::new(
-            "task.submit",
-            json!({
-                "workspaceSessionId": "session-1",
-                "executorId": "executor-1",
-                "capability": "test",
-                "input": {},
-                "idempotencyKey": "handoff-task"
-            }),
-        ));
-        let task_id = submitted.result.unwrap()["task"]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        for state in ["running", "succeeded"] {
-            assert!(
-                controller_a
-                    .handle(Request::new(
-                        "task.transition",
-                        json!({"taskId": task_id, "state": state})
-                    ))
-                    .ok
-            );
-        }
-        let moved = controller_a.handle(Request::new(
-            "session.handoff",
-            json!({"sessionId": "session-1", "targetControllerId": "node-b"}),
-        ));
-        assert!(moved.ok, "{:?}", moved.error);
-        assert_eq!(moved.result.unwrap()["authority"]["epoch"], 2);
-        assert_eq!(
-            controller_b
-                .handle(Request::new("task.get", json!({"taskId": task_id})))
-                .result
-                .unwrap()["state"],
-            "succeeded"
-        );
-        let transitioned = controller_a.handle(Request::new(
-            "session.transition",
-            json!({"sessionId": "session-1", "state": "completed"}),
-        ));
-        assert!(transitioned.ok, "{:?}", transitioned.error);
-        assert_eq!(transitioned.result.unwrap()["state"], "completed");
-        assert_eq!(
-            controller_b
-                .handle(Request::new(
-                    "session.get",
-                    json!({"sessionId": "session-1"})
-                ))
-                .result
-                .unwrap()["state"],
-            "completed"
-        );
-    }
-
-    #[test]
-    fn session_gate_prevents_mutation_from_crossing_a_handoff() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket = directory.path().join("target.sock");
-        let server_socket = socket.clone();
-        let (accept_started_tx, accept_started_rx) = mpsc::channel();
-        let (release_accept_tx, release_accept_rx) = mpsc::channel();
-        let release_accept_rx = Arc::new(Mutex::new(release_accept_rx));
+        let socket = directory.path().join("b.sock");
+        let server = Arc::clone(&b);
+        let endpoint = socket.clone();
         std::thread::spawn(move || {
-            RpcServer::new(server_socket)
-                .serve(move |request| match request.action.as_str() {
-                    "session.accept-handoff" => {
-                        let _ = accept_started_tx.send(());
-                        release_accept_rx
-                            .lock()
-                            .expect("release receiver")
-                            .recv()
-                            .expect("handoff release");
-                        Response::success(request.request_id, json!({"accepted": true}))
-                    }
-                    "session.transition" => Response::success(
-                        request.request_id,
-                        json!({"id": "session-gated", "state": "completed"}),
-                    ),
-                    _ => Response::success(
-                        request.request_id,
-                        json!({"controller": {"id": "node-b", "status": "ready"}}),
-                    ),
-                })
+            RpcServer::new(endpoint)
+                .serve(move |r| server.handle(r))
                 .unwrap();
         });
         for _ in 0..100 {
@@ -5826,64 +5576,130 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let controller = Arc::new(
-            Controller::open_with_id(
-                JsonStore::new(directory.path().join("source.json")),
-                Some("node-a".to_owned()),
-            )
-            .unwrap(),
-        );
         assert!(
-            controller
-                .handle(Request::new(
-                    "controller.register",
-                    json!({"controllerId": "node-b", "endpoint": {"transport": "local", "socket": socket}}),
-                ))
-                .ok
-        );
-        assert!(
-            controller
-                .handle(Request::new(
-                    "session.put",
-                    json!({
-                        "apiVersion": "workbench.dev/v1",
-                        "metadata": {"id": "session-gated", "labels": {}, "createdAt": 1, "updatedAt": 1},
-                        "objective": "test gate",
-                        "state": "active"
-                    }),
-                ))
-                .ok
-        );
-        let handoff_controller = Arc::clone(&controller);
-        let handoff = std::thread::spawn(move || {
-            handoff_controller.handle(Request::new(
-                "session.handoff",
-                json!({"sessionId": "session-gated", "targetControllerId": "node-b"}),
+            a.handle(Request::new(
+                "controller.register",
+                json!({"controllerId":"node-b", "endpoint":{"transport":"local", "socket":socket}})
             ))
-        });
-        accept_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("handoff reached target");
-        let transition_controller = Arc::clone(&controller);
-        let (transition_tx, transition_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let response = transition_controller.handle(Request::new(
-                "session.transition",
-                json!({"sessionId": "session-gated", "state": "completed"}),
-            ));
-            transition_tx.send(response).unwrap();
-        });
-        assert!(
-            transition_rx
-                .recv_timeout(Duration::from_millis(50))
-                .is_err()
+            .ok
         );
-        release_accept_tx.send(()).unwrap();
-        assert!(handoff.join().unwrap().ok);
-        let transitioned = transition_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("transition unblocked after handoff");
-        assert!(transitioned.ok, "{:?}", transitioned.error);
+        for controller in [&a, b.as_ref()] {
+            let created = controller.handle(Request::new("session.put", json!({
+                "apiVersion":"workbench.dev/v1", "metadata":{"id":"same-name", "labels":{}, "createdAt":1, "updatedAt":1},
+                "objective":"independent task", "state":"active"
+            })));
+            assert!(created.ok, "{created:?}");
+            assert_eq!(
+                created.result.unwrap()["authority"]["controllerId"],
+                controller.id
+            );
+            let moved = controller.handle(Request::new(
+                "session.handoff",
+                json!({"sessionId":"same-name", "targetControllerId":"node-b"}),
+            ));
+            assert_eq!(moved.error.unwrap().code, "SESSION_IMMUTABLE_HOME");
+        }
+        assert!(
+            a.handle(Request::new(
+                "session.transition",
+                json!({"sessionId":"same-name", "state":"completed"})
+            ))
+            .ok
+        );
+        let remote = a.handle(Request::new(
+            "session.get",
+            json!({"sessionControllerId":"node-b", "sessionId":"same-name"}),
+        ));
+        assert_eq!(remote.result.unwrap()["state"], "active");
+        // Preserve a legacy redirect as historical state, but never follow it implicitly.
+        a.state.lock().unwrap().sessions[0]
+            .authority
+            .as_mut()
+            .unwrap()
+            .controller_id = "node-b".into();
+        let legacy = a.handle(Request::new(
+            "session.get",
+            json!({"sessionId":"same-name"}),
+        ));
+        assert_eq!(
+            legacy.error.unwrap().code,
+            "SESSION_REMOTE_REFERENCE_REQUIRED"
+        );
+        let explicit = a.handle(Request::new(
+            "session.get",
+            json!({"sessionId":"same-name", "sessionControllerId":"node-b"}),
+        ));
+        assert!(explicit.ok);
+    }
+
+    #[test]
+    fn two_controllers_acquire_and_validate_the_same_executor_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("executor.sock");
+        let executor = crate::ExecutorRuntime::open(
+            "shared",
+            vec![directory.path().into()],
+            directory.path().join("fences.json"),
+        )
+        .unwrap();
+        let endpoint = socket.clone();
+        std::thread::spawn(move || {
+            RpcServer::new(endpoint)
+                .serve(move |r| executor.handle(r))
+                .unwrap();
+        });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let a = Controller::open_with_id(
+            JsonStore::new(directory.path().join("a.json")),
+            Some("a".into()),
+        )
+        .unwrap();
+        let b = Controller::open_with_id(
+            JsonStore::new(directory.path().join("b.json")),
+            Some("b".into()),
+        )
+        .unwrap();
+        for controller in [&a, &b] {
+            let registered = controller.handle(Request::new(
+                "executor.register",
+                json!({"executorId":"shared", "endpoint":{"transport":"local", "socket":socket}}),
+            ));
+            assert!(registered.ok, "{registered:?}");
+        }
+        // Only A has this session. Executing on the shared Executor requires no
+        // session record on B and leaves the task in A's local state.
+        assert!(a.handle(Request::new("session.put", json!({"apiVersion":"workbench.dev/v1", "metadata":{"id":"local-task", "labels":{}, "createdAt":1,"updatedAt":1},"objective":"remote execution","state":"active"}))).ok);
+        let driver = a
+            .handle(Request::new(
+                "driver.acquire",
+                json!({"resource":"workspace:local-task", "owner":"agent", "ttlMs":60000}),
+            ))
+            .result
+            .unwrap();
+        let written = a.handle(Request::new("capability.invoke", json!({"executorId":"shared", "workspaceSessionId":"local-task", "owner":"agent", "driverToken":driver["token"], "capability":"filesystem.write", "input":{"path":directory.path().join("proof.txt"),"content":"from A"}, "idempotencyKey":"proof", "executionMode":"sync"})));
+        assert!(written.ok, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("proof.txt")).unwrap(),
+            "from A"
+        );
+        assert!(b.state.lock().unwrap().sessions.is_empty());
+        assert!(!a.tasks.lock().unwrap().snapshot().is_empty());
+        let request = json!({"executorId":"shared", "resource":"tunnel:shared:t", "owner":"agent", "ttlMs":60000});
+        let acquired = a.handle(Request::new("lease.acquire", request.clone()));
+        assert!(acquired.ok, "{acquired:?}");
+        let token = acquired.result.unwrap()["token"].clone();
+        let conflict = b.handle(Request::new("lease.acquire", request.clone()));
+        assert_eq!(conflict.error.unwrap().code, "RESOURCE_BUSY");
+        let release = json!({"executorId":"shared", "resource":"tunnel:shared:t", "owner":"agent", "token":token});
+        assert!(!b.handle(Request::new("lease.release", release.clone())).ok);
+        assert!(a.handle(Request::new("lease.release", release.clone())).ok);
+        assert!(b.handle(Request::new("lease.acquire", request)).ok);
+        assert!(!a.handle(Request::new("lease.release", release)).ok);
     }
 
     #[test]

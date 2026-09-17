@@ -12,6 +12,7 @@ mod generation;
 mod macos;
 mod peer;
 mod process;
+mod resource;
 mod rpc;
 mod telemetry;
 mod transport;

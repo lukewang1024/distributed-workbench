@@ -41,6 +41,7 @@ pub struct ExecutorRuntime {
     computer_use: crate::computer_use::ComputerUseService,
     desktop: Mutex<crate::desktop::DesktopQueue>,
     desktop_execution: Mutex<()>,
+    resources: Mutex<crate::resource::Resources>,
 }
 
 #[derive(Debug)]
@@ -236,6 +237,7 @@ impl ExecutorRuntime {
             computer_use: crate::computer_use::ComputerUseService::default(),
             desktop: Mutex::new(crate::desktop::DesktopQueue::default()),
             desktop_execution: Mutex::new(()),
+            resources: Mutex::new(crate::resource::Resources::default()),
         })
     }
 
@@ -310,6 +312,9 @@ impl ExecutorRuntime {
         runtime.desktop = Mutex::new(crate::desktop::DesktopQueue::open(
             state_path.with_file_name("desktop-queue.json"),
         )?);
+        runtime.resources = Mutex::new(crate::resource::Resources::open(
+            state_path.with_file_name("executor-resources.json"),
+        )?);
         runtime.fences = Some(Mutex::new(fences));
         Ok(runtime)
     }
@@ -343,7 +348,7 @@ impl ExecutorRuntime {
             .execution
             .try_acquire(execution_class(&request.action, &request.params));
         let result = match permit {
-            Ok(_permit) => self.desktop_dispatch(&request.action, request.params),
+            Ok(_permit) => self.resource_dispatch(&request.action, request.params),
             Err(error) => Err(error),
         };
         let response = match result {
@@ -448,6 +453,57 @@ impl ExecutorRuntime {
         queue.promote()
     }
 
+    fn resource_dispatch(&self, action: &str, params: Value) -> Result<Value, RpcError> {
+        if action.starts_with("resource.lease.") {
+            return self
+                .resources
+                .lock()
+                .expect("resources")
+                .command(action, &params);
+        }
+        let canonical = match action {
+            "fs.write" => "filesystem.write",
+            "fs.patch" => "filesystem.patch",
+            "fs.remove" => "filesystem.remove",
+            "fs.restore" => "filesystem.restore",
+            other => other,
+        };
+        let contract = capability_catalog()
+            .into_iter()
+            .find(|c| c.name == canonical);
+        let mut resources = Vec::new();
+        if let Some(contract) = contract {
+            if let CapabilityAuthority::ResourceLease { resource } = &contract.authority {
+                resources.push(render_authority_resource(
+                    &resource.replace("${executorId}", &self.id),
+                    &params,
+                )?);
+            }
+            for lock in &contract.locks {
+                resources.push(render_authority_resource(
+                    &lock.key.replace("${executorId}", &self.id),
+                    &params,
+                )?);
+            }
+            if canonical == "command.run" {
+                resources.extend(crate::controller::command_resources(&params)?);
+            }
+        }
+        if canonical == "tunnel.ensure" {
+            resources.push(format!(
+                "tunnel-bind-port:{}",
+                required_port(&params, "bindPort")?
+            ));
+        }
+        let grants = params
+            .get("_resourceLeases")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let _permit = crate::resource::Resources::begin(&self.resources, resources, &grants)?;
+        self.desktop_dispatch(action, params)
+    }
+
     fn desktop_dispatch(&self, action: &str, mut params: Value) -> Result<Value, RpcError> {
         if action.starts_with("desktop.") {
             self.reconcile_desktop()?;
@@ -521,6 +577,24 @@ impl ExecutorRuntime {
         if matches!(contract.authority, CapabilityAuthority::None) {
             return Ok(());
         }
+        if let CapabilityAuthority::ResourceLease { .. } = contract.authority {
+            // Short tunnel operations arbitrate atomically inside this Executor.
+            // Relay chunks retain their operation-level destination reservation.
+            if canonical.starts_with("tunnel.") || canonical.starts_with("artifact.relay.") {
+                return Ok(());
+            }
+            if params
+                .get("_resourceLeases")
+                .and_then(Value::as_array)
+                .is_none_or(|v| v.is_empty())
+            {
+                return Err(RpcError::new(
+                    "RESOURCE_LEASE_REQUIRED",
+                    "resource operation requires an Executor-issued grant",
+                ));
+            }
+            return Ok(());
+        }
         let authorities = params
             .get("_authority")
             .and_then(Value::as_array)
@@ -574,6 +648,20 @@ impl ExecutorRuntime {
         for authority in authorities {
             let controller_id = required_str(authority, "controllerId")?;
             let resource = required_str(authority, "resource")?;
+            if !resource.starts_with("workspace:") {
+                continue;
+            }
+            let resource = format!("{controller_id}/{resource}");
+            if authority
+                .get("expiresAt")
+                .and_then(Value::as_u64)
+                .is_some_and(|expiry| expiry <= now_ms())
+            {
+                return Err(RpcError::new(
+                    "DRIVER_LEASE_EXPIRED",
+                    "driver expired before execution",
+                ));
+            }
             let fence = authority
                 .get("fence")
                 .and_then(Value::as_u64)
@@ -581,7 +669,7 @@ impl ExecutorRuntime {
             if fence == 0 {
                 return Err(RpcError::new("INVALID_AUTHORITY", "fence must be positive"));
             }
-            if let Some(current) = table.resources.get(resource)
+            if let Some(current) = table.resources.get(&resource)
                 && (fence < current.fence
                     || (fence == current.fence && controller_id != current.controller_id))
             {
@@ -596,7 +684,11 @@ impl ExecutorRuntime {
         }
         for authority in authorities {
             let controller_id = required_str(authority, "controllerId")?.to_owned();
-            let resource = required_str(authority, "resource")?.to_owned();
+            let resource = required_str(authority, "resource")?;
+            if !resource.starts_with("workspace:") {
+                continue;
+            }
+            let resource = format!("{controller_id}/{resource}");
             let fence = authority["fence"].as_u64().expect("validated fence");
             table.resources.insert(
                 resource,
@@ -1938,9 +2030,25 @@ impl ExecutorRuntime {
         let target_host = required_str(params, "targetHost")?;
         let target_port = required_port(params, "targetPort")?;
         let ssh_host = required_str(params, "sshHost")?;
+        for record in self.processes.list() {
+            let meta = &record.metadata;
+            if meta.get("kind").and_then(Value::as_str) == Some("tunnel")
+                && meta.get("tunnelId").and_then(Value::as_str) != Some(tunnel_id)
+                && meta.get("desiredState").and_then(Value::as_str) == Some("running")
+                && meta["source"]["port"].as_u64() == Some(bind_port as u64)
+                && meta["direction"].as_str() == Some(direction)
+                && (direction == "local-forward" || meta["sshHost"].as_str() == Some(ssh_host))
+            {
+                return Err(RpcError::new(
+                    "TUNNEL_PORT_RESERVED",
+                    format!("port {bind_port} is reserved by {}", record.id),
+                ));
+            }
+        }
         let metadata = json!({
             "kind": "tunnel", "tunnelId": tunnel_id,
-            "workspaceSessionId": params.get("workspaceSessionId"),
+            "workspaceSessionId": params.get("_workspaceSessionId").or_else(|| params.get("workspaceSessionId")),
+            "sessionRef": params.get("_sessionRef"),
             "sshHost": ssh_host, "direction": direction,
             "source": {"host": bind_host, "port": bind_port},
             "destination": {"host": target_host, "port": target_port},
@@ -2053,6 +2161,19 @@ impl ExecutorRuntime {
             })
             .collect::<Vec<_>>();
         for record in candidates {
+            let tunnel_id = record.metadata["tunnelId"].as_str().unwrap_or("");
+            let keys = vec![
+                format!("tunnel:{}:{tunnel_id}", self.id),
+                format!("tunnel:{tunnel_id}"),
+                format!(
+                    "bind:{}:{}",
+                    record.metadata["source"]["host"].as_str().unwrap_or(""),
+                    record.metadata["source"]["port"]
+                ),
+            ];
+            let Ok(_permit) = crate::resource::Resources::begin(&self.resources, keys, &[]) else {
+                continue;
+            };
             let mut metadata = record.metadata.clone();
             metadata["lastReconcileAttemptAt"] = Value::from(now);
             let _ = self.processes.update_metadata(&record.id, metadata);
@@ -2133,7 +2254,8 @@ impl ExecutorRuntime {
         capability: &str,
     ) -> Result<(), RpcError> {
         let workspace = params
-            .get("_workspaceSessionId")
+            .get("_workspaceScope")
+            .or_else(|| params.get("_workspaceSessionId"))
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 RpcError::new(
@@ -3592,7 +3714,6 @@ fn tunnel_definition_matches(left: &Value, right: &Value) -> bool {
     [
         "kind",
         "tunnelId",
-        "workspaceSessionId",
         "sshHost",
         "direction",
         "source",
@@ -3635,6 +3756,7 @@ fn tunnel_view(record: &crate::process::ProcessRecord, reused: bool) -> Value {
     json!({
         "id": record.metadata.get("tunnelId"),
         "workspaceSessionId": record.metadata.get("workspaceSessionId"),
+        "sessionRef": record.metadata.get("sessionRef"),
         "sshHost": record.metadata.get("sshHost"),
         "direction": record.metadata.get("direction"),
         "source": record.metadata.get("source"),
@@ -4660,15 +4782,13 @@ mod tests {
                 .enforce_authority("clipboard.write", &json!({}))
                 .unwrap_err()
                 .code,
-            "EXECUTOR_AUTHORITY_REQUIRED"
+            "RESOURCE_LEASE_REQUIRED"
         );
         assert!(
             runtime
                 .enforce_authority(
                     "clipboard.write",
-                    &json!({"_authority":[{
-                        "controllerId":"sender","resource":"clipboard:clipboard-test","fence":1
-                    }]})
+                    &json!({"_resourceLeases":[{"resource":"clipboard:clipboard-test", "owner":"sender", "token":"validated-at-operation-boundary"}]})
                 )
                 .is_ok()
         );
@@ -5136,7 +5256,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_fences_reject_stale_and_conflicting_controllers() {
+    fn persistent_driver_fences_are_scoped_to_the_owning_controller() {
         let directory = tempfile::tempdir().unwrap();
         let state = directory.path().join("fences.json");
         let path = directory.path().join("fenced.txt");
@@ -5159,7 +5279,8 @@ mod tests {
 
         let runtime =
             ExecutorRuntime::open("local", vec![directory.path().to_path_buf()], state).unwrap();
-        for (controller, fence) in [("controller-a", 1), ("controller-b", 2)] {
+        {
+            let (controller, fence) = ("controller-a", 1);
             let rejected = runtime.handle(Request::new(
                 "filesystem.write",
                 json!({"path": path, "content": "stale", "_workspaceSessionId":"test", "_authority": authority(controller, fence)}),

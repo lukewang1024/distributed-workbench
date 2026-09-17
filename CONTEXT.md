@@ -24,3 +24,11 @@ _Avoid_: Core release
 
 **Desktop maintenance**: A temporary hold on new desktop ownership while existing ownership is allowed to finish.
 _Avoid_: Desktop quarantine
+
+**Workspace session**: One task context with a permanent home Controller. Its identity is the pair of Controller ID and session ID.
+
+**Session driver**: The Agent currently entitled to advance a workspace session. This ownership does not confer exclusive access to shared machine resources.
+
+**Resource owner**: The holder of a grant issued by the Executor responsible for a physical resource. Requests from all Controllers share that Executor’s arbitration.
+
+**Session reference**: An explicit pair identifying a session and its home Controller; execution placement does not change this reference.
