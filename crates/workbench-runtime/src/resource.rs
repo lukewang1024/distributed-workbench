@@ -109,6 +109,20 @@ impl Resources {
         Ok(())
     }
     pub fn command(&mut self, action: &str, params: &Value) -> Result<Value, RpcError> {
+        if action == "resource.lease.list" {
+            let prefix = params.get("prefix").and_then(Value::as_str).unwrap_or("");
+            let leases: Vec<_> = self
+                .table
+                .snapshot()
+                .into_iter()
+                .filter(|l| l.resource.starts_with(prefix))
+                .map(|mut l| {
+                    l.token.clear();
+                    l
+                })
+                .collect();
+            return Ok(json!(leases));
+        }
         let resource = string(params, "resource")?;
         if action == "resource.lease.status" {
             let mut lease = self.table.get(resource).cloned();

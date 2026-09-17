@@ -348,7 +348,7 @@ impl ExecutorRuntime {
             .execution
             .try_acquire(execution_class(&request.action, &request.params));
         let result = match permit {
-            Ok(_permit) => self.resource_dispatch(&request.action, request.params),
+            Ok(_permit) => self.desktop_dispatch(&request.action, request.params),
             Err(error) => Err(error),
         };
         let response = match result {
@@ -491,7 +491,8 @@ impl ExecutorRuntime {
         }
         if canonical == "tunnel.ensure" {
             resources.push(format!(
-                "tunnel-bind-port:{}",
+                "port:{}:{}",
+                self.id,
                 required_port(&params, "bindPort")?
             ));
         }
@@ -501,7 +502,8 @@ impl ExecutorRuntime {
             .cloned()
             .unwrap_or_default();
         let _permit = crate::resource::Resources::begin(&self.resources, resources, &grants)?;
-        self.desktop_dispatch(action, params)
+        self.enforce_authority(action, &params)
+            .and_then(|()| self.dispatch(action, params))
     }
 
     fn desktop_dispatch(&self, action: &str, mut params: Value) -> Result<Value, RpcError> {
@@ -523,9 +525,7 @@ impl ExecutorRuntime {
             return Ok(result);
         }
         if !crate::desktop::protected(action) {
-            return self
-                .enforce_authority(action, &params)
-                .and_then(|()| self.dispatch(action, params));
+            return self.resource_dispatch(action, params);
         }
         self.reconcile_desktop()?;
         let _gate = self.desktop_execution.lock().expect("desktop execution");
@@ -538,8 +538,7 @@ impl ExecutorRuntime {
         let result = if action == "computer-use.call" {
             self.dispatch(action, params)
         } else {
-            self.enforce_authority(action, &params)
-                .and_then(|()| self.dispatch(action, params))
+            self.resource_dispatch(action, params)
         };
         let uncertain = result.as_ref().is_err_and(|e| {
             let message = e.message.to_ascii_lowercase();
@@ -1657,7 +1656,17 @@ impl ExecutorRuntime {
                     .get("port")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| RpcError::new("INVALID_PARAMS", "port is required"))?;
-                let available = std::net::TcpListener::bind(("127.0.0.1", port as u16)).is_ok();
+                if !(1..=65535).contains(&port) {
+                    return Err(RpcError::new("INVALID_PARAMS", "invalid port"));
+                }
+                let reserved = self.processes.list().iter().any(|record| {
+                    record.metadata["kind"] == "tunnel"
+                        && record.metadata["desiredState"] == "running"
+                        && record.metadata["direction"] == "local-forward"
+                        && record.metadata["source"]["port"].as_u64() == Some(port)
+                });
+                let available =
+                    !reserved && std::net::TcpListener::bind(("127.0.0.1", port as u16)).is_ok();
                 Ok(json!({"port": port, "available": available}))
             }
             "application.materialize" => {
@@ -2049,6 +2058,7 @@ impl ExecutorRuntime {
             "kind": "tunnel", "tunnelId": tunnel_id,
             "workspaceSessionId": params.get("_workspaceSessionId").or_else(|| params.get("workspaceSessionId")),
             "sessionRef": params.get("_sessionRef"),
+            "profile": params.pointer("/_sessionLabels/profile"),
             "sshHost": ssh_host, "direction": direction,
             "source": {"host": bind_host, "port": bind_port},
             "destination": {"host": target_host, "port": target_port},
@@ -3757,6 +3767,7 @@ fn tunnel_view(record: &crate::process::ProcessRecord, reused: bool) -> Value {
         "id": record.metadata.get("tunnelId"),
         "workspaceSessionId": record.metadata.get("workspaceSessionId"),
         "sessionRef": record.metadata.get("sessionRef"),
+        "profile": record.metadata.get("profile"),
         "sshHost": record.metadata.get("sshHost"),
         "direction": record.metadata.get("direction"),
         "source": record.metadata.get("source"),

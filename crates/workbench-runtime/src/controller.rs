@@ -331,11 +331,27 @@ impl Controller {
             if let Some(owner) = params.get("owner").and_then(Value::as_str) {
                 forwarded["owner"] = json!(self.resource_owner(owner));
             }
-            return self.call_registered_executor(
+            let mut result = self.call_registered_executor(
                 &executor_id,
                 &format!("resource.{action}"),
                 forwarded,
-            );
+            )?;
+            if result.get("resource").is_some() && params.get("owner").is_some() {
+                result["owner"] = params["owner"].clone();
+                result["controllerId"] = json!(self.id);
+            }
+            return Ok(result);
+        }
+        if action.starts_with("lease.")
+            && params
+                .get("resource")
+                .and_then(Value::as_str)
+                .is_none_or(|r| !r.starts_with("workspace:"))
+        {
+            return Err(RpcError::new(
+                "RESOURCE_EXECUTOR_REQUIRED",
+                "resource leases require a registered executorId",
+            ));
         }
         if let Some(routed) = self.route_session_action(action, &params)? {
             return Ok(routed);
@@ -2914,19 +2930,33 @@ impl Controller {
                 self.observe_task_state(&task);
                 Ok(serde_json::to_value(task).expect("task serializes"))
             }
-            "port.list" => Ok(serde_json::to_value(
-                self.leases
-                    .lock()
-                    .expect("lease lock")
-                    .snapshot()
-                    .into_iter()
-                    .filter(|lease| lease.resource.starts_with("port:"))
-                    .collect::<Vec<_>>(),
-            )
-            .expect("port leases serialize")),
+            "port.list" => {
+                let executors = self.state.lock().expect("state lock").executors.clone();
+                let mut leases = Vec::new();
+                for executor in executors
+                    .iter()
+                    .filter(|e| e.capabilities.iter().any(|c| c.name == "port.check"))
+                {
+                    if params
+                        .get("executorId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id != executor.metadata.id)
+                    {
+                        continue;
+                    }
+                    let value = self.call_registered_executor(
+                        &executor.metadata.id,
+                        "resource.lease.list",
+                        json!({"prefix":"port:"}),
+                    )?;
+                    leases.extend(value.as_array().cloned().unwrap_or_default());
+                }
+                Ok(json!(leases))
+            }
             "port.allocate" => {
                 let executor_id = required_str(&params, "executorId")?;
                 let owner = required_str(&params, "owner")?;
+                let qualified_owner = self.resource_owner(owner);
                 let start = params
                     .get("start")
                     .and_then(Value::as_u64)
@@ -2935,50 +2965,34 @@ impl Controller {
                 if start == 0 || end > 65_535 || start > end {
                     return Err(RpcError::new("INVALID_PARAMS", "invalid port range"));
                 }
-                let executor = self
-                    .state
-                    .lock()
-                    .expect("state lock")
-                    .executors
-                    .iter()
-                    .find(|executor| executor.metadata.id == executor_id)
-                    .cloned()
-                    .ok_or_else(|| RpcError::new("EXECUTOR_NOT_FOUND", "executor not found"))?;
                 for port in start..=end {
                     let resource = format!("port:{executor_id}:{port}");
-                    let lease = match self.leases.lock().expect("lease lock").acquire(
-                        LeaseKind::Resource,
-                        &resource,
-                        owner,
-                        params
-                            .get("ttlMs")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(300_000),
-                    ) {
+                    let mut lease = match self.call_registered_executor(executor_id, "resource.lease.acquire", json!({"resource":resource,"owner":qualified_owner,"ttlMs":params.get("ttlMs").and_then(Value::as_u64).unwrap_or(300_000)})) {
                         Ok(lease) => lease,
-                        Err(LeaseError::Active { .. }) => continue,
-                        Err(error) => return Err(map_lease_error(error)),
+                        Err(error) if error.code == "RESOURCE_BUSY" => continue,
+                        Err(error) => return Err(error),
                     };
-                    let response = call_executor(
-                        &executor.endpoint,
-                        &traced_request("port.check", json!({"port": port})),
+                    let checked = self.call_registered_executor(
+                        executor_id,
+                        "port.check",
+                        json!({"port":port}),
                     );
-                    let available = response
+                    if checked
+                        .as_ref()
                         .ok()
-                        .and_then(|response| response.result)
-                        .and_then(|result| result.get("available").and_then(Value::as_bool))
-                        .unwrap_or(false);
-                    if available {
-                        self.persist()?;
-                        return Ok(
-                            json!({"executorId": executor_id, "port": port, "lease": lease}),
-                        );
+                        .and_then(|v| v.get("available"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        lease["owner"] = json!(owner);
+                        return Ok(json!({"executorId":executor_id,"port":port,"lease":lease}));
                     }
-                    let _ = self.leases.lock().expect("lease lock").release(
-                        &resource,
-                        owner,
-                        &lease.token,
+                    let _ = self.call_registered_executor(
+                        executor_id,
+                        "resource.lease.release",
+                        json!({"resource":resource,"owner":qualified_owner,"token":lease["token"]}),
                     );
+                    checked?;
                 }
                 Err(RpcError::new(
                     "PORT_UNAVAILABLE",
@@ -2988,11 +3002,11 @@ impl Controller {
             "transaction.begin" => {
                 let idempotency_key = required_str(&params, "idempotencyKey")?;
                 let mut state = self.state.lock().expect("state lock");
-                if let Some(existing) = state
-                    .transactions
-                    .iter()
-                    .find(|transaction| transaction.idempotency_key == idempotency_key)
-                {
+                if let Some(existing) = state.transactions.iter().find(|transaction| {
+                    transaction.idempotency_key == idempotency_key
+                        && params.get("workspaceSessionId").and_then(Value::as_str)
+                            == Some(transaction.workspace_session_id.as_str())
+                }) {
                     return Ok(json!({"transaction": existing, "reused": true}));
                 }
                 let now = now_ms();
@@ -3827,7 +3841,10 @@ impl Controller {
         }
         let resource = params.get("resource")?.as_str()?;
         let (kind, tail) = resource.split_once(':')?;
-        if !matches!(kind, "tunnel" | "runtime" | "acceptance" | "clipboard") {
+        if !matches!(
+            kind,
+            "tunnel" | "runtime" | "acceptance" | "clipboard" | "port"
+        ) {
             return None;
         }
         self.state
@@ -5700,6 +5717,16 @@ mod tests {
         assert!(a.handle(Request::new("lease.release", release.clone())).ok);
         assert!(b.handle(Request::new("lease.acquire", request)).ok);
         assert!(!a.handle(Request::new("lease.release", release)).ok);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let allocation = json!({"executorId":"shared","owner":"agent","start":port,"end":port});
+        let first = a.handle(Request::new("port.allocate", allocation.clone()));
+        assert!(first.ok, "{first:?}");
+        let conflict = b.handle(Request::new("port.allocate", allocation));
+        assert_eq!(conflict.error.unwrap().code, "PORT_UNAVAILABLE");
+        let lease = first.result.unwrap()["lease"].clone();
+        assert!(a.handle(Request::new("lease.release", json!({"executorId":"shared","resource":lease["resource"],"owner":"agent","token":lease["token"]}))).ok);
     }
 
     #[test]
@@ -5765,7 +5792,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_order_requires_release_between_publish_phases() {
+    fn unaddressed_resource_lease_cannot_be_issued_by_the_local_controller() {
         let directory = tempfile::tempdir().unwrap();
         let controller =
             Controller::open(JsonStore::new(directory.path().join("controller.json"))).unwrap();
@@ -5785,34 +5812,7 @@ mod tests {
                 "resource":"runtime:mac:doubao", "owner":"publisher", "ttlMs":60000
             }),
         ));
-        assert_eq!(runtime.error.unwrap().code, "LEASE_ORDER_VIOLATION");
-    }
-
-    #[test]
-    fn unrelated_resource_lease_does_not_block_runtime_lease() {
-        let directory = tempfile::tempdir().unwrap();
-        let controller =
-            Controller::open(JsonStore::new(directory.path().join("controller.json"))).unwrap();
-        assert!(
-            controller
-                .handle(Request::new(
-                    "lease.acquire",
-                    json!({
-                        "resource":"datapack:C:/staging/app.pak", "owner":"publisher", "ttlMs":60000
-                    })
-                ))
-                .ok
-        );
-        let runtime = controller.handle(Request::new(
-            "lease.acquire",
-            json!({
-                "resource":"runtime:windows:doubao", "owner":"publisher", "ttlMs":60000
-            }),
-        ));
-        assert!(
-            runtime.ok,
-            "unranked resource leases must not participate in publish lease ordering"
-        );
+        assert_eq!(runtime.error.unwrap().code, "RESOURCE_EXECUTOR_REQUIRED");
     }
 
     #[test]
