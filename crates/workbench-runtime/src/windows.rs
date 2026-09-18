@@ -22,12 +22,17 @@ use windows_sys::Win32::{
             WTSEnumerateSessionsW, WTSFreeMemory, WTSQueryUserToken,
         },
         Threading::{
-            CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW, PROCESS_INFORMATION, STARTUPINFOW,
+            CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
+            PROCESS_INFORMATION, STARTUPINFOW,
         },
     },
 };
 use workbench_core::now_ms;
 use workbench_protocol::RpcError;
+
+const INTERACTIVE_PROCESS_CREATION_FLAGS: u32 = CREATE_UNICODE_ENVIRONMENT;
+const HIDDEN_INTERACTIVE_PROCESS_CREATION_FLAGS: u32 =
+    CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
 
 pub fn inspect(application: &Path) -> Result<Value, RpcError> {
     let executable = find_executable(application).ok_or_else(|| {
@@ -440,6 +445,32 @@ pub(crate) fn spawn_in_active_session(
     args: &[String],
     cwd: &Path,
 ) -> Result<u32, RpcError> {
+    spawn_in_active_session_with_flags(executable, args, cwd, INTERACTIVE_PROCESS_CREATION_FLAGS)
+}
+
+// Console-subsystem helpers must run in the user's interactive session without
+// creating a visible terminal over the application being tested. Keep this
+// separate from product application launches so their window semantics remain
+// unchanged.
+pub(crate) fn spawn_hidden_in_active_session(
+    executable: &Path,
+    args: &[String],
+    cwd: &Path,
+) -> Result<u32, RpcError> {
+    spawn_in_active_session_with_flags(
+        executable,
+        args,
+        cwd,
+        HIDDEN_INTERACTIVE_PROCESS_CREATION_FLAGS,
+    )
+}
+
+fn spawn_in_active_session_with_flags(
+    executable: &Path,
+    args: &[String],
+    cwd: &Path,
+    creation_flags: u32,
+) -> Result<u32, RpcError> {
     let mut sessions = std::ptr::null_mut::<WTS_SESSION_INFOW>();
     let mut count = 0_u32;
     let enumerated = unsafe {
@@ -538,7 +569,7 @@ pub(crate) fn spawn_in_active_session(
             std::ptr::null(),
             std::ptr::null(),
             0,
-            CREATE_UNICODE_ENVIRONMENT,
+            creation_flags,
             environment,
             cwd.as_ptr(),
             &startup,
@@ -1311,6 +1342,19 @@ fn find_directory(root: &Path, name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_hidden_interactive_processes_suppress_console_windows() {
+        assert_eq!(INTERACTIVE_PROCESS_CREATION_FLAGS & CREATE_NO_WINDOW, 0);
+        assert_ne!(
+            HIDDEN_INTERACTIVE_PROCESS_CREATION_FLAGS & CREATE_NO_WINDOW,
+            0
+        );
+        assert_ne!(
+            HIDDEN_INTERACTIVE_PROCESS_CREATION_FLAGS & CREATE_UNICODE_ENVIRONMENT,
+            0
+        );
+    }
 
     #[test]
     fn native_process_arguments_preserve_paths_without_verbatim_prefixes() {

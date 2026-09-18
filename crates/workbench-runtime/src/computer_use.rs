@@ -255,7 +255,7 @@ impl Host {
         ];
         #[cfg(windows)]
         let spawned: Result<Option<Child>, RpcError> =
-            crate::windows::spawn_in_active_session(&node, &args, &root).map(|_| None);
+            crate::windows::spawn_hidden_in_active_session(&node, &args, &root).map(|_| None);
         #[cfg(not(windows))]
         let spawned = Command::new(&node)
             .args(&args)
