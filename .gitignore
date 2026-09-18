@@ -10,3 +10,5 @@
 /computer-use/NODE-LICENSE
 
 /computer-use/host-release.json
+
+__pycache__/

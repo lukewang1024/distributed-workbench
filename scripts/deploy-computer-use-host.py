@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -18,14 +19,16 @@ COMPUTER_USE_ENVIRONMENT_KEYS = {
     'DISPLAY', 'XAUTHORITY', 'DBUS_SESSION_BUS_ADDRESS', 'AT_SPI_BUS_ADDRESS',
     'XDG_RUNTIME_DIR', 'PI_COMPUTER_USE_HEADLESS',
 }
+POWERSHELL_STDIN = '& ([scriptblock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd()))))'
 
 def run(command, **kwargs):
     return subprocess.run(command, check=True, text=True, **kwargs)
 
 def desired_environment(node):
-    if 'computerUseEnvironment' not in node:
+    desktop = desired_desktop(node)
+    if 'computerUseEnvironment' not in node and not (desktop and desktop['enabled']):
         return None
-    environment = node['computerUseEnvironment']
+    environment = dict(node.get('computerUseEnvironment') or {})
     if not isinstance(environment, dict) or set(environment) - COMPUTER_USE_ENVIRONMENT_KEYS:
         raise ValueError(f"invalid computerUseEnvironment on {node['id']}")
     if any(not isinstance(value, str) for value in environment.values()):
@@ -33,7 +36,84 @@ def desired_environment(node):
     headless = environment.get('PI_COMPUTER_USE_HEADLESS')
     if headless is not None and headless not in {'true', 'false'}:
         raise ValueError(f"PI_COMPUTER_USE_HEADLESS must be 'true' or 'false' on {node['id']}")
+    if desktop and desktop['enabled']:
+        if headless == 'true':
+            raise ValueError('windowsDesktop requires headless=false')
+        environment['PI_COMPUTER_USE_HEADLESS'] = 'false'
     return environment
+
+def desired_desktop(node):
+    policy = node.get('windowsDesktop')
+    if policy is None:
+        return None
+    if (node.get('platform') != 'windows' or not isinstance(policy, dict)
+            or set(policy) - {'enabled', 'user'} or type(policy.get('enabled')) is not bool):
+        raise ValueError('windowsDesktop requires a Windows node and boolean enabled')
+    user = policy.get('user')
+    if policy['enabled'] and (not isinstance(user, str) or not user.strip()):
+        raise ValueError('windowsDesktop requires an explicit user')
+    if not re.fullmatch(r'[A-Za-z0-9._-]+', node['id']):
+        raise ValueError('invalid desktop node id')
+    return policy
+
+def desktop_command(node, verify=False):
+    policy = desired_desktop(node)
+    if policy is None:
+        return None
+    # Use the same deterministic deployment transport as the CU host. No new
+    # remote service, password or product-specific state is introduced.
+    runtime = base64.b64encode((ROOT / 'scripts/windows-cu-console.ps1').read_bytes()).decode()
+    installer = (ROOT / 'scripts/install-windows-desktop.ps1').read_text()
+    quote = lambda value: "'" + value.replace("'", "''") + "'"
+    command = '& {\n' + installer + '\n} -NodeId ' + quote(node['id'])
+    command += ' -RuntimeBase64 ' + quote(runtime)
+    if policy['enabled']:
+        command += ' -User ' + quote(policy['user'])
+    else:
+        command += ' -Disable'
+    if verify:
+        command += ' -VerifyOnly'
+    return command
+
+def powershell_node(node, initiator, command):
+    encoded = base64.b64encode(command.encode('utf-16le')).decode()
+    if node['id'] == initiator:
+        return run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', POWERSHELL_STDIN], input=encoded)
+    alias = node['connection']['sshAlias']
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', alias):
+        raise ValueError('invalid SSH alias')
+    return run(['ssh', '-o', 'BatchMode=yes', '-o', 'ClearAllForwardings=yes', alias,
+                'powershell.exe -NoProfile -NonInteractive -Command "' + POWERSHELL_STDIN + '"'], input=encoded)
+
+def deploy_desktop(binary, node, initiator, verify=False):
+    command = desktop_command(node, verify)
+    if command is None:
+        return
+    executor = node['id'] + '-native'
+    reply = json.loads(subprocess.check_output([binary, 'call', 'executor.call', json.dumps({
+        'executorId':executor, 'action':'status', 'params':{}})], text=True))
+    state = reply.get('result', {}).get('computerUseStateRoot')
+    if not reply.get('ok') or not state:
+        raise RuntimeError('Windows CU Executor is not ready')
+    if desired_desktop(node)['enabled']:
+        desired_environment(node)  # Reject conflicting headless policy first.
+        quoted = "'" + state.replace("'", "''") + "'"
+        environment = "$ErrorActionPreference='Stop'; $path=Join-Path " + quoted + " 'environment.json'; "
+        environment += "$envMap=@{}; if(Test-Path $path){$v=Get-Content -Raw $path | ConvertFrom-Json; $v.PSObject.Properties | ForEach-Object {$envMap[$_.Name]=$_.Value}}; "
+        if verify:
+            environment += "if($envMap['PI_COMPUTER_USE_HEADLESS'] -ne 'false'){throw 'CU headless policy drift'}; "
+        else:
+            environment += "$envMap['PI_COMPUTER_USE_HEADLESS']='false'; $tmp=$path+'.tmp-'+[guid]::NewGuid().ToString('N'); [IO.File]::WriteAllText($tmp,($envMap|ConvertTo-Json -Compress)); Move-Item -Force $tmp $path; "
+        # Apply the environment only after the installer succeeds (bad accounts
+        # must not change the host). Verify it before reporting configuration.
+        if verify:
+            powershell_node(node, initiator, environment)
+            powershell_node(node, initiator, command)
+        else:
+            powershell_node(node, initiator, command)
+            powershell_node(node, initiator, environment)
+    else:
+        powershell_node(node, initiator, command)
 
 def environment_content(node):
     environment = desired_environment(node)
@@ -72,6 +152,9 @@ def deploy_node(binary, node, initiator, artifact, digest, verify=False):
     if verify and selected != digest:
         raise RuntimeError(f'CU host selection drift on {executor}: {selected!r}')
     if node['id'] == initiator:
+        desktop = desktop_command(node, verify)
+        if desktop:
+            powershell_node(node, initiator, desktop)
         if verify:
             local_environment(state, node, True)
             print(json.dumps({'node':node['id'], 'hostArtifactDigest':selected,
@@ -95,10 +178,14 @@ def deploy_node(binary, node, initiator, artifact, digest, verify=False):
     ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'ClearAllForwardings=yes', alias]
     def remote(command):
         if windows:
-            encoded = base64.b64encode(command.encode('utf-16le')).decode()
-            return run(ssh + ['powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + encoded])
+            # The installer is larger than Windows' command-line limit. Send
+            # ASCII payload on stdin, never interpolate its contents in a shell.
+            return powershell_node(node, initiator, command)
         return run(ssh + [command])
     expected_environment = environment_content(node)
+    desktop = desktop_command(node, verify)
+    if desktop:
+        remote(desktop)
     if verify:
         if expected_environment is not None:
             encoded = base64.b64encode(expected_environment.encode()).decode()
@@ -166,13 +253,26 @@ def deploy_node(binary, node, initiator, artifact, digest, verify=False):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--file', required=True)
+    target = parser.add_mutually_exclusive_group(required=True)
+    target.add_argument('--file')
+    target.add_argument('--desktop-node-json', help='One already registered Windows node; policy-only reconciliation')
+    parser.add_argument('--local-node', action='store_true')
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--artifact', type=Path)
     source.add_argument('--url')
     parser.add_argument('--verify-only', action='store_true')
-    parser.add_argument('--sha256', required=True)
+    parser.add_argument('--sha256')
     args = parser.parse_args()
+    binary = os.environ.get('DISTRIBUTED_WORKBENCH_BINARY', 'workbench')
+    desktop_only = args.desktop_node_json is not None
+    if desktop_only:
+        node = json.loads(args.desktop_node_json)
+        if desired_desktop(node) is None:
+            parser.error('desktop-node-json needs windowsDesktop')
+        desired_environment(node)
+        manifest = {'nodes':[node], 'initiatorNode':node['id'] if args.local_node else ''}
+    elif not args.sha256:
+        parser.error('--sha256 is required for host installation')
     if not args.verify_only and args.url:
         cache = Path(os.environ.get('XDG_CACHE_HOME', Path.home() / '.cache')) / 'distributed-workbench' / 'cu-host-artifacts'
         cache.mkdir(parents=True, exist_ok=True)
@@ -185,13 +285,19 @@ def main():
             if len(content) > 2 * 1024 * 1024 or hashlib.sha256(content).hexdigest() != args.sha256:
                 raise ValueError('invalid host artifact download')
             args.artifact.write_bytes(content)
-    if not args.verify_only and (args.artifact is None or hashlib.sha256(args.artifact.read_bytes()).hexdigest() != args.sha256):
+    if not desktop_only and not args.verify_only and (args.artifact is None or hashlib.sha256(args.artifact.read_bytes()).hexdigest() != args.sha256):
         raise ValueError('CU host artifact SHA-256 mismatch')
-    binary = os.environ.get('DISTRIBUTED_WORKBENCH_BINARY', 'workbench')
-    manifest = json.loads(subprocess.check_output([binary, 'fabric', 'validate', '--file', args.file], text=True))
+    if not desktop_only:
+        manifest = json.loads(subprocess.check_output([binary, 'fabric', 'validate', '--file', args.file], text=True))
+    # Validate every desktop policy before the first node mutation.
+    for node in manifest['nodes']:
+        desired_environment(node)
     for node in manifest['nodes']:
         if args.verify_only:
-            deploy_node(binary, node, manifest['initiatorNode'], None, args.sha256, True)
+            if desktop_only:
+                deploy_desktop(binary, node, manifest['initiatorNode'], True)
+            else:
+                deploy_node(binary, node, manifest['initiatorNode'], None, args.sha256, True)
             continue
         executor = node['id'] + ('-native' if node['platform'] == 'windows' else '-rust')
         owner = 'host-upgrade-' + uuid.uuid4().hex
@@ -208,7 +314,10 @@ def main():
                 if time.monotonic() >= deadline:
                     raise RuntimeError(f'{executor} did not drain; no host selection changed')
                 time.sleep(1)
-            deploy_node(binary, node, manifest['initiatorNode'], args.artifact.resolve(), args.sha256)
+            if desktop_only:
+                deploy_desktop(binary, node, manifest['initiatorNode'])
+            else:
+                deploy_node(binary, node, manifest['initiatorNode'], args.artifact.resolve(), args.sha256)
         finally:
             maintenance(False)
 

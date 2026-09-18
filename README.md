@@ -413,3 +413,29 @@ A package manifest identifies `packageId` separately from `version`; platform su
 are valid. An updater instance refuses a manifest or verified record for another
 package. Existing private manifests/records can be admitted only through an explicit
 legacy-identity policy during migration.
+
+### Windows CU desktop after RDP disconnect
+
+A selected Windows node may declare `windowsDesktop: {enabled: true, user: 'DESKTOP\tester'}`.
+The CU host deployer installs a namespaced SYSTEM task and protected runtime under
+ProgramData, and sets `PI_COMPUTER_USE_HEADLESS` to `"false"`. Explicit `"true"`
+conflicts fail before deployment. One interactive login is required. Subsequent RDP
+disconnects transfer that user's existing session to the console. No password,
+autologon, startup trigger or workstation unlock is installed. An active user session
+prevents transfer. Reboot, logoff, sleep and lock require an interactive desktop to
+be established again. A small state-check/transfer race remains; use dedicated
+acceptance desktops, not multi-user servers.
+
+`deploy-computer-use-host.py --verify-only` checks the task, SID, script SHA-256,
+protected ACLs and environment without changes. It reports `waiting-for-first-login`
+or `session-active-input-unverified`: configuration health is not screenshot/input
+acceptance. `enabled: false` disables the managed task; omission leaves it unmanaged.
+Reapplying updates the existing task instead of adding duplicates. Reapply the
+previous immutable release and declaration to roll back. Installation does not
+immediately transfer any session.
+
+For a provisioned node, the same deployer supports
+`--desktop-node-json '{"id":"win","platform":"windows","connection":{"sshAlias":"win"},"windowsDesktop":{"enabled":true,"user":"tester"}}'`
+(and `--verify-only`). It uses the existing Controller and bootstrap transport,
+drains the desktop before configuration, and does not replace core services.
+Use `--local-node` only when running on that Windows node itself.

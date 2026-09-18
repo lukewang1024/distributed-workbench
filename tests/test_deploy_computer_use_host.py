@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts/deploy-computer-use-host.py"
@@ -12,6 +13,28 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ComputerUseEnvironmentTests(unittest.TestCase):
+    def test_desktop_policy_requires_explicit_windows_user_and_foreground(self):
+        node = {'id':'test', 'platform':'windows', 'windowsDesktop':{'enabled':True,'user':'tester'}}
+        self.assertEqual(MODULE.desired_environment(node), {'PI_COMPUTER_USE_HEADLESS':'false'})
+        for bad in [dict(node, platform='linux'), dict(node, windowsDesktop={'enabled':True}),
+                    dict(node, computerUseEnvironment={'PI_COMPUTER_USE_HEADLESS':'true'}),
+                    dict(node, windowsDesktop={'enabled':'true','user':'tester'})]:
+            with self.assertRaises(ValueError):
+                MODULE.desired_environment(bad)
+
+    def test_disabled_and_unmanaged_do_not_force_environment(self):
+        node = {'id':'test','platform':'windows','windowsDesktop':{'enabled':False}}
+        self.assertIsNone(MODULE.desired_environment(node))
+        self.assertIn('-Disable -VerifyOnly', MODULE.desktop_command(node, True))
+        self.assertIsNone(MODULE.desktop_command({'id':'test'}))
+
+    def test_payload_is_stdin_not_a_windows_command_line(self):
+        node = {'id':'test','connection':{'sshAlias':'test-host'}}
+        with mock.patch.object(MODULE, 'run') as run:
+            MODULE.powershell_node(node, '', 'x'*50000)
+        self.assertLess(len(' '.join(run.call_args.args[0])), 1000)
+        self.assertGreater(len(run.call_args.kwargs['input']), 50000)
+
     def test_environment_content_is_stable_and_string_typed(self):
         node = {
             "id": "windows",

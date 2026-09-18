@@ -277,6 +277,16 @@ struct FabricNode {
     allow_roots: Vec<String>,
     #[serde(default)]
     computer_use_environment: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows_desktop: Option<WindowsDesktop>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WindowsDesktop {
+    enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1785,6 +1795,27 @@ fn load_fabric_manifest(path: &Path) -> Result<FabricManifest> {
     let mut identities = HashSet::new();
     for node in &manifest.nodes {
         validate_identity(&node.id)?;
+        if let Some(desktop) = &node.windows_desktop {
+            if !matches!(node.platform, FabricPlatform::Windows) {
+                bail!("windowsDesktop is only valid on Windows nodes");
+            }
+            if desktop.enabled {
+                if desktop
+                    .user
+                    .as_deref()
+                    .is_none_or(|user| user.trim().is_empty())
+                {
+                    bail!("windowsDesktop needs an explicit user");
+                }
+                if node
+                    .computer_use_environment
+                    .get("PI_COMPUTER_USE_HEADLESS")
+                    .is_some_and(|value| value == "true")
+                {
+                    bail!("windowsDesktop requires headless=false");
+                }
+            }
+        }
         if !identities.insert(node.id.as_str()) {
             bail!("duplicate node id: {}", node.id);
         }
@@ -2128,6 +2159,9 @@ nodes:
     allowRoots: ["C:/Users"]
     computerUseEnvironment:
       PI_COMPUTER_USE_HEADLESS: "false"
+    windowsDesktop:
+      enabled: true
+      user: "desktop-test-user"
 topology: {mode: full-mesh}
 "#,
         )
@@ -2139,6 +2173,9 @@ topology: {mode: full-mesh}
                 .map(String::as_str),
             Some("false")
         );
+        let desktop = manifest.nodes[0].windows_desktop.as_ref().unwrap();
+        assert!(desktop.enabled);
+        assert_eq!(desktop.user.as_deref(), Some("desktop-test-user"));
     }
 
     #[test]
