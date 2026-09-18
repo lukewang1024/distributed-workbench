@@ -60,7 +60,7 @@ removes queued work or drains active work; `close` finishes the whole session.
 An active session expires after 15 minutes by default; renew before expiry.
 Queued time does not consume its TTL. TTL must be 1 second to 1 hour.
 
-All Controllers, including CloudIDE submitters, route to the same target queue.
+All Controllers, including headless development nodes, route to the same target queue.
 The queue owns an entire acceptance session, not individual clicks. Activation,
 observations, actions, screenshots and cleanup belong inside that session. Every
 new session gets a unique identity and increasing epoch, invalidating prior refs.
