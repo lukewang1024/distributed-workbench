@@ -14,9 +14,50 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
+COMPUTER_USE_ENVIRONMENT_KEYS = {
+    'DISPLAY', 'XAUTHORITY', 'DBUS_SESSION_BUS_ADDRESS', 'AT_SPI_BUS_ADDRESS',
+    'XDG_RUNTIME_DIR', 'PI_COMPUTER_USE_HEADLESS',
+}
 
 def run(command, **kwargs):
     return subprocess.run(command, check=True, text=True, **kwargs)
+
+def desired_environment(node):
+    if 'computerUseEnvironment' not in node:
+        return None
+    environment = node['computerUseEnvironment']
+    if not isinstance(environment, dict) or set(environment) - COMPUTER_USE_ENVIRONMENT_KEYS:
+        raise ValueError(f"invalid computerUseEnvironment on {node['id']}")
+    if any(not isinstance(value, str) for value in environment.values()):
+        raise ValueError(f"computerUseEnvironment values must be strings on {node['id']}")
+    headless = environment.get('PI_COMPUTER_USE_HEADLESS')
+    if headless is not None and headless not in {'true', 'false'}:
+        raise ValueError(f"PI_COMPUTER_USE_HEADLESS must be 'true' or 'false' on {node['id']}")
+    return environment
+
+def environment_content(node):
+    environment = desired_environment(node)
+    return None if environment is None else json.dumps(
+        environment, sort_keys=True, separators=(',', ':')) + '\n'
+
+def local_environment(state, node, verify):
+    expected = desired_environment(node)
+    if expected is None:
+        return
+    path = Path(state) / 'environment.json'
+    if verify:
+        try:
+            actual = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise RuntimeError(f"CU environment drift on {node['id']}: {error}") from error
+        if actual != expected:
+            raise RuntimeError(
+                f"CU environment drift on {node['id']}: expected {expected!r}, found {actual!r}")
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.tmp-' + uuid.uuid4().hex)
+    temporary.write_text(environment_content(node))
+    os.replace(temporary, path)
 
 def deploy_node(binary, node, initiator, artifact, digest, verify=False):
     executor = node['id'] + ('-native' if node['platform'] == 'windows' else '-rust')
@@ -24,19 +65,22 @@ def deploy_node(binary, node, initiator, artifact, digest, verify=False):
         'executorId': executor, 'action': 'status', 'params': {}})], text=True))
     if not reply.get('ok'):
         raise RuntimeError(f'cannot inspect {executor}')
-    if verify:
-        selected = reply['result'].get('computerUse', {}).get('selectedArtifactDigest')
-        if selected != digest:
-            raise RuntimeError(f'CU host selection drift on {executor}: {selected!r}')
-        print(json.dumps({'node':node['id'], 'hostArtifactDigest':selected}))
-        return
     state = reply['result'].get('computerUseStateRoot')
     if not state:
         raise RuntimeError(f'{executor} needs a core upgrade before independent host installation')
+    selected = reply['result'].get('computerUse', {}).get('selectedArtifactDigest')
+    if verify and selected != digest:
+        raise RuntimeError(f'CU host selection drift on {executor}: {selected!r}')
     if node['id'] == initiator:
+        if verify:
+            local_environment(state, node, True)
+            print(json.dumps({'node':node['id'], 'hostArtifactDigest':selected,
+                              'computerUseEnvironment':desired_environment(node)}))
+            return
         runtime = Path((Path(state) / 'runtime-root').read_text().strip())
         run([str(runtime / 'node'), str(ROOT / 'scripts/install-computer-use-host.mjs'),
              str(artifact), digest, state, str(runtime.parent.parent)])
+        local_environment(state, node, False)
         return
     alias = node['connection']['sshAlias']
     # Keep remote paths short for Windows PowerShell 5.1 and SCP compatibility.
@@ -50,6 +94,28 @@ def deploy_node(binary, node, initiator, artifact, digest, verify=False):
             encoded = base64.b64encode(command.encode('utf-16le')).decode()
             return run(ssh + ['powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + encoded])
         return run(ssh + [command])
+    expected_environment = environment_content(node)
+    if verify:
+        if expected_environment is not None:
+            encoded = base64.b64encode(expected_environment.encode()).decode()
+            if windows:
+                quoted_state = "'" + state.replace("'", "''") + "'"
+                command = ("$ErrorActionPreference='Stop'; $path=Join-Path " + quoted_state +
+                           " 'environment.json'; if (!(Test-Path $path)) { exit 44 }; "
+                           "$actual=[Convert]::ToBase64String([IO.File]::ReadAllBytes($path)); "
+                           f"if ($actual -ne '{encoded}') {{ exit 45 }}")
+            else:
+                path = shlex.quote(str(Path(state) / 'environment.json'))
+                command = (f"test -f {path} || exit 44; "
+                           f"actual=$(base64 < {path} | tr -d '\\n'); "
+                           f"test \"$actual\" = {shlex.quote(encoded)} || exit 45")
+            try:
+                remote(command)
+            except subprocess.CalledProcessError as error:
+                raise RuntimeError(f"CU environment drift on {executor} (exit {error.returncode})") from error
+        print(json.dumps({'node':node['id'], 'hostArtifactDigest':selected,
+                          'computerUseEnvironment':desired_environment(node)}))
+        return
     with tempfile.TemporaryDirectory(prefix='cu-host-stage-') as directory:
         stage = Path(directory) / stage_name
         (stage / 'scripts').mkdir(parents=True)
@@ -74,6 +140,20 @@ def deploy_node(binary, node, initiator, artifact, digest, verify=False):
                 remote('set -eu; state=' + shlex.quote(state) + '; runtime=$(cat "$state/runtime-root"); '
                        'data=$(dirname "$(dirname "$runtime")"); '
                        f'"$runtime/node" {staging}/scripts/install.mjs {staging}/artifact.json {digest} "$state" "$data"')
+            if expected_environment is not None:
+                encoded = base64.b64encode(expected_environment.encode()).decode()
+                if windows:
+                    quoted_state = "'" + state.replace("'", "''") + "'"
+                    remote("$ErrorActionPreference='Stop'; $state=" + quoted_state + "; "
+                           "$path=Join-Path $state 'environment.json'; "
+                           "$tmp=$path+'.tmp-'+[guid]::NewGuid().ToString('N'); "
+                           f"[IO.File]::WriteAllBytes($tmp,[Convert]::FromBase64String('{encoded}')); "
+                           "Move-Item -Force $tmp $path")
+                else:
+                    path = str(Path(state) / 'environment.json')
+                    temporary = path + '.tmp-' + uuid.uuid4().hex
+                    remote(f"printf %s {shlex.quote(encoded)} | base64 -d > {shlex.quote(temporary)}; "
+                           f"mv {shlex.quote(temporary)} {shlex.quote(path)}")
         finally:
             remote(f"Remove-Item -Recurse -Force '{staging}'" if windows else f'rm -rf {staging}')
 

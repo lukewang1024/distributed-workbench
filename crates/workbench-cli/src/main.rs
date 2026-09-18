@@ -275,6 +275,8 @@ struct FabricNode {
     #[serde(default)]
     connection: Option<FabricConnection>,
     allow_roots: Vec<String>,
+    #[serde(default)]
+    computer_use_environment: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -2096,6 +2098,7 @@ topology: {mode: full-mesh}
         )
         .unwrap();
         assert_eq!(manifest.nodes.len(), 2);
+        assert!(manifest.nodes[0].computer_use_environment.is_empty());
         assert!(
             serde_yaml::from_str::<FabricManifest>(
                 r#"
@@ -2108,6 +2111,33 @@ domains: []
 "#
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn fabric_manifest_accepts_computer_use_environment() {
+        let manifest: FabricManifest = serde_yaml::from_str(
+            r#"
+apiVersion: distributed-workbench.dev/v1
+kind: Fabric
+initiatorNode: desktop
+nodes:
+  - id: desktop
+    platform: windows
+    architecture: x86_64
+    allowRoots: ["C:/Users"]
+    computerUseEnvironment:
+      PI_COMPUTER_USE_HEADLESS: "false"
+topology: {mode: full-mesh}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.nodes[0]
+                .computer_use_environment
+                .get("PI_COMPUTER_USE_HEADLESS")
+                .map(String::as_str),
+            Some("false")
         );
     }
 

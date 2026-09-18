@@ -58,6 +58,14 @@ submit response can be recovered by repeating the same owner/request-key; use a
 new key for a new session. `queue` lists sessions without exposing tokens. `cancel`
 removes queued work or drains active work; `close` finishes the whole session.
 An active session expires after 15 minutes by default; renew before expiry.
+
+The Fabric manifest may declare an Executor-level `computerUseEnvironment` map.
+Host deployment atomically converges it to `computer-use/environment.json` and
+verify-only detects drift. Supported keys are `DISPLAY`, `XAUTHORITY`,
+`DBUS_SESSION_BUS_ADDRESS`, `AT_SPI_BUS_ADDRESS`, `XDG_RUNTIME_DIR`, and
+`PI_COMPUTER_USE_HEADLESS`; the last value must be the string `"true"` or
+`"false"`. This is machine desktop policy and therefore belongs to the Fabric
+node, not to an application workspace profile.
 Queued time does not consume its TTL. TTL must be 1 second to 1 hour.
 
 All Controllers, including headless development nodes, route to the same target queue.
