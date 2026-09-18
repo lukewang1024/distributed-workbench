@@ -167,6 +167,23 @@ impl ComputerUseService {
         result
     }
 }
+fn node_executable(root: &Path) -> Result<PathBuf, RpcError> {
+    match fs::read_to_string(root.join("node-path")) {
+        Ok(value) => {
+            let selected = PathBuf::from(value.trim());
+            if !selected.is_absolute() {
+                return Err(failed("computer-use node-path must be absolute"));
+            }
+            Ok(selected)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Legacy bundled runtimes remain usable during gradual upgrades.
+            Ok(root.join(if cfg!(windows) { "node.exe" } else { "node" }))
+        }
+        Err(error) => Err(failed(error)),
+    }
+}
+
 impl Host {
     fn start(state_root: &Path, session: &str) -> Result<Self, RpcError> {
         let root = std::env::var_os("WORKBENCH_COMPUTER_USE_ROOT")
@@ -182,7 +199,7 @@ impl Host {
                     .and_then(|p| p.parent()?.parent().map(|p| p.join("computer-use")))
             })
             .ok_or_else(|| failed("cannot locate computer-use package"))?;
-        let node = root.join(if cfg!(windows) { "node.exe" } else { "node" });
+        let node = node_executable(&root)?;
         // Read the host selection only when starting a new session. An existing
         // session retains its process and immutable host until acknowledged close.
         let host_root = match fs::read_to_string(state_root.join("host-root")) {
@@ -312,6 +329,20 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_node_selection_is_absolute_and_legacy_fallback_is_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        assert_eq!(
+            node_executable(root).unwrap(),
+            root.join(if cfg!(windows) { "node.exe" } else { "node" })
+        );
+        let selected = root.join("manager-version").join("node");
+        fs::write(root.join("node-path"), selected.to_str().unwrap()).unwrap();
+        assert_eq!(node_executable(root).unwrap(), selected);
+        fs::write(root.join("node-path"), "relative/node").unwrap();
+        assert!(node_executable(root).is_err());
+    }
     fn frame(bytes: &'static [u8]) -> Result<Value, RpcError> {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();

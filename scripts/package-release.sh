@@ -30,11 +30,13 @@ esac
 case $target in
   *-linux-android) ;;
   *)
-    [ -d computer-use/node_modules ] || { echo 'build computer-use runtime before packaging' >&2; exit 2; }
-    # Release consumers reject archive links; dereference npm's CLI shims.
-    cp -RL computer-use "$staging/computer-use"
-    rm -rf "$staging/computer-use/test"
-    cp scripts/install-computer-use.mjs scripts/package-computer-use-host.mjs scripts/install-computer-use-host.mjs "$staging/scripts/"
+    # Releases carry host source and locks only. Node/npm and dependencies are
+    # provisioned on the node by the normal runtime installer.
+    mkdir -p "$staging/computer-use"
+    for file in host.mjs extension-host.mjs environment.mjs linux-runtime.mjs release.mjs package.json package-lock.json node-runtimes.json host-version.json; do
+      cp "computer-use/$file" "$staging/computer-use/$file"
+    done
+    cp scripts/install-computer-use.mjs scripts/trim-computer-use-runtime.mjs scripts/package-computer-use-host.mjs scripts/install-computer-use-host.mjs "$staging/scripts/"
     ;;
 esac
 cp README.md LICENSE "$staging/"

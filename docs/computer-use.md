@@ -234,3 +234,23 @@ release it. The gate survives an Executor restart. Host deployment acquires this
 waits up to two minutes for cleanup, switches the host, then releases the gate. Timeout
 changes no host selection. This is a desktop gate, not a claim that arbitrary long-lived
 product processes have stopped; whole-node upgrades still require product/task draining.
+
+Release archives contain Computer Use host scripts and dependency locks only;
+Node, npm, and node_modules are not bundled. Provision the exact version in
+`computer-use/node-runtimes.json` on each node using nodenv, nvm, or the system
+package manager. Installation selects the locked nodenv version, the matching
+version under NVM_DIR, or Node on PATH; `WORKBENCH_NODE` selects an explicit
+executable. It never changes a version manager's global/default version.
+
+The installer runs locked production-only `npm ci` in a private runtime directory
+and records the resolved Node executable in `node-path`. Native services use that
+absolute path instead of relying on shell initialization. Keep that Node version
+installed while a runtime references it. Missing/incompatible Node or npm fails
+with installation guidance, before changing the selected runtime. Existing
+bundled runtimes remain readable during migration and rollback. Offline machines
+need an available npm cache or registry mirror during first provisioning.
+
+Installation prunes non-target `@esbuild` platform packages, including nested
+copies, using each package's `os`/`cpu` metadata. The target platform, unknown
+packages, and runtime SDKs are retained; the dependency lock remains unchanged.
+A successfully installed runtime is reused on repeat installation.

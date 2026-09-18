@@ -48,7 +48,8 @@ app_version=$($source_binary --version | awk 'NR == 1 { print $2 }')
 
 mkdir -p "$contents/MacOS" "$(dirname "$controller_executable")" "$bin_home" "$launch_agents" "$state_root"
 allow_roots_file=$state_root/.allow-roots.$$.xml
-trap 'rm -f "$allow_roots_file" "$launch_plist.$$.tmp" "$launch_plist.$$.tmp.2"' EXIT HUP INT TERM
+runtime_stage=$(mktemp -d "$state_root/.runtime-preflight.XXXXXX")
+trap 'rm -f "$allow_roots_file" "$launch_plist.$$.tmp" "$launch_plist.$$.tmp.2"; rm -rf "$runtime_stage"' EXIT HUP INT TERM
 
 xml_escape() {
   printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
@@ -80,6 +81,10 @@ if [ -f "$controller_state" ] || [ -f "$state_root/executor-fences.json" ]; then
     if [ -f "$state_file" ]; then cp -p "$state_file" "$backup_root/"; fi
   done
 fi
+# Finish fallible Node/dependency provisioning before stopping healthy launchd jobs.
+# Preserve the separately packaged upstream plugin across release staging cleanup.
+sh "$(dirname "$0")/install-computer-use-runtime.sh" "$source_binary" "$runtime_stage"
+
 domain=gui/$(id -u)
 # Stop the existing launchd job and any legacy LaunchServices child before
 # replacing a signed bundle. Older releases used `open -W`, which could leave
@@ -101,8 +106,11 @@ if [ -x "$executable" ]; then
     sleep 0.1
   done
 fi
-# Preserve the separately packaged upstream plugin across release staging cleanup.
-sh "$(dirname "$0")/install-computer-use-runtime.sh" "$source_binary" "$state_root"
+# Publish the prepared selection only after the old Executor has stopped.
+if [ -f "$runtime_stage/computer-use/runtime-root" ]; then
+  mkdir -p "$state_root/computer-use"
+  mv "$runtime_stage/computer-use/runtime-root" "$state_root/computer-use/runtime-root"
+fi
 
 app_changed=false
 source_uuid=$(/usr/bin/dwarfdump --uuid "$source_binary" 2>/dev/null | awk 'NR == 1 { print $2 }')

@@ -78,7 +78,11 @@ def deploy_node(binary, node, initiator, artifact, digest, verify=False):
                               'computerUseEnvironment':desired_environment(node)}))
             return
         runtime = Path((Path(state) / 'runtime-root').read_text().strip())
-        run([str(runtime / 'node'), str(ROOT / 'scripts/install-computer-use-host.mjs'),
+        node_path = runtime / 'node-path'
+        node_executable = node_path.read_text().strip() if node_path.exists() else str(runtime / 'node')
+        if not Path(node_executable).is_absolute():
+            raise RuntimeError('computer-use node-path must be absolute')
+        run([node_executable, str(ROOT / 'scripts/install-computer-use-host.mjs'),
              str(artifact), digest, state, str(runtime.parent.parent)])
         local_environment(state, node, False)
         return
@@ -134,12 +138,15 @@ def deploy_node(binary, node, initiator, artifact, digest, verify=False):
                 remote("$ErrorActionPreference='Stop'; $state=" + quoted_state + "; "
                        "$runtime=(Get-Content -Raw (Join-Path $state 'runtime-root')).Trim(); "
                        "$data=Split-Path (Split-Path $runtime -Parent) -Parent; "
-                       f"& (Join-Path $runtime 'node.exe') '{staging}/scripts/install.mjs' '{staging}/artifact.json' '{digest}' $state $data; "
+                       "$nodeFile=Join-Path $runtime 'node-path'; $nodeExe=Join-Path $runtime 'node.exe'; "
+                       "if (Test-Path $nodeFile) { $nodeExe=(Get-Content -Raw $nodeFile).Trim() }; "
+                       f"& $nodeExe '{staging}/scripts/install.mjs' '{staging}/artifact.json' '{digest}' $state $data; "
                        "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
             else:
                 remote('set -eu; state=' + shlex.quote(state) + '; runtime=$(cat "$state/runtime-root"); '
                        'data=$(dirname "$(dirname "$runtime")"); '
-                       f'"$runtime/node" {staging}/scripts/install.mjs {staging}/artifact.json {digest} "$state" "$data"')
+                       'node_bin="$runtime/node"; if [ -f "$runtime/node-path" ]; then node_bin=$(cat "$runtime/node-path"); fi; '
+                       f'"$node_bin" {staging}/scripts/install.mjs {staging}/artifact.json {digest} "$state" "$data"')
             if expected_environment is not None:
                 encoded = base64.b64encode(expected_environment.encode()).decode()
                 if windows:
