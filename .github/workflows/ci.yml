@@ -33,6 +33,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - if: runner.os != 'Windows'
         run: sh -n scripts/*.sh
+      - if: runner.os != 'Windows'
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
       - if: runner.os == 'Windows'
         shell: pwsh
         run: |

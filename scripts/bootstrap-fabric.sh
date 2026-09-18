@@ -4,6 +4,7 @@ set -eu
 usage() {
   printf '%s\n' \
     'usage: scripts/bootstrap-fabric.sh [--version VERSION] [--local-id ID] [--local-allow-root PATH]... [--windows-allow-root PATH]... [--windows-application-root PATH]... [--skip-release-install] [--verify-only] HOST|windows:HOST ...' \
+    '       scripts/bootstrap-fabric.sh --headless-file NODE_CONFIG plan|ensure|status|stop' \
     '' \
     'Install or verify distributed-workbench on selected SSH hosts, then register' \
     'their executors with the laptop Controller. Prefix native Windows nodes' \
@@ -22,6 +23,12 @@ node_transports=
 node_allow_roots=
 while [ "$#" -gt 0 ]; do
   case $1 in
+    --headless-file)
+      test "$#" -ge 2 || { usage >&2; exit 2; }
+      attachment=$2
+      shift 2
+      exec python3 "$(dirname -- "$0")/supervise-node.py" --file "$attachment" "$@"
+      ;;
     --file)
       test "$#" -ge 2 || { usage >&2; exit 2; }
       manifest=$2
