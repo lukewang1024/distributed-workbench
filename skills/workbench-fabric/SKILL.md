@@ -12,7 +12,12 @@ Operate the domain-neutral machine fabric. Keep product workflows in their ownin
 1. Prefer a `distributed-workbench.dev/v1` `Fabric` manifest as the validated inventory contract. Validate it with `workbench fabric validate --file <path>`, then inspect the authoritative physical dialer plan with `workbench fabric plan --file <path>`. If no manifest exists, identify the laptop and SSH-config aliases explicitly selected by the user and offer to create one from `examples/fabric.yaml`.
 2. Confirm that SSH is initiated from the laptop. Do not require a devbox to initiate SSH back to the laptop.
 3. Treat each machine as one node with one Controller and one Executor. Treat Controller/Executor as logical roles multiplexed over one persistent peer connection per node pair.
-4. Use the same release across the selected fabric. Do not perform a mixed-version rollout.
+4. A rollout may temporarily contain different installed releases and `offline-pending`
+   nodes because personal workstations are not continuously available. Keep the generic
+   Fabric control plane available across releases that implement the same peer protocol so
+   a returning node can be inspected and reconciled. The composition/product layer must
+   gate its active participants on one exact release before product capabilities run. A
+   peer-protocol mismatch remains quarantined at handshake and cannot expose any route.
 
 ## Choose the operation
 
@@ -27,6 +32,11 @@ Operate the domain-neutral machine fabric. Keep product workflows in their ownin
 - Inspect a single local role or peer: use `workbench --help`, then the relevant `status` or `peer status` command. Discover current flags from command help instead of reproducing them here.
 
 Before an installing run, report the selected nodes and version. Installation, upgrade, service replacement, or topology changes require explicit user intent; diagnosis defaults to `--verify-only`.
+Persist the exact release intent before the first installation mutation. Report online
+cohort safety (`operational`) independently from inventory-wide completion
+(`fullyConverged`). An offline node is pending work, not a reason to undo successful
+online upgrades. A non-transport installation failure is a failed rollout, not an
+offline node.
 
 Keep the Fabric manifest domain-neutral: node identities, platform, architecture, SSH alias, allow roots, initiator, and topology belong here; product adapters, workflows, profiles, credentials, and application paths do not. Use `scripts/bootstrap-fabric.sh --file FABRIC --version VERSION` so the public layer
 receives the complete resolved declaration. The public reconciler preserves independent
